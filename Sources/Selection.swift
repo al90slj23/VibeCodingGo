@@ -8,7 +8,8 @@ struct CueResolvedSelection {
 
     init(fields: [String: String], choose: (([String]) -> String)? = nil) {
         var resolved = fields
-        for (key, identifiers) in Self.catalogs where fields[key] == Self.randomToken {
+        for (key, allIdentifiers) in Self.catalogs where fields[key] == Self.randomToken {
+            let identifiers = Self.pool(key: key, fields: fields, fallback: allIdentifiers)
             guard let fallback = identifiers.first else { continue }
             let selected = choose?(identifiers) ?? identifiers.randomElement() ?? fallback
             // Injected selectors are useful in tests, but cannot produce an
@@ -16,6 +17,20 @@ struct CueResolvedSelection {
             resolved[key] = identifiers.contains(selected) ? selected : fallback
         }
         self.fields = resolved
+    }
+
+    private static func pool(key: String, fields: [String: String], fallback: [String]) -> [String] {
+        let tags = Set((fields[key + "_random_tags"] ?? "").split(separator: ",").map { value in
+            key == "effect" && value == "subtle" ? "recommended" : key == "effect" && value == "vivid" ? "classic" : String(value)
+        })
+        guard !tags.isEmpty, !tags.contains("all") else { return fallback }
+        let ids: [String]
+        switch key {
+        case "effect": ids = CueEffectCatalog.presets.filter { !tags.isDisjoint(with: $0.tagIDs) }.map(\.id)
+        case "card_style": ids = CueCardCatalog.presets.filter { !tags.isDisjoint(with: $0.tags) }.map(\.id)
+        default: ids = CueSoundCatalog.presets.filter { !tags.isDisjoint(with: $0.tags) }.map(\.id)
+        }
+        return ids.isEmpty ? fallback : ids
     }
 
     private static var catalogs: [(String, [String])] {
@@ -81,7 +96,7 @@ struct CueResolvedSelection {
 
         var covered: [String: Set<String>] = [:]
         var coverageValid = true
-        for index in 0..<50 {
+        for index in 0..<(catalogs.map { $0.1.count }.max() ?? 0) {
             let resolved = CueResolvedSelection(fields: randomFields) { identifiers in
                 identifiers.isEmpty ? "" : identifiers[index % identifiers.count]
             }
@@ -94,7 +109,7 @@ struct CueResolvedSelection {
             }
         }
         let allFifty = coverageValid && catalogs.allSatisfy { key, identifiers in
-            identifiers.count == 50 && Set(identifiers).count == 50 && covered[key] == Set(identifiers)
+            !identifiers.isEmpty && Set(identifiers).count == identifiers.count && covered[key] == Set(identifiers)
         }
         let invalidChoice = CueResolvedSelection(fields: randomFields) { _ in "not-a-preset" }
         let safeFallback = catalogs.allSatisfy { key, identifiers in invalidChoice.fields[key] == identifiers.first }
@@ -103,12 +118,17 @@ struct CueResolvedSelection {
         let perAlert = catalogs.allSatisfy { key, _ in first.fields[key] != last.fields[key] } &&
             randomFields.values.allSatisfy { $0 == randomToken }
 
-        return ["random_selections_independent": independent && individual,
+        let scopedFields = randomFields.merging(["effect_random_tags": "recommended", "card_style_random_tags": "native", "sound_random_tags": "nature"]) { _, new in new }
+        var pools: [[String]] = []
+        let scoped = CueResolvedSelection(fields: scopedFields) { ids in pools.append(ids); return ids.last ?? "" }
+        let scopedCorrect = pools.count == 3 && pools[0] == CueEffectCatalog.presets.filter { $0.tagIDs.contains("recommended") }.map(\.id) && pools[1] == CueCardCatalog.presets.filter { $0.tags.contains("native") }.map(\.id) && pools[2] == CueSoundCatalog.presets.filter { $0.tags.contains("nature") }.map(\.id) && scoped.fields["sound"]?.hasPrefix("nature-") == true
+        return ["random_selection_respects_tag_scope": scopedCorrect,
+                "random_selections_independent": independent && individual,
                 "random_selection_ids_valid": valid,
                 "random_selection_snapshot_stable": stable,
                 "random_selection_legacy_preserved": legacyPreserved,
                 "random_selection_parameters_preserved": parametersPreserved,
-                "random_selection_all_50_covered": allFifty,
+                "random_selection_full_catalog_covered": allFifty,
                 "random_selection_invalid_choice_safe": safeFallback,
                 "random_selection_per_alert_resolution": perAlert]
     }

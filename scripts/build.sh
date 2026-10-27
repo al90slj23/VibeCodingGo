@@ -10,5 +10,8 @@ cp "$PROJECT_ROOT/assets/Info.plist" "$APP_DIR/Contents/Info.plist"
 if [[ -f "$PROJECT_ROOT/assets/AppIcon.icns" ]]; then
   cp "$PROJECT_ROOT/assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
+if [[ -d "$PROJECT_ROOT/assets/Sounds" ]]; then
+  /usr/bin/ditto "$PROJECT_ROOT/assets/Sounds" "$APP_DIR/Contents/Resources/Sounds"
+fi
 /usr/bin/codesign --force --sign - "$APP_DIR"
 printf '%s\n' "$APP_DIR"

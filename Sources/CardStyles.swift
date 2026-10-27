@@ -1,14 +1,46 @@
 import AppKit
 import Foundation
 
+struct CueCardTag {
+    let id: String
+    let name: String
+    let description: String
+}
+
 struct CueCardPreset {
     let id: String
     let name: String
     let size: NSSize
+    let tags: [String]
+    let featured: Bool
+
+    init(id: String, name: String, size: NSSize, tags: [String] = [], featured: Bool = false) {
+        self.id = id; self.name = name; self.size = size; self.featured = featured
+        if !tags.isEmpty { self.tags = tags; return }
+        var assigned = ["classic"]
+        if ["glass-dark", "frosted-glass", "frosted-light", "hologram", "aurora", "bubble"].contains(id) { assigned.append("glass") }
+        if ["paper-light", "mono-white", "warm-paper", "notebook", "sticky", "newspaper", "postage", "receipt", "polaroid", "sunrise", "frosted-light"].contains(id) { assigned.append("paper") }
+        else { assigned.append("dark") }
+        if ["compact", "pill", "minimal", "micro", "mono-black", "mono-white", "floating-strip", "outline"].contains(id) { assigned.append("minimal") }
+        if ["ticket", "stacked", "badge-top", "ribbon", "bookmark", "dashboard", "split-panel", "pixel", "cyber-grid", "gradient-ribbon", "sticky", "newspaper", "postage", "receipt", "polaroid", "orbit", "metro", "corner-tab", "progress", "wave", "dotted", "contour"].contains(id) { assigned.append("playful") }
+        self.tags = assigned
+    }
 }
 
 enum CueCardCatalog {
+    static let tags: [CueCardTag] = [
+        .init(id: "native", name: "原生精选", description: "系统材质、清楚层级，适合日常提醒。"),
+        .init(id: "glass", name: "玻璃与柔光", description: "经典半透明配色与柔光装饰。"),
+        .init(id: "dark", name: "深色", description: "保留固定深色外观的经典样式。"),
+        .init(id: "paper", name: "浅色与纸张", description: "明亮底色，以及纸张主题。"),
+        .init(id: "minimal", name: "简洁", description: "较少装饰、紧凑排版。"),
+        .init(id: "playful", name: "个性", description: "更鲜明的主题与装饰。"),
+        .init(id: "classic", name: "经典样式", description: "保留已有的 50 套样式和自定义设置。")
+    ]
     static let presets: [CueCardPreset] = [
+        .init(id: "native-compact", name: "原生紧凑", size: NSSize(width: 420, height: 132), tags: ["native", "minimal"], featured: true),
+        .init(id: "native-focus", name: "原生聚焦", size: NSSize(width: 448, height: 158), tags: ["native"], featured: true),
+        .init(id: "native-minimal", name: "原生极简", size: NSSize(width: 400, height: 108), tags: ["native", "minimal"], featured: true),
         .init(id: "glass-dark", name: "深色玻璃", size: NSSize(width: 560, height: 164)),
         .init(id: "frosted-glass", name: "磨砂悬浮", size: NSSize(width: 560, height: 174)),
         .init(id: "paper-light", name: "浅色纸笺", size: NSSize(width: 560, height: 164)),
@@ -31,7 +63,7 @@ enum CueCardCatalog {
         .init(id: "timeline", name: "时间轴节点", size: NSSize(width: 560, height: 178)),
         .init(id: "chat-left", name: "左侧对话", size: NSSize(width: 540, height: 180)),
         .init(id: "bookmark", name: "书签页角", size: NSSize(width: 530, height: 188)),
-        .init(id: "dashboard", name: "仪表卡片", size: NSSize(width: 620, height: 194)),
+        .init(id: "dashboard", name: "分栏柔光", size: NSSize(width: 620, height: 194)),
         .init(id: "code-editor", name: "代码编辑器", size: NSSize(width: 610, height: 200)),
         .init(id: "blueprint", name: "蓝图标注", size: NSSize(width: 570, height: 180)),
         .init(id: "pixel", name: "像素街机", size: NSSize(width: 520, height: 168)),
@@ -54,13 +86,16 @@ enum CueCardCatalog {
         .init(id: "metro", name: "都市色块", size: NSSize(width: 560, height: 176)),
         .init(id: "floating-strip", name: "悬浮细条", size: NSSize(width: 620, height: 120)),
         .init(id: "corner-tab", name: "页角索引", size: NSSize(width: 550, height: 186)),
-        .init(id: "progress", name: "进度光轨", size: NSSize(width: 570, height: 182)),
-        .init(id: "wave", name: "声波浮层", size: NSSize(width: 580, height: 180)),
+        .init(id: "progress", name: "细线光轨", size: NSSize(width: 570, height: 182)),
+        .init(id: "wave", name: "轻彩浮层", size: NSSize(width: 580, height: 180)),
         .init(id: "dotted", name: "点阵札记", size: NSSize(width: 550, height: 174)),
         .init(id: "contour", name: "等高线条", size: NSSize(width: 580, height: 180)),
         .init(id: "frosted-light", name: "浅色磨砂", size: NSSize(width: 560, height: 180))
     ]
     static func preset(id: String) -> CueCardPreset { presets.first { $0.id == id } ?? presets[0] }
+    static func presets(tagID: String) -> [CueCardPreset] {
+        tagID.isEmpty || tagID == "all" ? presets : presets.filter { $0.tags.contains(tagID) }
+    }
     static let positions: [(String, String)] = [("top-center", "顶部居中"), ("top-right", "右上角"), ("top-left", "左上角"), ("bottom-center", "底部居中"), ("bottom-right", "右下角"), ("bottom-left", "左下角"), ("center", "屏幕中央"), ("mouse", "鼠标附近")]
 
     static func previewImage(for preset: CueCardPreset, size: NSSize, fields: [String: String] = [:], color: NSColor = .systemTeal) -> NSImage {
@@ -69,6 +104,9 @@ enum CueCardCatalog {
         let palette = fields.isEmpty ? [NSColor.systemTeal, .systemBlue, .systemPurple] : CueVisualStyle(fields: fields, fallback: color).palette
         let card = CueStyledBannerView(event: event, target: nil, color: color, palette: palette, style: CueCardStyle(fields: selected))
         let image = NSImage(size: size)
+        let appearance = NSApp.effectiveAppearance
+        card.appearance = appearance
+        appearance.performAsCurrentDrawingAppearance {
         image.lockFocus()
         NSColor.clear.setFill(); NSRect(origin: .zero, size: size).fill(using: .copy)
         if let rep = card.bitmapImageRepForCachingDisplay(in: card.bounds) {
@@ -76,9 +114,17 @@ enum CueCardCatalog {
             let source = NSImage(size: card.bounds.size); source.addRepresentation(rep)
             let scale = min((size.width - 14) / card.bounds.width, (size.height - 12) / card.bounds.height)
             let scaled = NSSize(width: card.bounds.width * scale, height: card.bounds.height * scale)
-            source.draw(in: NSRect(x: (size.width - scaled.width) / 2, y: (size.height - scaled.height) / 2, width: scaled.width, height: scaled.height))
+            let destination = NSRect(x: (size.width - scaled.width) / 2, y: (size.height - scaled.height) / 2, width: scaled.width, height: scaled.height)
+            if preset.featured {
+                // A static thumbnail has no desktop behind it. Supply a neutral
+                // semantic substrate; live cards use the actual effect view.
+                NSColor.windowBackgroundColor.setFill()
+                NSBezierPath(roundedRect: destination, xRadius: 14 * scale, yRadius: 14 * scale).fill()
+            }
+            source.draw(in: destination)
         }
         image.unlockFocus()
+        }
         return image
     }
 
@@ -101,23 +147,25 @@ enum CueCardCatalog {
 
     static func validationReport() -> [String: Bool] {
         let event = CueEvent(kind: "input", title: "固定测试对话", message: "同一组内容用于验证实际渲染与布局。")
-        var hashes = Set<UInt64>(), noOverlap = true
+        var hashes = Set<UInt64>(), legacyHashes = Set<UInt64>(), noOverlap = true
         var cardHitRouting = true, buttonHitRouting = true, futureControlRouting = true, previewDoesNotNavigate = true
+        var nativeMaterials = true
         for preset in presets {
             let image = previewImage(for: preset, size: NSSize(width: 320, height: 150))
             if let data = image.tiffRepresentation {
                 let hash = data.reduce(UInt64(1469598103934665603)) { ($0 ^ UInt64($1)) &* 1099511628211 }
                 hashes.insert(hash)
+                if !preset.featured { legacyHashes.insert(hash) }
             }
             for scale in ["0.8", "1", "1.25"] {
                 let view = CueStyledBannerView(event: event, target: nil, color: .systemTeal, palette: [.systemTeal, .systemBlue], style: CueCardStyle(fields: ["card_style": preset.id, "text_scale": scale, "card_width": "380"]))
-                let labels: [NSView] = [view.statusLabel, view.conversationLabel, view.messageLabel, view.openButton, view.closeButton].filter { !$0.isHidden }
+                let labels: [NSView] = [view.statusLabel, view.conversationLabel, view.messageLabel, view.sourceLabel, view.openButton, view.closeButton].filter { $0.superview != nil && !$0.isHidden }
                 for (index, a) in labels.enumerated() {
                     if !view.bounds.contains(a.frame) { noOverlap = false }
                     for b in labels.dropFirst(index + 1) where a.frame.intersects(b.frame) { noOverlap = false }
                 }
                 func hit(_ item: NSView) -> NSView? { view.hitTest(NSPoint(x: item.frame.midX, y: item.frame.midY)) }
-                for item in [view.statusLabel, view.conversationLabel, view.messageLabel, view.icon] where !item.isHidden {
+                for item in [view.statusLabel, view.conversationLabel, view.messageLabel, view.sourceLabel, view.icon] where item.superview != nil && !item.isHidden {
                     if hit(item) !== view { cardHitRouting = false }
                 }
                 if view.hitTest(NSPoint(x: 5, y: view.bounds.midY)) !== view { cardHitRouting = false }
@@ -125,6 +173,7 @@ enum CueCardCatalog {
                     if hit(button) !== button { buttonHitRouting = false }
                 }
                 if view.accessibilityPerformPress() { previewDoesNotNavigate = false }
+                if preset.featured && !view.subviews.contains(where: { $0 is NSVisualEffectView }) { nativeMaterials = false }
                 let futureButton = NSButton(title: "独立操作", target: nil, action: nil)
                 futureButton.frame = NSRect(x: 20, y: 45, width: 100, height: 24); view.addSubview(futureButton)
                 if hit(futureButton) !== futureButton { futureControlRouting = false }
@@ -134,8 +183,13 @@ enum CueCardCatalog {
                 if hit(editableField) !== editableField { futureControlRouting = false }
             }
         }
-        return ["exactly_50_card_styles": presets.count == 50, "fifty_unique_card_ids": Set(presets.map(\.id)).count == 50,
-                "fifty_distinct_card_renders": hashes.count == 50, "all_card_text_and_controls_fit_without_overlap": noOverlap,
+        let legacy = presets.filter { !$0.featured }
+        return ["exactly_53_card_styles": presets.count == 53, "fifty_unique_legacy_card_ids": legacy.count == 50 && Set(legacy.map(\.id)).count == 50,
+                "fifty_distinct_legacy_card_renders": legacyHashes.count == 50, "all_53_card_renders_distinct": hashes.count == 53,
+                "three_native_featured_cards": presets.filter(\.featured).count == 3 && presets(tagID: "native").count == 3,
+                "native_cards_use_visual_effect_material": nativeMaterials,
+                "legacy_cards_have_classic_tags": legacy.allSatisfy { $0.tags.contains("classic") },
+                "all_card_text_and_controls_fit_without_overlap": noOverlap,
                 "all_cards_background_text_and_icon_hit_card": cardHitRouting,
                 "all_card_buttons_keep_native_hit_routes": buttonHitRouting,
                 "future_interactive_controls_keep_hit_routes": futureControlRouting,
@@ -156,7 +210,7 @@ struct CueCardStyle {
     let showOpenButton: Bool
 
     init(fields: [String: String]) {
-        id = CueCardCatalog.preset(id: fields["card_style"] ?? "glass-dark").id
+        id = CueCardCatalog.preset(id: fields["card_style"] ?? "native-compact").id
         position = CueCardCatalog.positions.contains { $0.0 == fields["card_position"] } ? fields["card_position"]! : "top-center"
         func number(_ key: String, _ fallback: Double, _ lower: Double, _ upper: Double) -> Double {
             guard let value = Double(fields[key] ?? ""), value.isFinite else { return fallback }
@@ -198,11 +252,14 @@ final class CueStyledBannerView: NSView {
     let statusLabel = NSTextField(labelWithString: "")
     let conversationLabel = NSTextField(labelWithString: "")
     let messageLabel = NSTextField(wrappingLabelWithString: "")
+    let sourceLabel = NSTextField(labelWithString: "")
     let icon = NSImageView()
     let openButton = NSButton(title: "打开对话 ↗", target: nil, action: nil)
     let closeButton = NSButton(title: "×", target: nil, action: nil)
     private weak var controller: CueController?
     private var pressedForConversation = false
+    private var nativeMaterial: NSVisualEffectView?
+    private var isNative: Bool { style.id.hasPrefix("native-") }
 
     init(event: CueEvent, target: AnyObject?, color: NSColor, palette: [NSColor], style: CueCardStyle, availableWidth: CGFloat? = nil) {
         self.event = event; accent = color; self.palette = palette.isEmpty ? [color] : palette; self.style = style
@@ -210,7 +267,8 @@ final class CueStyledBannerView: NSView {
         var size = style.size
         if let availableWidth { size.width = min(size.width, availableWidth) }
         super.init(frame: NSRect(origin: .zero, size: size))
-        wantsLayer = true; layer?.opacity = Float(style.opacity)
+        wantsLayer = true; layer?.opacity = style.id.hasPrefix("native-") ? 1 : Float(style.opacity)
+        if isNative { buildNativeMaterial() }
         if ["neon", "frosted-glass", "hologram", "aurora", "spotlight", "frosted-light"].contains(style.id) {
             layer?.shadowColor = color.cgColor; layer?.shadowOpacity = style.id == "neon" ? 0.5 : 0.18
             layer?.shadowRadius = style.id == "neon" ? 12 : 8; layer?.shadowOffset = .zero
@@ -220,6 +278,31 @@ final class CueStyledBannerView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var isOpaque: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateNativeAppearance(); needsDisplay = true
+    }
+
+    private func buildNativeMaterial() {
+        let material = NSVisualEffectView(frame: bounds.insetBy(dx: 1, dy: 1))
+        material.material = style.id == "native-focus" ? .popover : style.id == "native-minimal" ? .toolTip : .hudWindow
+        material.blendingMode = .behindWindow; material.state = .active
+        material.isEmphasized = false; material.appearance = nil
+        material.autoresizingMask = [.width, .height]; material.wantsLayer = true
+        material.layer?.cornerRadius = style.radius ?? (style.id == "native-minimal" ? 10 : 14)
+        material.layer?.masksToBounds = true
+        // Background opacity remains customisable; text keeps its semantic contrast.
+        material.alphaValue = style.opacity
+        nativeMaterial = material; addSubview(material)
+        updateNativeAppearance()
+    }
+    private func updateNativeAppearance() {
+        guard let nativeMaterial else { return }
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            nativeMaterial.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.4).cgColor
+            nativeMaterial.layer?.borderWidth = 0.5
+        }
+    }
 
     private var canOpenConversation: Bool {
         controller != nil && event.provider == "codex" && !event.isPreview && !event.threadID.isEmpty &&
@@ -264,7 +347,7 @@ final class CueStyledBannerView: NSView {
         super.resetCursorRects()
         guard canOpenConversation else { return }
         addCursorRect(bounds, cursor: .pointingHand)
-        for child in subviews where child is NSControl && child !== icon && child !== statusLabel && child !== conversationLabel && child !== messageLabel {
+        for child in subviews where child is NSControl && child !== icon && child !== statusLabel && child !== conversationLabel && child !== messageLabel && child !== sourceLabel {
             addCursorRect(child.frame, cursor: child === openButton ? .pointingHand : .arrow)
         }
     }
@@ -318,6 +401,7 @@ final class CueStyledBannerView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor.clear.setFill(); bounds.fill(using: .copy)
+        if isNative { return }
         let inset: CGFloat = style.id == "stacked" ? 9 : ["postage", "pixel"].contains(style.id) ? 7 : 2
         var rect = bounds.insetBy(dx: inset, dy: inset)
         if ["bubble", "chat-left"].contains(style.id) { rect = rect.insetBy(dx: 0, dy: 6) }
@@ -391,7 +475,7 @@ final class CueStyledBannerView: NSView {
             line(NSPoint(x: 78, y: 0), NSPoint(x: 78, y: h), color: accent.withAlphaComponent(0.3))
         case "split-panel":
             fillRound(NSRect(x: w - 110, y: 14, width: 96, height: h - 28), color: soft, radius: 14)
-            for n in 0..<4 { fillRound(NSRect(x: w - 91 + CGFloat(n) * 17, y: 30, width: 8, height: CGFloat(14 + n * 7)), color: palette[n % palette.count].withAlphaComponent(0.65), radius: 3) }
+            circle(NSRect(x: w - 87, y: 32, width: 50, height: 50), color: a.withAlphaComponent(0.10), stroke: true)
         case "badge-top":
             circle(NSRect(x: w / 2 - 28, y: h - 62, width: 56, height: 56), color: soft)
             circle(NSRect(x: w / 2 - 34, y: h - 68, width: 68, height: 68), color: faint, stroke: true)
@@ -419,9 +503,8 @@ final class CueStyledBannerView: NSView {
             decorativeText("待办 / ATTENTION", at: NSPoint(x: 66, y: h - 24), color: a.withAlphaComponent(0.65))
         case "dashboard":
             fillRound(NSRect(x: w - 107, y: 16, width: 91, height: h - 32), color: .white.withAlphaComponent(0.04), radius: 12)
-            circle(NSRect(x: w - 92, y: h / 2 - 26, width: 60, height: 60), color: a.withAlphaComponent(0.16), stroke: true, width: 7)
-            let arc = NSBezierPath(); arc.appendArc(withCenter: NSPoint(x: w - 62, y: h / 2 + 4), radius: 30, startAngle: 30, endAngle: 280, clockwise: false); arc.lineWidth = 7; accent.setStroke(); arc.stroke()
-            decorativeText("READY", at: NSPoint(x: w - 81, y: 30), color: a.withAlphaComponent(0.7), mono: true)
+            circle(NSRect(x: w - 96, y: h / 2 - 30, width: 68, height: 68), color: a.withAlphaComponent(0.07))
+            line(NSPoint(x: w - 93, y: 38), NSPoint(x: w - 31, y: 38), color: a.withAlphaComponent(0.16))
         case "blueprint":
             for x in stride(from: CGFloat(0), to: w, by: 20) { line(NSPoint(x: x, y: 0), NSPoint(x: x, y: h), color: .white.withAlphaComponent(0.025)) }
             for y in stride(from: CGFloat(0), to: h, by: 20) { line(NSPoint(x: 0, y: y), NSPoint(x: w, y: y), color: .white.withAlphaComponent(0.025)) }
@@ -490,10 +573,9 @@ final class CueStyledBannerView: NSView {
             decorativeText("当前对话 / CUE", at: NSPoint(x: 27, y: h - 25), color: a, size: 9)
             polygon([NSPoint(x: w - 38, y: h), NSPoint(x: w, y: h - 38), NSPoint(x: w, y: h)], color: soft)
         case "progress":
-            fillRound(NSRect(x: 22, y: 7, width: w - 44, height: 4), color: faint, radius: 2)
-            gradient(NSRect(x: 22, y: 7, width: (w - 44) * 0.7, height: 4), colors: palette, angle: 0)
+            line(NSPoint(x: 22, y: 9), NSPoint(x: w - 22, y: 9), color: a.withAlphaComponent(0.15))
         case "wave":
-            for n in 0..<36 { let height = CGFloat(3 + Int(abs(sin(Double(n) * 0.7)) * 13)); fillRound(NSRect(x: w - 151 + CGFloat(n) * 4, y: 12, width: 2, height: height), color: palette[n % palette.count].withAlphaComponent(0.22), radius: 1) }
+            gradient(NSRect(x: w - 154, y: 12, width: 132, height: 3), colors: [a.withAlphaComponent(0.02), a.withAlphaComponent(0.18), a.withAlphaComponent(0.02)], angle: 0)
         case "dotted":
             for x in stride(from: CGFloat(14), to: w, by: 16) { for y in stride(from: CGFloat(14), to: h, by: 16) { circle(NSRect(x: x, y: y, width: 1.6, height: 1.6), color: a.withAlphaComponent(0.10)) } }
         case "contour":
@@ -534,6 +616,7 @@ final class CueStyledBannerView: NSView {
     }
 
     private func build(target: AnyObject?) {
+        if isNative { buildNative(target: target); return }
         let w = bounds.width, h = bounds.height, scale = style.textScale
         // AppKit wrapping labels are selectable by default. These three fields
         // are passive card content; future selectable/editor fields retain
@@ -612,5 +695,65 @@ final class CueStyledBannerView: NSView {
         setAccessibilityElement(true); setAccessibilityLabel("\(event.providerLabel) 提醒：\(event.label)，\(event.title)")
         setAccessibilityRole(canOpenConversation ? .button : .group)
         if canOpenConversation { setAccessibilityHelp("点击提示卡的背景、标题、正文或图标可打开此对话；关闭按钮只关闭提醒。") }
+    }
+
+    private func buildNative(target: AnyObject?) {
+        let w = bounds.width, h = bounds.height, scale = style.textScale
+        let minimal = style.id == "native-minimal", focus = style.id == "native-focus"
+        let x: CGFloat = minimal ? 42 : 48
+        for field in [statusLabel, conversationLabel, messageLabel, sourceLabel] {
+            field.isEditable = false; field.isSelectable = false; field.lineBreakMode = .byTruncatingTail
+        }
+        conversationLabel.stringValue = event.title
+        conversationLabel.font = .systemFont(ofSize: 15 * scale, weight: .semibold)
+        conversationLabel.textColor = .labelColor; conversationLabel.toolTip = event.title
+        conversationLabel.frame = NSRect(x: x, y: h - 14 - 22 * scale, width: w - x - 42, height: 22 * scale)
+        addSubview(conversationLabel)
+        statusLabel.stringValue = event.label
+        statusLabel.font = .systemFont(ofSize: 13 * scale, weight: .regular)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.frame = NSRect(x: x, y: conversationLabel.frame.minY - 5 - 18 * scale, width: w - x - 30, height: 18 * scale)
+        addSubview(statusLabel)
+        icon.image = NSImage(systemSymbolName: event.symbol, accessibilityDescription: event.label)
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: minimal ? 13 : 15, weight: .regular)
+        switch event.kind {
+        case "complete": icon.contentTintColor = .systemGreen
+        case "error": icon.contentTintColor = .systemRed
+        default: icon.contentTintColor = minimal ? .secondaryLabelColor : .systemOrange
+        }
+        let iconSize: CGFloat = minimal ? 16 : 20
+        icon.frame = NSRect(x: 16, y: conversationLabel.frame.midY - iconSize / 2, width: iconSize, height: iconSize)
+        addSubview(icon)
+        messageLabel.stringValue = event.message.isEmpty ? "回到对话查看最新进度。" : event.message
+        messageLabel.font = .systemFont(ofSize: 11 * scale)
+        messageLabel.textColor = .secondaryLabelColor; messageLabel.maximumNumberOfLines = focus ? 2 : 1
+        let messageHeight: CGFloat = (focus ? 32 : 17) * scale
+        messageLabel.frame = NSRect(x: x, y: statusLabel.frame.minY - 5 - messageHeight, width: w - x - 24, height: messageHeight)
+        messageLabel.isHidden = minimal || !style.showMessage
+        addSubview(messageLabel)
+        sourceLabel.stringValue = "来自 \(event.providerLabel)"
+        sourceLabel.font = .systemFont(ofSize: 11 * scale)
+        sourceLabel.textColor = .secondaryLabelColor
+        sourceLabel.frame = NSRect(x: x, y: 13, width: max(70, w - x - 130), height: 16 * scale)
+        addSubview(sourceLabel)
+        if focus {
+            let separator = NSBox(frame: NSRect(x: 16, y: 42, width: w - 32, height: 1))
+            separator.boxType = .separator; addSubview(separator)
+        }
+        openButton.title = "打开对话 ↗"; openButton.bezelStyle = .inline
+        openButton.font = .systemFont(ofSize: 11 * scale, weight: .medium)
+        openButton.contentTintColor = .controlAccentColor
+        openButton.target = self; openButton.action = #selector(openBoundConversation(_:))
+        openButton.frame = NSRect(x: w - 112, y: 9, width: 96, height: 24)
+        openButton.isEnabled = target == nil || canOpenConversation
+        openButton.isHidden = !style.showOpenButton; addSubview(openButton)
+        closeButton.bezelStyle = .inline; closeButton.font = .systemFont(ofSize: 16, weight: .regular)
+        closeButton.contentTintColor = .tertiaryLabelColor
+        closeButton.target = target; closeButton.action = #selector(CueController.dismissCurrent)
+        closeButton.frame = NSRect(x: w - 31, y: h - 31, width: 22, height: 22)
+        closeButton.setAccessibilityLabel("关闭提醒"); addSubview(closeButton)
+        setAccessibilityElement(true); setAccessibilityRole(canOpenConversation ? .button : .group)
+        setAccessibilityLabel("\(event.label)，\(event.title)，来自 \(event.providerLabel)")
+        if canOpenConversation { setAccessibilityHelp("点击打开此对话；关闭按钮只关闭提醒。") }
     }
 }

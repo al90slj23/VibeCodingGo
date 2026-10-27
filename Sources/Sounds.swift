@@ -19,12 +19,26 @@ fileprivate struct CueSoundTone {
     }
 }
 
+struct CueSoundTag {
+    let id: String
+    let name: String
+    let description: String
+}
+
 struct CueSoundPreset {
     let id: String
     let name: String
     let family: String
     let description: String
     let duration: Double
+    let tags: [String]
+    /// Explicit provenance: a timbre metaphor never turns synthesis into a recording.
+    let sourceType: String
+    let sourceDescription: String
+    let sourceURL: String?
+    let license: String
+    fileprivate let assetName: String?
+    fileprivate let systemURL: URL?
     fileprivate let voice: CueSoundVoice
     fileprivate let score: [CueSoundTone]
     fileprivate let legacy: Bool
@@ -33,18 +47,46 @@ struct CueSoundPreset {
                      _ voice: CueSoundVoice, _ score: [CueSoundTone], legacy: Bool = false) {
         self.id = id; self.name = name; self.family = family; self.description = description
         self.voice = voice; self.score = score; self.legacy = legacy
+        tags = ["synthesized"]; sourceType = "synthesized"
+        sourceDescription = "VibeCue 原创合成提示音"; sourceURL = nil; license = "VibeCue 项目许可"
+        assetName = nil; systemURL = nil
         duration = Double(score.reduce(0) { $0 + Int($1.duration * Double(CueChime.sampleRate)) + Int($1.gap * Double(CueChime.sampleRate)) }) / Double(CueChime.sampleRate)
+    }
+
+    fileprivate init(recording id: String, _ name: String, tag: String, description: String,
+                     duration: Double, file: String, author: String, sourceURL: String) {
+        self.id = id; self.name = name; family = tag == "nature" ? "自然实录" : "城市与生活实录"
+        self.description = description; self.duration = duration; tags = [tag]
+        sourceType = "recording"; sourceDescription = "实录 · \(author) · CC0"
+        self.sourceURL = sourceURL; license = "CC0 1.0"; assetName = file; systemURL = nil
+        voice = .soft; score = []; legacy = false
+    }
+
+    fileprivate init(system url: URL, duration: Double) {
+        let filename = url.deletingPathExtension().lastPathComponent
+        id = "system:" + filename; name = filename; family = "macOS 系统音效"
+        description = "使用本机 macOS 的 \(filename) 音效；音频文件不随 VibeCue 分发。"
+        self.duration = duration; tags = ["system"]; sourceType = "system"
+        sourceDescription = "本机 macOS 系统音效"; sourceURL = nil; license = "Apple 系统资源，仅本机读取"
+        assetName = nil; systemURL = url; voice = .soft; score = []; legacy = false
     }
 }
 
 enum CueSoundCatalog {
+    static let tags: [CueSoundTag] = [
+        .init(id: "all", name: "全部", description: "所有可用音源，来源类型分别标注。"),
+        .init(id: "synthesized", name: "合成提示音", description: "50 段 VibeCue 原创合成乐句，玻璃、木琴等为音色描述。"),
+        .init(id: "nature", name: "自然", description: "雨、海浪、鸟鸣和风的 CC0 实录短片段。"),
+        .init(id: "urban", name: "城市与生活", description: "键盘、门铃、车流和脚步的 CC0 实录短片段。"),
+        .init(id: "system", name: "系统音效", description: "动态读取本机 macOS 系统声音，不复制或分发 Apple 音频。")
+    ]
     private static let waveformCache: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>(); cache.totalCostLimit = 8 * 1024 * 1024
         return cache
     }()
-    // Each preset is an original score and synthesis recipe. No network audio
-    // or third-party recordings are used. The first four preserve old releases.
-    static let presets: [CueSoundPreset] = [
+    // The original bank stays intact and is explicitly tagged as synthesis.
+    // The first four also preserve the exact PCM used by earlier releases.
+    static let synthesizedPresets: [CueSoundPreset] = [
         .init("complete", "上行三音", "经典", "熟悉的三音上行完成提示", .soft,
               [.init(523.25, 0.16, 0.035), .init(659.25, 0.16, 0.035), .init(783.99, 0.34, 0.12)], legacy: true),
         .init("input", "问答三音", "经典", "高低高三段，提示需要回答", .soft,
@@ -156,6 +198,45 @@ enum CueSoundCatalog {
               [.init(880, 0.11, 0.10), .init(440, 0.58, 0.14, chord: [1.5])])
     ]
 
+    static let recordedPresets: [CueSoundPreset] = [
+        .init(recording: "nature-rain", "雨落片刻", tag: "nature", description: "户外雨声实录，截取原录音前段；淡入淡出，无循环。", duration: 2.4,
+              file: "nature-rain.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/rain-and-storm-s0124.html"),
+        .init(recording: "nature-waves", "海浪轻涌", tag: "nature", description: "海边浪花实录短片段；保留原环境声。", duration: 2.6,
+              file: "nature-waves.wav", author: "DenisChardonnet", sourceURL: "https://bigsoundbank.com/sea-waves-s0266.html"),
+        .init(recording: "nature-birds", "林间鸟鸣", tag: "nature", description: "森林鸟鸣实录短片段，背景含自然环境声及微弱远处车流。", duration: 2.4,
+              file: "nature-birds.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/forest-s0100.html"),
+        .init(recording: "nature-wind", "草间微风", tag: "nature", description: "风吹草丛实录短片段；淡入淡出，无循环。", duration: 2.4,
+              file: "nature-wind.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/wind-in-tall-grass-s0908.html"),
+        .init(recording: "urban-keyboard", "键盘轻敲", tag: "urban", description: "实体电脑键盘实录，截取一小段敲键声。", duration: 1.6,
+              file: "urban-keyboard.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/computer-keyboard-s0229.html"),
+        .init(recording: "urban-doorbell", "门铃来访", tag: "urban", description: "电磁机械门铃实录短片段，包含金属簧片余音。", duration: 2.4,
+              file: "urban-doorbell.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/doorbell-4-s1604.html"),
+        .init(recording: "urban-traffic", "远处车流", tag: "urban", description: "道路旁约 50 米处的车辆实录短片段。", duration: 2.6,
+              file: "urban-traffic.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/highway-s0122.html"),
+        .init(recording: "urban-footsteps", "路面脚步", tag: "urban", description: "鞋底踏过混凝土地面的实录短片段。", duration: 1.8,
+              file: "urban-footsteps.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/fast-steps-on-concrete-s1318.html")
+    ]
+
+    /// Inventory is built from the local OS, so unavailable system sounds never
+    /// appear as selectable presets. No Apple files are bundled with the app.
+    static let systemPresets: [CueSoundPreset] = {
+        let root = URL(fileURLWithPath: "/System/Library/Sounds", isDirectory: true)
+        let urls = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+        return urls.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }.compactMap { url in
+            guard ["aiff", "aif", "wav", "caf"].contains(url.pathExtension.lowercased()),
+                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+                  let file = try? AVAudioFile(forReading: url) else { return nil }
+            let duration = Double(file.length) / file.fileFormat.sampleRate
+            guard duration > 0, duration <= 30 else { return nil }
+            return CueSoundPreset(system: url, duration: duration)
+        }
+    }()
+
+    static let presets: [CueSoundPreset] = synthesizedPresets + recordedPresets + systemPresets
+    static func presets(tagID: String) -> [CueSoundPreset] {
+        tagID == "all" ? presets : presets.filter { $0.tags.contains(tagID) }
+    }
+    static func tag(id: String) -> CueSoundTag? { tags.first { $0.id == id } }
     static func preset(id: String) -> CueSoundPreset? { presets.first { $0.id == id } }
     static func contains(id: String) -> Bool { preset(id: id) != nil }
     static func displayName(id: String) -> String {
@@ -164,11 +245,26 @@ enum CueSoundCatalog {
         return preset(id: id)?.name ?? "提示音"
     }
 
+    fileprivate static func recordingURL(for preset: CueSoundPreset) -> URL? {
+        guard let filename = preset.assetName, filename == URL(fileURLWithPath: filename).lastPathComponent else { return nil }
+        var roots: [URL] = []
+        if let resources = Bundle.main.resourceURL { roots.append(resources.appendingPathComponent("Sounds", isDirectory: true)) }
+        // The source fallback lets a developer run the command-line self-test
+        // before packaging. Installed applications use their bundled resource.
+        if Bundle.main.bundleURL.pathExtension != "app" {
+            roots.append(URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("assets/Sounds", isDirectory: true))
+        }
+        return roots.map { $0.appendingPathComponent(filename) }.first { FileManager.default.isReadableFile(atPath: $0.path) }
+    }
+
     static func waveformImage(for preset: CueSoundPreset, size: NSSize = NSSize(width: 180, height: 44)) -> NSImage {
         let key = (preset.id + ":" + String(Int(size.width)) + "x" + String(Int(size.height))) as NSString
         if let image = waveformCache.object(forKey: key) { return image }
-        let wav = CueChime.waveData(kind: preset.id)
+        guard let wav = try? CueChime.resolvedWaveData(for: preset) else {
+            return NSImage(systemSymbolName: "speaker.slash", accessibilityDescription: "音源不可用") ?? NSImage(size: size)
+        }
         let samples = CueChime.samples(from: wav)
+        guard !samples.isEmpty else { return NSImage(size: size) }
         let width = max(16, Int(size.width)), height = max(16, Int(size.height))
         let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: width * 4, bitsPerPixel: 32)!
         NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
@@ -194,7 +290,7 @@ enum CueSoundCatalog {
     static func validationReport() -> [String: Bool] {
         var hashes = Set<UInt64>()
         var nonSilent = true, notClipped = true, validDuration = true, stableData = true
-        for preset in presets {
+        for preset in synthesizedPresets {
             let wav = CueChime.synthesizedWaveData(kind: preset.id)
             let samples = CueChime.samples(from: wav)
             let peak = samples.map { abs(Int($0)) }.max() ?? 0
@@ -208,13 +304,29 @@ enum CueSoundCatalog {
             hashes.insert(hash)
             stableData = stableData && wav == CueChime.synthesizedWaveData(kind: preset.id)
         }
-        return ["exactly_50_sound_presets": presets.count == 50,
-                "unique_sound_ids": Set(presets.map(\.id)).count == 50,
+        let recordedData = recordedPresets.compactMap { try? CueChime.resolvedWaveData(for: $0) }
+        let recordingsValid = recordedData.count == recordedPresets.count && zip(recordedPresets, recordedData).allSatisfy { preset, data in
+            let values = CueChime.samples(from: data)
+            let peak = values.map { abs(Int($0)) }.max() ?? 0
+            let rms = sqrt(values.reduce(0.0) { $0 + pow(Double($1) / Double(Int16.max), 2) } / Double(max(1, values.count)))
+            return abs(Double(values.count) / Double(CueChime.sampleRate) - preset.duration) < 0.0001 && peak < 32000 && peak > 1000 && rms > 0.005
+        }
+        let systemReadable = systemPresets.allSatisfy { preset in
+            guard let url = preset.systemURL else { return false }
+            return url.path.hasPrefix("/System/Library/Sounds/") && FileManager.default.isReadableFile(atPath: url.path)
+        }
+        return ["exactly_50_synthesized_presets": synthesizedPresets.count == 50,
+                "unique_sound_ids": Set(presets.map(\.id)).count == presets.count,
                 "fifty_distinct_audio_signals": hashes.count == 50,
                 "all_non_silent": nonSilent, "no_pcm_clipping": notClipped,
                 "short_notification_durations": validDuration,
                 "deterministic_local_synthesis": stableData,
                 "legacy_ids_preserved": ["complete", "input", "permission", "error"].allSatisfy { preset(id: $0)?.legacy == true },
+                "eight_cc0_recordings": recordedPresets.count == 8 && recordedPresets.allSatisfy { $0.sourceType == "recording" && $0.license == "CC0 1.0" && $0.sourceURL != nil },
+                "recordings_decodable_non_silent_and_unclipped": recordingsValid,
+                "four_nature_four_urban_recordings": self.presets(tagID: "nature").count == 4 && self.presets(tagID: "urban").count == 4,
+                "source_tags_are_explicit": presets.allSatisfy { !$0.tags.isEmpty && $0.tags.allSatisfy { tag(id: $0) != nil } && !$0.sourceDescription.isEmpty },
+                "system_files_read_from_os_only": systemReadable,
                 "silent_is_separate": !contains(id: "silent")]
     }
 }
@@ -229,9 +341,54 @@ struct CueChime {
     static func waveData(kind: String) -> Data {
         let identifier = CueSoundCatalog.contains(id: kind) ? kind : "error"
         if let data = waveCache.object(forKey: identifier as NSString) { return data as Data }
-        let data = synthesizedWaveData(kind: identifier)
-        waveCache.setObject(data as NSData, forKey: identifier as NSString, cost: data.count)
+        // Kept for older callers. The throwing write path below reports a
+        // missing recording instead of silently substituting another sound.
+        return (try? resolvedWaveData(for: CueSoundCatalog.preset(id: identifier)!)) ?? Data()
+    }
+
+    fileprivate static func resolvedWaveData(for preset: CueSoundPreset) throws -> Data {
+        if let data = waveCache.object(forKey: preset.id as NSString) { return data as Data }
+        let data: Data
+        if preset.sourceType == "recording" {
+            guard let url = CueSoundCatalog.recordingURL(for: preset) else {
+                throw NSError(domain: "VibeCue.Sound", code: 1, userInfo: [NSLocalizedDescriptionKey: "找不到实录音源：\(preset.name)。请重新安装完整的 VibeCue。"])
+            }
+            data = try Data(contentsOf: url)
+            guard !samples(from: data).isEmpty else {
+                throw NSError(domain: "VibeCue.Sound", code: 2, userInfo: [NSLocalizedDescriptionKey: "实录音源格式无效：\(preset.name)。"])
+            }
+        } else if let url = preset.systemURL {
+            data = try convertedSystemWaveData(from: url)
+        } else {
+            data = synthesizedWaveData(kind: preset.id)
+        }
+        waveCache.setObject(data as NSData, forKey: preset.id as NSString, cost: data.count)
         return data
+    }
+
+    private static func convertedSystemWaveData(from url: URL) throws -> Data {
+        let file = try AVAudioFile(forReading: url)
+        let capacity = AVAudioFrameCount(file.length)
+        guard capacity > 0, Double(file.length) / file.fileFormat.sampleRate <= 30,
+              let input = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: capacity),
+              let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(sampleRate), channels: 1, interleaved: true),
+              let converter = AVAudioConverter(from: file.processingFormat, to: target),
+              let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: AVAudioFrameCount(ceil(Double(capacity) * Double(sampleRate) / file.processingFormat.sampleRate)) + 256) else {
+            throw NSError(domain: "VibeCue.Sound", code: 3, userInfo: [NSLocalizedDescriptionKey: "无法读取本机系统音效。"])
+        }
+        try file.read(into: input)
+        var supplied = false, conversionError: NSError?
+        converter.convert(to: output, error: &conversionError) { _, status in
+            if supplied { status.pointee = .endOfStream; return nil }
+            supplied = true; status.pointee = .haveData; return input
+        }
+        if let conversionError { throw conversionError }
+        guard output.frameLength > 0, let values = output.int16ChannelData?[0] else {
+            throw NSError(domain: "VibeCue.Sound", code: 4, userInfo: [NSLocalizedDescriptionKey: "本机系统音效没有可播放内容。"])
+        }
+        var pcm = Data()
+        for index in 0..<Int(output.frameLength) { pcm.cueAppendLE(values[index]) }
+        return wavData(pcm: pcm)
     }
 
     fileprivate static func synthesizedWaveData(kind: String) -> Data {
@@ -292,6 +449,10 @@ struct CueChime {
             }
             pcm.append(Data(count: Int(Double(sampleRate) * tone.gap) * 2))
         }
+        return wavData(pcm: pcm)
+    }
+
+    private static func wavData(pcm: Data) -> Data {
         var wav = Data("RIFF".utf8)
         wav.cueAppendLE(UInt32(36 + pcm.count)); wav.append(Data("WAVEfmt ".utf8))
         wav.cueAppendLE(UInt32(16)); wav.cueAppendLE(UInt16(1)); wav.cueAppendLE(UInt16(1))
@@ -302,17 +463,36 @@ struct CueChime {
     }
 
     fileprivate static func samples(from data: Data) -> [Int16] {
-        guard data.count >= 44 else { return [] }
-        return stride(from: 44, to: data.count - 1, by: 2).map { offset in
-            Int16(bitPattern: UInt16(data[offset]) | UInt16(data[offset + 1]) << 8)
+        guard data.count >= 44, String(data: data.prefix(4), encoding: .ascii) == "RIFF",
+              String(data: data[8..<12], encoding: .ascii) == "WAVE" else { return [] }
+        var offset = 12, validFormat = false
+        while offset + 8 <= data.count {
+            let id = String(data: data[offset..<(offset + 4)], encoding: .ascii)
+            let length = Int(UInt32(data[offset + 4]) | UInt32(data[offset + 5]) << 8 | UInt32(data[offset + 6]) << 16 | UInt32(data[offset + 7]) << 24)
+            let start = offset + 8
+            guard length >= 0, length <= data.count - start else { return [] }
+            if id == "fmt ", length >= 16 {
+                validFormat = data[start] == 1 && data[start + 1] == 0 && data[start + 2] == 1 && data[start + 3] == 0 && data[start + 14] == 16 && data[start + 15] == 0
+                let rate = UInt32(data[start + 4]) | UInt32(data[start + 5]) << 8 | UInt32(data[start + 6]) << 16 | UInt32(data[start + 7]) << 24
+                validFormat = validFormat && rate == UInt32(sampleRate)
+            }
+            if id == "data", validFormat {
+                return stride(from: start, to: start + length - 1, by: 2).map { index in
+                    Int16(bitPattern: UInt16(data[index]) | UInt16(data[index + 1]) << 8)
+                }
+            }
+            offset = start + length + length % 2
         }
+        return []
     }
 
     static func write(kind: String, directory: URL) throws -> URL {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let identifier = CueSoundCatalog.contains(id: kind) ? kind : "error"
+        guard let preset = CueSoundCatalog.preset(id: identifier) else { throw CocoaError(.fileReadNoSuchFile) }
+        if let systemURL = preset.systemURL { return systemURL }
         let path = directory.appendingPathComponent(identifier + ".wav")
-        try waveData(kind: identifier).write(to: path, options: .atomic)
+        try resolvedWaveData(for: preset).write(to: path, options: .atomic)
         return path
     }
 
