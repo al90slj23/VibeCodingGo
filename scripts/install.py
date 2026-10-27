@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Install VibeCue, its local Codex adapter and passive notification hooks."""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import plistlib
+import shlex
+import shutil
+import subprocess
+import sys
+
+PROJECT = Path(__file__).resolve().parent.parent
+LABELS = ('local.vibecue',)
+OWNED_LABELS = frozenset(('local.vibecue', 'local.vibecue.watcher'))
+
+
+def private_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(path.name + '.vibecue-tmp')
+    with temporary.open('wb') as stream:
+        os.chmod(temporary, 0o600)
+        stream.write(data)
+    os.replace(temporary, path)
+
+
+def json_write(path, data):
+    private_write(path, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode())
+
+
+def hook_groups(control_path):
+    handler = {'type': 'command', 'command': shlex.quote(str(control_path)) + ' hook',
+               'timeout': 3, 'async': True}
+    return {
+        'PermissionRequest': {'hooks': [handler.copy()]},
+        'PreToolUse': {'matcher': r'(^|.*[._])request_user_input(_async)?$',
+                       'hooks': [handler.copy()]},
+    }
+
+
+def install_hooks(codex_home, control_path, home):
+    target = codex_home / 'hooks.json'
+    original = target.read_bytes() if target.exists() else None
+    config = json.loads(original) if original is not None else {'hooks': {}}
+    if not isinstance(config, dict) or not isinstance(config.get('hooks', {}), dict):
+        raise RuntimeError('Existing hooks.json has an unexpected shape; left unchanged.')
+    hooks = config.setdefault('hooks', {})
+    groups = hook_groups(control_path)
+    for event, group in groups.items():
+        current = hooks.setdefault(event, [])
+        if not isinstance(current, list):
+            raise RuntimeError('Existing hook event is not a list; left unchanged.')
+        if group not in current:
+            current.append(group)
+    new = (json.dumps(config, ensure_ascii=False, indent=2) + '\n').encode()
+    if new != original:
+        if original is not None:
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            private_write(home / 'backups' / ('hooks-' + stamp + '.json'), original)
+        private_write(target, new)
+    return {'file': str(target), 'groups': groups, 'trust_required': True}
+
+
+def install(start=True, with_hooks=True, user_home=None):
+    isolated = user_home is not None
+    user_home = Path(user_home or Path.home()).resolve()
+    home = user_home / 'Library/Application Support/VibeCue'
+    previous = json.loads((home / 'install.json').read_text()) if (home / 'install.json').exists() else {}
+    app = (user_home / 'Applications' if isolated else Path('/Applications')) / 'VibeCue.app'
+    agents = user_home / 'Library/LaunchAgents'
+    built = PROJECT / 'build/VibeCue.app'
+    if not (built / 'Contents/MacOS/VibeCue').exists():
+        raise RuntimeError('Run scripts/build.sh first.')
+    if app.exists() and not (home / 'install.json').exists():
+        raise RuntimeError('An unrelated VibeCue.app already exists; refusing to overwrite it.')
+    domain = f'gui/{os.getuid()}'
+    if start:
+        for label in set(LABELS) | (set(previous.get('labels', [])) & OWNED_LABELS):
+            subprocess.run(['/bin/launchctl', 'bootout', domain + '/' + label], capture_output=True)
+    for label in set(previous.get('labels', [])) & (OWNED_LABELS - set(LABELS)):
+        (agents / (label + '.plist')).unlink(missing_ok=True)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(home, 0o700)
+    for name in ('events', 'inflight', 'logs', 'runtime'):
+        (home / name).mkdir(exist_ok=True, mode=0o700)
+    runtime = home / 'runtime'
+    shutil.copytree(PROJECT / 'vibecue', runtime / 'vibecue', dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    app.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(built, app, dirs_exist_ok=True)
+    control = home / 'vibecuectl'
+    launcher = ('#!/bin/sh\nset -eu\nexport PYTHONPATH=' + shlex.quote(str(runtime)) + '\n'
+                'export VIBECUE_HOME=' + shlex.quote(str(home)) + '\n'
+                'exec /usr/bin/python3 -m vibecue.cli "$@"\n')
+    private_write(control, launcher.encode())
+    os.chmod(control, 0o700)
+    env = {'VIBECUE_HOME': str(home), 'PYTHONPATH': str(runtime),
+           'PYTHONUNBUFFERED': '1', 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
+    jobs = [
+        {'Label': LABELS[0], 'ProgramArguments': [str(app / 'Contents/MacOS/VibeCue'), '--background'],
+         'KeepAlive': {'SuccessfulExit': False}, 'ProcessType': 'Interactive'},
+    ]
+    for job in jobs:
+        job.update({'RunAtLoad': True, 'LimitLoadToSessionType': 'Aqua',
+                    'EnvironmentVariables': env, 'WorkingDirectory': str(runtime),
+                    'ThrottleInterval': 10,
+                    'StandardOutPath': str(home / 'logs' / (job['Label'] + '.out.log')),
+                    'StandardErrorPath': str(home / 'logs' / (job['Label'] + '.err.log'))})
+        private_write(agents / (job['Label'] + '.plist'), plistlib.dumps(job))
+    # Preserve config.toml and the existing computer-use notify command verbatim.
+    hooks = install_hooks(user_home / '.codex', control, home) if with_hooks else previous.get('hooks')
+    record = {'version': '0.1.0', 'app': str(app), 'home': str(home), 'hooks': hooks,
+              'source_dir': str(PROJECT),
+              'labels': list(LABELS), 'installed_at': datetime.now(timezone.utc).isoformat()}
+    json_write(home / 'install.json', record)
+    if start:
+        for label in LABELS:
+            subprocess.run(['/bin/launchctl', 'bootstrap', domain, str(agents / (label + '.plist'))], check=True)
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--no-start', action='store_true')
+    parser.add_argument('--without-hooks', action='store_true')
+    parser.add_argument('--user-home', type=Path, help='Isolated test destination; requires --no-start')
+    args = parser.parse_args()
+    if args.user_home and not args.no_start:
+        parser.error('--user-home requires --no-start')
+    install(not args.no_start, not args.without_hooks, args.user_home)
+
+
+if __name__ == '__main__':
+    main()
