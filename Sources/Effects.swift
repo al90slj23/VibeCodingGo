@@ -119,7 +119,8 @@ struct CueVisualStyle {
     static func normalizedFields(_ fields: [String: String], fallback: NSColor) -> [String: String] {
         let style = CueVisualStyle(fields: fields, fallback: fallback)
         var result = fields
-        result["effect"] = style.effectID; result["palette"] = style.paletteHex.joined(separator: ",")
+        result["effect"] = fields["effect"] == "random" ? "random" : style.effectID
+        result["palette"] = style.paletteHex.joined(separator: ",")
         result["direction"] = style.direction; result["speed"] = String(style.speed)
         result["width"] = String(Double(style.width)); result["opacity"] = String(style.opacity)
         result["inset"] = String(Double(style.inset)); result["trail"] = String(style.trail)
