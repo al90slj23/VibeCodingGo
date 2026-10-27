@@ -56,7 +56,7 @@ def handle_hook(payload):
         if name.rsplit('.', 1)[-1].rsplit('__', 1)[-1] not in ('request_user_input', 'request_user_input_async'):
             return
         emit_event('input', thread_id, turn_id,
-                   message='Codex 已提出問題，請回到對話回答或選擇',
+                   message='Codex 已提出问题，请回到对话回答或选择',
                    event_id=f'input:{thread_id}:{turn_id}:{payload.get("tool_use_id", "")}',
                    source='PreToolUse hook')
 
@@ -117,21 +117,21 @@ def control(action):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='VibeCue 本機對話提醒')
+    parser = argparse.ArgumentParser(description='VibeCue 本机对话提醒')
     sub = parser.add_subparsers(dest='command', required=True)
-    watch = sub.add_parser('watch', help='被動觀察本機 Codex 對話')
+    watch = sub.add_parser('watch', help='被动观察本机 Codex 对话')
     watch.add_argument('--interval', type=float, default=1.0)
-    demo = sub.add_parser('test', help='測試畫面與聲音')
+    demo = sub.add_parser('test', help='测试画面与声音')
     demo.add_argument('kind', choices=('complete', 'input', 'permission', 'error'))
-    demo.add_argument('--title', default='VibeCue · 提醒效果測試')
+    demo.add_argument('--title', default='VibeCue · 提醒效果测试')
     demo.add_argument('--thread-id', default='')
-    demo.add_argument('--message', default='這是一則測試提醒。')
-    sub.add_parser('status', help='顯示本機程序與事件來源狀態')
-    sub.add_parser('hook', help='Codex 的唯讀提醒 hook（JSON stdin）')
-    notify = sub.add_parser('notify', help='可選的 notify 串接介面（JSON argument）')
+    demo.add_argument('--message', default='这是一则测试提醒。')
+    sub.add_parser('status', help='显示本机进程与事件来源状态')
+    sub.add_parser('hook', help='Codex 的唯读提醒 hook（JSON stdin）')
+    notify = sub.add_parser('notify', help='可选的 notify 串接接口（JSON argument）')
     notify.add_argument('payload')
-    sub.add_parser('stop', help='停止 App 與其監看程序')
-    sub.add_parser('start', help='重新啟動 App 與其監看程序')
+    sub.add_parser('stop', help='停止 App 与其监控进程')
+    sub.add_parser('start', help='重新启动 App 与其监控进程')
     args = parser.parse_args(argv)
     if args.command == 'watch':
         from .providers.codex import main as watch_main

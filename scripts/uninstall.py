@@ -31,7 +31,7 @@ def main():
                 if group in groups:
                     groups.remove(group)
             json_write(path, config)
-    print('VibeCue 已停用；應用程式與本機資料保留，可自行刪除。')
+    print('VibeCue 已停用；应用程序与本机数据保留，可自行删除。')
 
 
 if __name__ == '__main__':

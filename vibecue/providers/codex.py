@@ -246,13 +246,13 @@ class Interpreter:
         name = str(payload.get('name', '')).split('.')[-1]
         call_id = str(payload.get('call_id') or payload.get('id') or '')
         if event_type == 'function_call' and name in _INPUT_NAMES:
-            self.send('input', '有問題需要你回答',
+            self.send('input', '有问题需要你回答',
                       input_event_id(self.metadata.thread_id, self.turn_id, call_id))
         elif event_type == 'custom_tool_call' and name == 'exec':
             # Code-mode invocation is visible before nested execution. Only an
             # explicit awaited tool call is recognized, not arbitrary mentions.
             if _JS_INPUT.search(strip_js_literals(payload.get('input', ''))):
-                self.send('input', '偵測到提問工具呼叫（依本機執行記錄判斷）',
+                self.send('input', '侦测到提问工具调用（依本机运行记录判断）',
                           input_event_id(self.metadata.thread_id, self.turn_id, call_id))
 
 

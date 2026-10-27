@@ -77,7 +77,7 @@ def resolve_title(thread_id, codex_home=None):
                     continue
     except OSError:
         pass
-    return f'Codex 對話 {str(thread_id)[:8]}' if thread_id else 'Codex 對話'
+    return f'Codex 对话 {str(thread_id)[:8]}' if thread_id else 'Codex 对话'
 
 
 # An explicit request to the user in the final paragraph is a heuristic, never
@@ -100,8 +100,8 @@ def classify_final_message(text):
     tail = paragraphs[-1][-700:] if paragraphs else ''
     tail = '\n'.join(l for l in tail.splitlines() if not l.lstrip().startswith('>'))
     if _ACTION_REQUEST.search(tail) and not _NEGATED_REQUEST.search(tail):
-        return 'input', '回覆可能需要你的確認或選擇（依回覆文字判斷）'
-    return 'complete', '這一輪已結束'
+        return 'input', '回复可能需要你的确认或选择（依回复文本判断）'
+    return 'complete', '这一轮已结束'
 
 
 def prune_event_spool(spool, now=None, retain=500):

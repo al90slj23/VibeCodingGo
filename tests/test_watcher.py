@@ -98,7 +98,7 @@ class InterpretationTests(unittest.TestCase):
         self.interpreter.process(record('event_msg', {'type': 'task_complete', 'turn_id': 'turn-1', 'last_agent_message': '請你選擇下一步。'}))
         self.assertEqual(self.events[1]['kind'], 'input')
         self.assertEqual(self.events[0]['event_id'], self.events[1]['event_id'])
-        self.assertIn('依回覆文字判斷', self.events[1]['message'])
+        self.assertIn('依回复文本判断', self.events[1]['message'])
 
     def test_structured_question_and_async_question(self):
         for name in ('request_user_input', 'request_user_input_async'):
@@ -137,7 +137,7 @@ class InterpretationTests(unittest.TestCase):
     def test_final_questions_need_explicit_user_request(self):
         for text in ('測試通過。', '如何運作？以下已說明。', '不需要你確認。', '> 請你確認。', '```\n請你選擇\n```'):
             self.assertEqual(classify_final_message(text)[0], 'complete', text)
-        for text in ('請你確認再繼續。', '需要您選擇。', 'Please confirm the destination.', 'I need your approval.'):
+        for text in ('請你確認再繼續。', '需要您選擇。', '请你确认再继续。', '需要您选择。', 'Please confirm the destination.', 'I need your approval.'):
             self.assertEqual(classify_final_message(text)[0], 'input', text)
 
 

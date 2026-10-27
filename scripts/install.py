@@ -10,8 +10,11 @@ from pathlib import Path
 import plistlib
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
+import uuid
 
 PROJECT = Path(__file__).resolve().parent.parent
 LABELS = ('local.vibecue',)
@@ -29,6 +32,62 @@ def private_write(path, data):
 
 def json_write(path, data):
     private_write(path, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode())
+
+
+def owned_pid(home, executable):
+    """The app can outlive its launchd job after Launch Services reopens it."""
+    try:
+        pid = int(json.loads((home / 'app-status.json').read_text())['pid'])
+        result = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'uid=', '-o', 'comm='],
+                                capture_output=True, text=True)
+        parts = result.stdout.strip().split(None, 1)
+        if (pid > 1 and result.returncode == 0 and len(parts) == 2 and
+                int(parts[0]) == os.getuid() and parts[1] == str(executable)):
+            return pid
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def stop_owned_app(home, executable):
+    pid = owned_pid(home, executable)
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and owned_pid(home, executable) == pid:
+        time.sleep(.1)
+    if owned_pid(home, executable) == pid:
+        os.kill(pid, signal.SIGKILL)
+
+
+def replace_app(built, app, home):
+    """Use fresh inodes; overwriting signed executable pages breaks macOS launches."""
+    app.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    staging = app.parent / ('.VibeCue-install-' + stamp + '.app')
+    previous = app.parent / ('.VibeCue-previous-' + stamp + '.app')
+    try:
+        shutil.copytree(built, staging)
+        subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(staging)], check=True)
+        if app.exists():
+            app.rename(previous)
+        try:
+            staging.rename(app)
+        except OSError:
+            if previous.exists() and not app.exists():
+                previous.rename(app)
+            raise
+        if previous.exists():
+            backup = home / 'backups'
+            backup.mkdir(mode=0o700, exist_ok=True)
+            shutil.move(str(previous), str(backup / ('app-' + stamp + '.app')))
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def hook_groups(control_path):
@@ -90,12 +149,14 @@ def install(start=True, with_hooks=True, user_home=None):
     built = PROJECT / 'build/VibeCue.app'
     if not (built / 'Contents/MacOS/VibeCue').exists():
         raise RuntimeError('Run scripts/build.sh first.')
+    subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(built)], check=True)
     if app.exists() and not (home / 'install.json').exists():
         raise RuntimeError('An unrelated VibeCue.app already exists; refusing to overwrite it.')
     domain = f'gui/{os.getuid()}'
     if start:
         for label in set(LABELS) | (set(previous.get('labels', [])) & OWNED_LABELS):
             subprocess.run(['/bin/launchctl', 'bootout', domain + '/' + label], capture_output=True)
+        stop_owned_app(home, app / 'Contents/MacOS/VibeCue')
     for label in set(previous.get('labels', [])) & (OWNED_LABELS - set(LABELS)):
         (agents / (label + '.plist')).unlink(missing_ok=True)
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -103,10 +164,11 @@ def install(start=True, with_hooks=True, user_home=None):
     for name in ('events', 'inflight', 'logs', 'runtime'):
         (home / name).mkdir(exist_ok=True, mode=0o700)
     runtime = home / 'runtime'
+    for cache in (runtime / 'vibecue').rglob('__pycache__'):
+        shutil.rmtree(cache)
     shutil.copytree(PROJECT / 'vibecue', runtime / 'vibecue', dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    app.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(built, app, dirs_exist_ok=True)
+    replace_app(built, app, home)
     control = home / 'vibecuectl'
     launcher = ('#!/bin/sh\nset -eu\nexport PYTHONPATH=' + shlex.quote(str(runtime)) + '\n'
                 'export VIBECUE_HOME=' + shlex.quote(str(home)) + '\n'

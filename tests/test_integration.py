@@ -42,6 +42,30 @@ class HookAdapterTests(unittest.TestCase):
 
 
 class InstallTests(unittest.TestCase):
+    def test_stop_ignores_unrelated_pid_and_terminates_owned_app(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory)
+            executable=Path('/Applications/VibeCue.app/Contents/MacOS/VibeCue')
+            (home/'app-status.json').write_text(json.dumps({'pid':2222}))
+            unrelated=type('Result',(),{'returncode':0,'stdout':f'{os.getuid()} /Applications/Other.app/Contents/MacOS/Other'})()
+            with patch.object(installer.subprocess,'run',return_value=unrelated),patch.object(installer.os,'kill') as kill:
+                installer.stop_owned_app(home,executable)
+                kill.assert_not_called()
+            with patch.object(installer,'owned_pid',side_effect=[2222,None,None]),patch.object(installer.os,'kill') as kill:
+                installer.stop_owned_app(home,executable)
+                kill.assert_called_once_with(2222,installer.signal.SIGTERM)
+
+    def test_signed_bundle_replacement_uses_fresh_inode_and_keeps_backup(self):
+        if not (PROJECT/'build/VibeCue.app').exists():self.skipTest('Build app first')
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);built=PROJECT/'build/VibeCue.app';target=home/'Applications/VibeCue.app'
+            installer.replace_app(built,target,home)
+            original=(target/'Contents/MacOS/VibeCue').stat().st_ino
+            installer.replace_app(built,target,home)
+            self.assertNotEqual((target/'Contents/MacOS/VibeCue').stat().st_ino,original)
+            self.assertTrue(list((home/'backups').glob('app-*.app')))
+            self.assertFalse(list(target.parent.glob('.VibeCue-install-*.app')))
+
     def test_upgrade_removes_only_our_raw_permission_handler(self):
         with tempfile.TemporaryDirectory() as directory:
             home=Path(directory)

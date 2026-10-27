@@ -32,7 +32,7 @@ struct CueEvent {
         self.id = String(id.prefix(200))
         self.kind = kind
         self.provider = String((raw["provider"] as? String ?? "codex").prefix(40))
-        self.title = String((raw["title"] as? String ?? "Codex 對話").prefix(180))
+        self.title = String((raw["title"] as? String ?? "Codex 对话").prefix(180))
         self.threadID = String((raw["thread_id"] as? String ?? "").prefix(160))
         self.message = String((raw["message"] as? String ?? "").prefix(220))
         self.source = source
@@ -69,10 +69,10 @@ struct CueEvent {
     var isPreview: Bool { source == "native demo" || source == "manual test" }
     var label: String {
         switch kind {
-        case "complete": return "本輪已完成"
-        case "input": return "需要你回答或判斷"
-        case "permission": return source == "native demo" || source == "manual test" ? "人工批准提醒測試" : "正在等待你人工批准"
-        default: return "執行遇到問題"
+        case "complete": return "本轮已完成"
+        case "input": return "需要你回答或判断"
+        case "permission": return source == "native demo" || source == "manual test" ? "人工批准提醒测试" : "正在等待你人工批准"
+        default: return "运行遇到问题"
         }
     }
     var symbol: String {
@@ -86,8 +86,8 @@ struct CueEvent {
     var sound: String {
         switch kind {
         case "complete": return "上行三音"
-        case "input": return "問答三音"
-        case "permission": return "雙短一長"
+        case "input": return "问答三音"
+        case "permission": return "双短一长"
         default: return "低音警示"
         }
     }
@@ -171,8 +171,8 @@ struct CueSettings {
     func soundToken(for kind: String) -> String { eventStyles[kind]?["sound"] ?? kind }
     func soundName(for kind: String) -> String {
         let token = soundToken(for: kind)
-        if token == "silent" { return "靜音" }
-        if token.hasPrefix("custom:") { return "自選音效" }
+        if token == "silent" { return "静音" }
+        if token.hasPrefix("custom:") { return "自选音效" }
         return CueEvent(kind: token, title: "", message: "").sound
     }
 }
@@ -298,7 +298,7 @@ final class BannerView: NSView {
     let conversationLabel = NSTextField(labelWithString: "")
     let messageLabel = NSTextField(wrappingLabelWithString: "")
     let icon = NSImageView()
-    let openButton = NSButton(title: "開啟對話 ↗", target: nil, action: nil)
+    let openButton = NSButton(title: "打开对话 ↗", target: nil, action: nil)
     let closeButton = NSButton(title: "×", target: nil, action: nil)
 
     init(event: CueEvent, target: AnyObject, color: NSColor) {
@@ -329,7 +329,7 @@ final class BannerView: NSView {
         conversationLabel.toolTip = event.title
         addSubview(conversationLabel)
 
-        messageLabel.stringValue = event.message.isEmpty ? "回到這個對話查看最新進度。" : event.message
+        messageLabel.stringValue = event.message.isEmpty ? "回到这个对话查看最新进度。" : event.message
         messageLabel.font = .systemFont(ofSize: 12)
         messageLabel.textColor = NSColor.white.withAlphaComponent(0.70)
         messageLabel.maximumNumberOfLines = 2
@@ -350,7 +350,7 @@ final class BannerView: NSView {
         closeButton.font = .systemFont(ofSize: 24, weight: .light)
         closeButton.target = target; closeButton.action = #selector(CueController.dismissCurrent)
         closeButton.frame = NSRect(x: 519, y: 119, width: 27, height: 29)
-        closeButton.setAccessibilityLabel("關閉提醒")
+        closeButton.setAccessibilityLabel("关闭提醒")
         addSubview(closeButton)
         setAccessibilityElement(true)
         setAccessibilityLabel("\(event.providerLabel) 提醒：\(event.label)，\(event.title)")
@@ -392,7 +392,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var ownsLock = false
     var shownAt = Date()
     var monitorObserver: NSObjectProtocol?
-    var watcherHealthText = "監看程序未連線"
+    var watcherHealthText = "监控进程未连接"
     var nextHealthCheck = Date.distantPast
     var watcherProcess: Process?
     var watcherRestartTimer: Timer?
@@ -465,7 +465,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             let kind = args[demoIndex + 1]
             if ["complete", "input", "permission", "error"].contains(kind) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                    self.enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果測試", message: "這是本機示範。正式提醒會顯示對話名稱。"))
+                    self.enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果测试", message: "这是本机示范。正式提醒会显示对话名称。"))
                     if let captureIndex = args.firstIndex(of: "--capture"), args.indices.contains(captureIndex + 1) {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.captureBanner(to: args[captureIndex + 1]) }
                     }
@@ -702,7 +702,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
     @objc func demo(_ sender: NSMenuItem) {
         let kind = sender.representedObject as? String ?? "complete"
-        enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果測試", message: "這是本機示範。正式提醒會顯示對話名稱。"))
+        enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果测试", message: "这是本机示范。正式提醒会显示对话名称。"))
     }
     @objc func quit() {
         do {
@@ -716,7 +716,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func updateWatcherHealth() {
         nextHealthCheck = Date().addingTimeInterval(2)
-        var message = "監看程序未連線"
+        var message = "监控进程未连接"
         let path = home.appendingPathComponent("watcher-state.json")
         if let data = try? Data(contentsOf: path), data.count <= 2_097_152,
            let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -726,11 +726,11 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             let count = state["watched_threads"] as? Int ?? 0
             let errors = state["read_error_count"] as? Int ?? 0
             if errors > 0 {
-                message = "需要授權讀取記錄 · \(errors) 個檔案無法讀取"
+                message = "需要授权读取记录 · \(errors) 个文件无法读取"
             } else if count == 0 {
-                message = "尚未找到可監看的本機對話"
+                message = "尚未找到可监控的本机对话"
             } else {
-                message = "本機監看中 · \(count) 個對話"
+                message = "本机监控中 · \(count) 个对话"
             }
         }
         if watcherHealthText != message {
@@ -745,7 +745,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         watcherRestartTimer?.invalidate(); watcherRestartTimer = nil
         let runtime = home.appendingPathComponent("runtime", isDirectory: true)
         guard FileManager.default.fileExists(atPath: runtime.appendingPathComponent("vibecue/cli.py").path) else {
-            watcherLaunchError = "本機監看模組尚未安裝"
+            watcherLaunchError = "本机监控模块尚未安装"
             writeStatus(); return
         }
         let logs = home.appendingPathComponent("logs", isDirectory: true)
@@ -793,7 +793,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             watcherStartedAt = Date(); watcherLaunchError = ""
         } catch {
             watcherProcess = nil
-            watcherLaunchError = "監看程序啟動失敗：\(error.localizedDescription)"
+            watcherLaunchError = "监控进程启动失败：\(error.localizedDescription)"
             scheduleWatcherRestart(after: watcherRestartDelay)
             watcherRestartDelay = min(60, watcherRestartDelay * 2)
         }
@@ -840,17 +840,17 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     @objc func authorizeHistoryRead() {
         let expected = expectedHistoryDirectory()
         let panel = NSOpenPanel()
-        panel.title = "授權讀取本機 Codex 記錄"
-        panel.message = "請選擇 Codex 的 sessions 記錄資料夾。VibeCue 只讀取本機記錄以判斷提醒，不修改或上傳對話。"
-        panel.prompt = "允許讀取此資料夾"
+        panel.title = "授权读取本机 Codex 记录"
+        panel.message = "请选择 Codex 的 sessions 记录文件夹。VibeCue 只读取本机记录以判断提醒，不修改或上传对话。"
+        panel.prompt = "允许读取此文件夹"
         panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.canCreateDirectories = false; panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true; panel.directoryURL = expected
         guard panel.runModal() == .OK, let selected = panel.url else { return }
         guard selected.resolvingSymlinksInPath().standardizedFileURL.path == expected.path else {
             let alert = NSAlert()
-            alert.messageText = "請選擇 Codex 的 sessions 記錄資料夾"
-            alert.informativeText = "為了限定讀取範圍，請選擇：\(expected.path)"
+            alert.messageText = "请选择 Codex 的 sessions 记录文件夹"
+            alert.informativeText = "为了限定读取范围，请选择：\(expected.path)"
             alert.runModal(); return
         }
         if historyScopeActive { historyURL?.stopAccessingSecurityScopedResource() }
@@ -911,35 +911,35 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func refreshMenu() {
         let menu = NSMenu()
-        let panel = NSMenuItem(title: "開啟 VibeCue 面板…", action: #selector(openSettings), keyEquivalent: ",")
+        let panel = NSMenuItem(title: "打开 VibeCue 面板…", action: #selector(openSettings), keyEquivalent: ",")
         panel.target = self; menu.addItem(panel)
-        let subtitle = NSMenuItem(title: "AI Coding Companion · AI 開發提醒助手", action: nil, keyEquivalent: "")
+        let subtitle = NSMenuItem(title: "AI Coding Companion · AI 开发提醒助手", action: nil, keyEquivalent: "")
         subtitle.isEnabled = false; menu.addItem(subtitle)
         menu.addItem(.separator())
-        let status = NSMenuItem(title: pausedUntil == nil ? "VibeCue · \(watcherHealthText)" : "已暫停提醒 30 分鐘", action: nil, keyEquivalent: "")
+        let status = NSMenuItem(title: pausedUntil == nil ? "VibeCue · \(watcherHealthText)" : "已暂停提醒 30 分钟", action: nil, keyEquivalent: "")
         status.isEnabled = false; menu.addItem(status)
         menu.addItem(.separator())
-        let enabled = NSMenuItem(title: "啟用提醒", action: #selector(toggleEnabled), keyEquivalent: "")
+        let enabled = NSMenuItem(title: "启用提醒", action: #selector(toggleEnabled), keyEquivalent: "")
         enabled.target = self; enabled.state = settings.enabled ? .on : .off; menu.addItem(enabled)
         let mute = NSMenuItem(title: "播放提示音", action: #selector(toggleMute), keyEquivalent: "")
         mute.target = self; mute.state = muted ? .off : .on; menu.addItem(mute)
-        let pause = NSMenuItem(title: pausedUntil == nil ? "暫停提醒 30 分鐘" : "恢復提醒", action: #selector(togglePause), keyEquivalent: "")
+        let pause = NSMenuItem(title: pausedUntil == nil ? "暂停提醒 30 分钟" : "恢复提醒", action: #selector(togglePause), keyEquivalent: "")
         pause.target = self; menu.addItem(pause)
         let demoMenu = NSMenu()
-        for (name, kind) in [("完成", "complete"), ("需要回答", "input"), ("人工批准測試", "permission")] {
+        for (name, kind) in [("完成", "complete"), ("需要回答", "input"), ("人工批准测试", "permission")] {
             let item = NSMenuItem(title: "\(name) · \(settings.soundName(for: kind))", action: #selector(demo(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = kind; demoMenu.addItem(item)
         }
-        let tests = NSMenuItem(title: "測試提醒效果", action: nil, keyEquivalent: ""); tests.submenu = demoMenu; menu.addItem(tests)
+        let tests = NSMenuItem(title: "测试提醒效果", action: nil, keyEquivalent: ""); tests.submenu = demoMenu; menu.addItem(tests)
         let audioMenu = NSMenu()
-        for (name, kind) in [("完成", "complete"), ("需要回答", "input"), ("人工批准測試音", "permission")] {
+        for (name, kind) in [("完成", "complete"), ("需要回答", "input"), ("人工批准测试音", "permission")] {
             let item = NSMenuItem(title: "\(name) · \(settings.soundName(for: kind))", action: #selector(testSound(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = kind; item.isEnabled = !muted; audioMenu.addItem(item)
         }
-        let audioTests = NSMenuItem(title: "只測試提示音", action: nil, keyEquivalent: ""); audioTests.submenu = audioMenu; menu.addItem(audioTests)
+        let audioTests = NSMenuItem(title: "只测试提示音", action: nil, keyEquivalent: ""); audioTests.submenu = audioMenu; menu.addItem(audioTests)
         if !recent.isEmpty {
             menu.addItem(.separator())
-            let header = NSMenuItem(title: "最近提醒 · 點擊開啟對話", action: nil, keyEquivalent: "")
+            let header = NSMenuItem(title: "最近提醒 · 点击打开对话", action: nil, keyEquivalent: "")
             header.isEnabled = false; menu.addItem(header)
             for (index, event) in recent.enumerated() {
                 let item = NSMenuItem(title: "\(event.kind == "complete" ? "✓" : "●") \(event.title.prefix(36))", action: #selector(openRecent(_:)), keyEquivalent: "")
@@ -948,7 +948,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             }
         }
         menu.addItem(.separator())
-        let exit = NSMenuItem(title: "結束 VibeCue", action: #selector(quit), keyEquivalent: "q")
+        let exit = NSMenuItem(title: "结束 VibeCue", action: #selector(quit), keyEquivalent: "q")
         exit.target = self; menu.addItem(exit)
         statusItem.menu = menu
     }
@@ -1062,8 +1062,8 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         sidebar.addSubview(mark)
         label("VibeCue", in: sidebar, frame: NSRect(x: 60, y: 29, width: 116, height: 30), size: 22, weight: .semibold)
         label("AI Coding Companion", in: sidebar, frame: NSRect(x: 20, y: 73, width: 156, height: 17), size: 11, color: .secondaryLabelColor)
-        label("AI 開發提醒助手", in: sidebar, frame: NSRect(x: 20, y: 94, width: 156, height: 18), size: 11, color: .secondaryLabelColor)
-        for (index, pair) in [("總覽", "square.grid.2x2"), ("提醒規則", "bell"), ("泛光與聲音", "waveform"), ("集成與檔案", "puzzlepiece.extension")].enumerated() {
+        label("AI 开发提醒助手", in: sidebar, frame: NSRect(x: 20, y: 94, width: 156, height: 18), size: 11, color: .secondaryLabelColor)
+        for (index, pair) in [("总览", "square.grid.2x2"), ("提醒规则", "bell"), ("泛光与声音", "waveform"), ("集成与文件", "puzzlepiece.extension")].enumerated() {
             let button = NSButton(title: pair.0, target: self, action: #selector(navigate(_:)))
             button.image = NSImage(systemSymbolName: pair.1, accessibilityDescription: nil)
             button.imagePosition = .imageLeading; button.imageScaling = .scaleProportionallyDown
@@ -1076,7 +1076,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         }
         let line = NSView(frame: NSRect(x: 20, y: 517, width: 142, height: 1))
         line.wantsLayer = true; line.layer?.backgroundColor = NSColor.separatorColor.cgColor; sidebar.addSubview(line)
-        label("本機執行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 533, width: 154, height: 19), size: 10.5, color: .secondaryLabelColor)
+        label("本机运行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 533, width: 154, height: 19), size: 10.5, color: .secondaryLabelColor)
         label("VibeCue 0.1.1", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
     }
 
@@ -1096,7 +1096,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case 2: glowAndSound()
         default: providers()
         }
-        label("變更會立即儲存到本機。", in: content, frame: NSRect(x: 26, y: 558, width: 525, height: 18), size: 10.5, color: .tertiaryLabelColor)
+        label("变更会立即保存到本机。", in: content, frame: NSRect(x: 26, y: 558, width: 525, height: 18), size: 10.5, color: .tertiaryLabelColor)
         updateHealth()
     }
 
@@ -1127,7 +1127,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     func rule(_ title: String, _ detail: String, y: CGFloat, key: String, on: Bool, duration: Double, durationKey: String, enabled: Bool = true) {
         let view = card(y, 122)
         toggle(title, detail, in: view, y: 17, key: key, on: on, enabled: enabled)
-        label("顯示時間", in: view, frame: NSRect(x: 20, y: 84, width: 120, height: 23), size: 11.5, color: .secondaryLabelColor)
+        label("显示时间", in: view, frame: NSRect(x: 20, y: 84, width: 120, height: 23), size: 11.5, color: .secondaryLabelColor)
         let popup = NSPopUpButton(frame: NSRect(x: 391, y: 80, width: 116, height: 26), pullsDown: false)
         var values: [Double] = [3, 5, 8, 14, 20, 30, 60]
         if !values.contains(duration) { values.append(duration); values.sort() }
@@ -1138,7 +1138,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         }
         popup.identifier = NSUserInterfaceItemIdentifier(durationKey)
         popup.target = self; popup.action = #selector(changeDuration(_:))
-        popup.setAccessibilityLabel(title + "顯示時間")
+        popup.setAccessibilityLabel(title + "显示时间")
         popup.isEnabled = enabled
         view.addSubview(popup)
     }
@@ -1161,45 +1161,45 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func overview() {
-        heading("AI 開發提醒助手", "離開對話視窗，也能掌握需要你注意的時刻。")
+        heading("AI 开发提醒助手", "离开对话窗口，也能掌握需要你注意的时刻。")
         let status = card(106, 199)
-        label("CODEX · 本機監看", in: status, frame: NSRect(x: 20, y: 17, width: 480, height: 21), size: 11, weight: .semibold, color: .secondaryLabelColor)
+        label("CODEX · 本机监控", in: status, frame: NSRect(x: 20, y: 17, width: 480, height: 21), size: 11, weight: .semibold, color: .secondaryLabelColor)
         healthLabel = label("", in: status, frame: NSRect(x: 20, y: 50, width: 480, height: 26), size: 18, weight: .semibold)
         threadLabel = label("", in: status, frame: NSRect(x: 20, y: 87, width: 480, height: 24), size: 12, color: .secondaryLabelColor)
-        toggle("啟用提醒", "暫停全部泛光、提示卡與聲音。", in: status, y: 130, key: "enabled", on: cue.settings.enabled)
+        toggle("启用提醒", "暂停全部泛光、提示卡与声音。", in: status, y: 130, key: "enabled", on: cue.settings.enabled)
         let latest = card(322, 101)
-        label("最近一則提醒", in: latest, frame: NSRect(x: 20, y: 15, width: 480, height: 20), size: 11, color: .secondaryLabelColor)
+        label("最近一则提醒", in: latest, frame: NSRect(x: 20, y: 15, width: 480, height: 20), size: 11, color: .secondaryLabelColor)
         latestLabel = label("", in: latest, frame: NSRect(x: 20, y: 45, width: 480, height: 37), size: 13, weight: .medium, lines: 2)
-        _ = button("測試完成提醒", in: content, frame: NSRect(x: 25, y: 450, width: 168, height: 32), action: #selector(testAlert(_:)), represented: "complete")
-        _ = button("測試等待輸入", in: content, frame: NSRect(x: 205, y: 450, width: 168, height: 32), action: #selector(testAlert(_:)), represented: "input")
-        label("測試會使用目前的提醒與音量設定；一般提醒不會搶走輸入焦點。", in: content, frame: NSRect(x: 27, y: 505, width: 520, height: 34), size: 11, color: .secondaryLabelColor, lines: 2)
+        _ = button("测试完成提醒", in: content, frame: NSRect(x: 25, y: 450, width: 168, height: 32), action: #selector(testAlert(_:)), represented: "complete")
+        _ = button("测试等待输入", in: content, frame: NSRect(x: 205, y: 450, width: 168, height: 32), action: #selector(testAlert(_:)), represented: "input")
+        label("测试会使用目前的提醒与音量设置；一般提醒不会抢走输入焦点。", in: content, frame: NSRect(x: 27, y: 505, width: 520, height: 34), size: 11, color: .secondaryLabelColor, lines: 2)
     }
 
     func notifications() {
-        heading("提醒自訂", "分別設定每一種提醒的顏色、聲音與顯示時間。")
+        heading("提醒自定义", "分别设置每一种提醒的颜色、声音与显示时间。")
         let selector = NSPopUpButton(frame: NSRect(x: 26, y: 106, width: 526, height: 32), pullsDown: false)
-        for (name, kind) in [("本輪已完成", "complete"), ("需要回答或判斷", "input"), ("人工批准 · 僅供預覽", "permission")] {
+        for (name, kind) in [("本轮已完成", "complete"), ("需要回答或判断", "input"), ("人工批准 · 仅供预览", "permission")] {
             selector.addItem(withTitle: name); selector.lastItem?.representedObject = kind
             if kind == selectedKind { selector.select(selector.lastItem) }
         }
         selector.target = self; selector.action = #selector(selectEventKind(_:))
-        selector.identifier = NSUserInterfaceItemIdentifier("event.kind"); selector.setAccessibilityLabel("自訂提醒類型")
+        selector.identifier = NSUserInterfaceItemIdentifier("event.kind"); selector.setAccessibilityLabel("自定义提醒类型")
         content.addSubview(selector)
         let view = card(154, 356)
         let isPermission = selectedKind == "permission"
         let on = selectedKind == "complete" ? cue.settings.completeEnabled : cue.settings.inputEnabled
-        let detail = isPermission ? "Codex 尚無可確認人工等待的訊號；自動批准不提醒。可先自訂並預覽。" : (selectedKind == "complete" ? "目前一輪執行結束，不一定代表整個需求已交付。" : "Codex 提出問題時提醒你回答或選擇。")
-        toggle(isPermission ? "人工批准（尚未接入）" : "啟用這一類提醒", detail, in: view, y: 17, key: selectedKind + "_enabled", on: isPermission ? false : on, enabled: !isPermission)
-        label("泛光顏色", in: view, frame: NSRect(x: 20, y: 91, width: 170, height: 23), size: 12, weight: .medium)
+        let detail = isPermission ? "Codex 尚无可确认人工等待的信号；自动批准不提醒。可先自定义并预览。" : (selectedKind == "complete" ? "目前一轮运行结束，不一定代表整个需求已交付。" : "Codex 提出问题时提醒你回答或选择。")
+        toggle(isPermission ? "人工批准（尚未接入）" : "启用这一类提醒", detail, in: view, y: 17, key: selectedKind + "_enabled", on: isPermission ? false : on, enabled: !isPermission)
+        label("泛光颜色", in: view, frame: NSRect(x: 20, y: 91, width: 170, height: 23), size: 12, weight: .medium)
         let color = NSColorWell(frame: NSRect(x: 391, y: 84, width: 116, height: 32))
         color.color = cue.settings.color(for: selectedKind); color.target = self; color.action = #selector(changeEventColor(_:))
-        color.identifier = NSUserInterfaceItemIdentifier("event.color"); color.setAccessibilityLabel("提醒泛光顏色")
+        color.identifier = NSUserInterfaceItemIdentifier("event.color"); color.setAccessibilityLabel("提醒泛光颜色")
         view.addSubview(color)
         label("提示音", in: view, frame: NSRect(x: 20, y: 136, width: 170, height: 23), size: 12, weight: .medium)
         let sounds = NSPopUpButton(frame: NSRect(x: 200, y: 129, width: 307, height: 31), pullsDown: false)
         let selectedSound = cue.settings.soundToken(for: selectedKind)
-        var options = [("上行三音", "complete"), ("問答三音", "input"), ("雙短一長", "permission"), ("低音警示", "error"), ("靜音", "silent")]
-        if selectedSound.hasPrefix("custom:") { options.append(("自選音效（已匯入）", selectedSound)) }
+        var options = [("上行三音", "complete"), ("问答三音", "input"), ("双短一长", "permission"), ("低音警示", "error"), ("静音", "silent")]
+        if selectedSound.hasPrefix("custom:") { options.append(("自选音效（已导入）", selectedSound)) }
         for (name, token) in options {
             sounds.addItem(withTitle: name); sounds.lastItem?.representedObject = token
             if token == selectedSound { sounds.select(sounds.lastItem) }
@@ -1207,9 +1207,9 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         sounds.target = self; sounds.action = #selector(changeEventSound(_:))
         sounds.identifier = NSUserInterfaceItemIdentifier("event.sound"); sounds.setAccessibilityLabel("提醒提示音")
         view.addSubview(sounds)
-        _ = button("選取音效檔案…", in: view, frame: NSRect(x: 200, y: 172, width: 147, height: 30), action: #selector(importEventSound))
-        _ = button("只試聽", in: view, frame: NSRect(x: 356, y: 172, width: 151, height: 30), action: #selector(previewEventSound))
-        label("顯示時間", in: view, frame: NSRect(x: 20, y: 226, width: 170, height: 23), size: 12, weight: .medium)
+        _ = button("选取音效文件…", in: view, frame: NSRect(x: 200, y: 172, width: 147, height: 30), action: #selector(importEventSound))
+        _ = button("只试听", in: view, frame: NSRect(x: 356, y: 172, width: 151, height: 30), action: #selector(previewEventSound))
+        label("显示时间", in: view, frame: NSRect(x: 20, y: 226, width: 170, height: 23), size: 12, weight: .medium)
         let duration = NSPopUpButton(frame: NSRect(x: 391, y: 218, width: 116, height: 30), pullsDown: false)
         var seconds: [Double] = [3, 5, 8, 14, 20, 30, 60]
         let selectedDuration = cue.settings.duration(selectedKind)
@@ -1219,52 +1219,52 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
             if value == selectedDuration { duration.select(duration.lastItem) }
         }
         duration.identifier = NSUserInterfaceItemIdentifier(selectedKind + "_duration")
-        duration.target = self; duration.action = #selector(changeDuration(_:)); duration.setAccessibilityLabel("提醒顯示時間")
+        duration.target = self; duration.action = #selector(changeDuration(_:)); duration.setAccessibilityLabel("提醒显示时间")
         view.addSubview(duration)
-        _ = button("預覽這種提醒", in: view, frame: NSRect(x: 17, y: 282, width: 240, height: 34), action: #selector(previewEvent))
-        _ = button("還原此類預設", in: view, frame: NSRect(x: 267, y: 282, width: 240, height: 34), action: #selector(resetEventStyle))
-        label("設定立即儲存。音效檔案會驗證後複製到本機；全域音量與亮度仍然生效。", in: content, frame: NSRect(x: 27, y: 526, width: 520, height: 36), size: 10.5, color: .secondaryLabelColor, lines: 2)
+        _ = button("预览这种提醒", in: view, frame: NSRect(x: 17, y: 282, width: 240, height: 34), action: #selector(previewEvent))
+        _ = button("重置此类默认", in: view, frame: NSRect(x: 267, y: 282, width: 240, height: 34), action: #selector(resetEventStyle))
+        label("设置立即保存。音效文件会验证后复制到本机；全局音量与亮度仍然生效。", in: content, frame: NSRect(x: 27, y: 526, width: 520, height: 36), size: 10.5, color: .secondaryLabelColor, lines: 2)
     }
 
     func glowAndSound() {
-        heading("泛光與聲音", "調整提醒的存在感，保留你的工作節奏。")
+        heading("泛光与声音", "调整提醒的存在感，保留你的工作节奏。")
         let glow = card(106, 204)
-        toggle("螢幕邊緣泛光", "提示卡仍會顯示對話名稱。", in: glow, y: 16, key: "glow_enabled", on: cue.settings.glowEnabled)
-        toggle("在所有螢幕顯示泛光", "關閉後只使用滑鼠所在的螢幕。", in: glow, y: 78, key: "all_displays", on: cue.settings.allDisplays)
+        toggle("屏幕边缘泛光", "提示卡仍会显示对话名称。", in: glow, y: 16, key: "glow_enabled", on: cue.settings.glowEnabled)
+        toggle("在所有屏幕显示泛光", "关闭后只使用鼠标所在的屏幕。", in: glow, y: 78, key: "all_displays", on: cue.settings.allDisplays)
         slider("泛光亮度", in: glow, y: 140, key: "glow_intensity", value: cue.settings.glowIntensity, min: 0.15)
         let audio = card(325, 212)
-        toggle("播放提示音", "使用一般媒體輸出，不修改系統音量或輸出裝置。", in: audio, y: 16, key: "sound_enabled", on: cue.settings.soundEnabled)
+        toggle("播放提示音", "使用一般媒体输出，不修改系统音量或输出设备。", in: audio, y: 16, key: "sound_enabled", on: cue.settings.soundEnabled)
         slider("提示音音量", in: audio, y: 82, key: "sound_volume", value: cue.settings.soundVolume)
-        for (index, pair) in [("完成音", "complete"), ("等待輸入音", "input"), ("人工批准測試音", "permission")].enumerated() {
+        for (index, pair) in [("完成音", "complete"), ("等待输入音", "input"), ("人工批准测试音", "permission")].enumerated() {
             let test = button("▶ \(pair.0)", in: audio, frame: NSRect(x: 17 + index * 164, y: 157, width: 158, height: 30), action: #selector(testAudio(_:)), represented: pair.1)
             test.isEnabled = cue.settings.soundEnabled
         }
     }
 
     func providers() {
-        heading("集成與檔案", "AI Coding Companion · 目前已接入 Codex。")
+        heading("集成与文件", "AI Coding Companion · 目前已接入 Codex。")
         let provider = card(106, 270)
         label("Codex", in: provider, frame: NSRect(x: 20, y: 17, width: 486, height: 27), size: 18, weight: .semibold)
         healthLabel = label("", in: provider, frame: NSRect(x: 20, y: 53, width: 486, height: 21), size: 12, weight: .medium)
-        label("完成與結構化問題由本機對話記錄監看。自動批准後繼續執行的權限請求不提醒。目前尚無可確認人工批准等待的訊號，因此 Codex 的人工批准提醒暫不啟用。", in: provider, frame: NSRect(x: 20, y: 88, width: 486, height: 73), size: 12, color: .secondaryLabelColor, lines: 4)
+        label("完成与结构化问题由本机对话记录监控。自动批准后继续运行的权限请求不提醒。目前尚无可确认人工批准等待的信号，因此 Codex 的人工批准提醒暂不启用。", in: provider, frame: NSRect(x: 20, y: 88, width: 486, height: 73), size: 12, color: .secondaryLabelColor, lines: 4)
         hookLabel = label("", in: provider, frame: NSRect(x: 20, y: 169, width: 486, height: 20), size: 11, color: .secondaryLabelColor)
-        _ = button("授權讀取本機 Codex 記錄…", in: provider, frame: NSRect(x: 16, y: 200, width: 283, height: 31), action: #selector(authorizeHistoryRead))
-        label("沒有本機記錄的雲端對話不在涵蓋範圍；尚未接入其他 AI 工具。", in: provider, frame: NSRect(x: 20, y: 242, width: 486, height: 23), size: 10.5, color: .tertiaryLabelColor)
+        _ = button("授权读取本机 Codex 记录…", in: provider, frame: NSRect(x: 16, y: 200, width: 283, height: 31), action: #selector(authorizeHistoryRead))
+        label("没有本机记录的云端对话不在涵盖范围；尚未接入其他 AI 工具。", in: provider, frame: NSRect(x: 20, y: 242, width: 486, height: 23), size: 10.5, color: .tertiaryLabelColor)
         let files = card(392, 145)
-        label("本機檔案", in: files, frame: NSRect(x: 20, y: 17, width: 480, height: 24), size: 13, weight: .semibold)
+        label("本机文件", in: files, frame: NSRect(x: 20, y: 17, width: 480, height: 24), size: 13, weight: .semibold)
         label(cue.home.path, in: files, frame: NSRect(x: 20, y: 52, width: 486, height: 35), size: 10.5, color: .secondaryLabelColor, lines: 2)
-        _ = button("原始碼資料夾", in: files, frame: NSRect(x: 16, y: 96, width: 160, height: 31), action: #selector(openSource))
-        _ = button("設定資料夾", in: files, frame: NSRect(x: 181, y: 96, width: 160, height: 31), action: #selector(openConfig))
-        _ = button("診斷日誌", in: files, frame: NSRect(x: 346, y: 96, width: 160, height: 31), action: #selector(openLogs))
+        _ = button("原代码文件夹", in: files, frame: NSRect(x: 16, y: 96, width: 160, height: 31), action: #selector(openSource))
+        _ = button("设置文件夹", in: files, frame: NSRect(x: 181, y: 96, width: 160, height: 31), action: #selector(openConfig))
+        _ = button("诊断日志", in: files, frame: NSRect(x: 346, y: 96, width: 160, height: 31), action: #selector(openLogs))
     }
 
     func updateHealth() {
         healthLabel?.stringValue = cue.watcherHealthText
-        healthLabel?.textColor = cue.watcherHealthText.hasPrefix("本機監看中") ? NSColor(srgbRed: 0.5, green: 0.94, blue: 0.76, alpha: 1) : .systemOrange
-        let pause = cue.pausedUntil == nil ? (cue.settings.enabled ? "提醒已啟用" : "提醒已關閉") : "提醒已暫停"
-        threadLabel?.stringValue = "\(pause)  ·  \(cue.settings.soundEnabled ? "聲音已啟用" : "聲音已關閉")"
-        latestLabel?.stringValue = cue.recent.first.map { "\($0.label) · \($0.title)" } ?? "尚無提醒。可以先測試一則提醒效果。"
-        hookLabel?.stringValue = "普通權限請求已忽略；結構化提問 hook 為可選補充。"
+        healthLabel?.textColor = cue.watcherHealthText.hasPrefix("本机监控中") ? NSColor(srgbRed: 0.5, green: 0.94, blue: 0.76, alpha: 1) : .systemOrange
+        let pause = cue.pausedUntil == nil ? (cue.settings.enabled ? "提醒已启用" : "提醒已关闭") : "提醒已暂停"
+        threadLabel?.stringValue = "\(pause)  ·  \(cue.settings.soundEnabled ? "声音已启用" : "声音已关闭")"
+        latestLabel?.stringValue = cue.recent.first.map { "\($0.label) · \($0.title)" } ?? "尚无提醒。可以先测试一则提醒效果。"
+        hookLabel?.stringValue = "普通权限请求已忽略；结构化提问 hook 为可选补充。"
     }
 
     @objc func changeToggle(_ sender: NSSwitch) {
@@ -1315,7 +1315,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
     @objc func importEventSound() {
         let panel = NSOpenPanel()
-        panel.title = "選取這種提醒的音效"; panel.prompt = "匯入音效"
+        panel.title = "选取这种提醒的音效"; panel.prompt = "导入音效"
         panel.canChooseDirectories = false; panel.canChooseFiles = true; panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.audio]
         guard panel.runModal() == .OK, let source = panel.url else { return }
@@ -1324,11 +1324,11 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         do {
             let properties = try source.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
             guard properties.isRegularFile == true, let size = properties.fileSize, size <= 20 * 1024 * 1024 else {
-                throw NSError(domain: "VibeCueSoundImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "請選擇 20 MB 以內的音效檔案。"])
+                throw NSError(domain: "VibeCueSoundImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "请选择 20 MB 以内的音效文件。"])
             }
             let player = try AVAudioPlayer(contentsOf: source)
             guard player.duration > 0, player.duration <= 30 else {
-                throw NSError(domain: "VibeCueSoundImport", code: 2, userInfo: [NSLocalizedDescriptionKey: "提醒音效需在 30 秒以內。"])
+                throw NSError(domain: "VibeCueSoundImport", code: 2, userInfo: [NSLocalizedDescriptionKey: "提醒音效需在 30 秒以内。"])
             }
             let directory = cue.home.appendingPathComponent("sounds/custom", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -1339,7 +1339,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
             cue.settings.eventStyles[selectedKind]?["sound"] = "custom:" + filename
             cue.applySettings(); rebuild()
         } catch {
-            let alert = NSAlert(); alert.messageText = "無法匯入音效"; alert.informativeText = error.localizedDescription
+            let alert = NSAlert(); alert.messageText = "无法导入音效"; alert.informativeText = error.localizedDescription
             alert.addButton(withTitle: "知道了"); alert.runModal()
         }
     }
@@ -1347,7 +1347,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         cue.playChime(kind: selectedKind, name: cue.settings.soundName(for: selectedKind))
     }
     @objc func previewEvent() {
-        cue.enqueue(CueEvent(kind: selectedKind, title: "VibeCue · 自訂提醒預覽", message: "使用這一類的顏色、提示音與顯示時間。"))
+        cue.enqueue(CueEvent(kind: selectedKind, title: "VibeCue · 自定义提醒预览", message: "使用这一类的颜色、提示音与显示时间。"))
     }
     @objc func resetEventStyle() {
         cue.settings.eventStyles[selectedKind] = CueSettings.defaultStyles[selectedKind]
@@ -1360,7 +1360,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
     @objc func testAlert(_ sender: NSButton) {
         let kind = sender.identifier?.rawValue ?? "complete"
-        cue.enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果測試", message: "使用你目前的泛光、聲音與顯示時間設定。"))
+        cue.enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果测试", message: "使用你目前的泛光、声音与显示时间设置。"))
         updateHealth()
     }
     @objc func testAudio(_ sender: NSButton) {
@@ -1401,7 +1401,7 @@ if CommandLine.arguments.contains("--customization-self-test") {
     let results: [String: Bool] = [
         "legacy_defaults_preserved": legacy.eventStyles == CueSettings.defaultStyles && legacy.inputDuration == 20 && legacy.soundVolume == 0.4,
         "color_roundtrip_and_render_mapping": restored.color(for: "input").cueHex == "#167DCE" && restored.color(for: "complete").cueHex == "#E04099",
-        "sound_roundtrip_and_playback_mapping": restored.soundToken(for: "input") == "silent" && restored.soundName(for: "input") == "靜音" && restored.soundToken(for: "complete") == "permission" && restored.soundName(for: "complete") == "雙短一長",
+        "sound_roundtrip_and_playback_mapping": restored.soundToken(for: "input") == "silent" && restored.soundName(for: "input") == "静音" && restored.soundToken(for: "complete") == "permission" && restored.soundName(for: "complete") == "双短一长",
         "invalid_style_defaults": invalid.eventStyles == CueSettings.defaultStyles,
         "custom_sound_basename_only": CueSettings.validSoundToken("custom:sample.wav") && !CueSettings.validSoundToken("custom:../sample.wav") && !CueSettings.validSoundToken("custom:/tmp/sample.wav") && !CueSettings.validSoundToken("custom:..") && !CueSettings.validSoundToken("custom:folder\\sample.wav")
     ]
