@@ -131,6 +131,13 @@ struct CueSettings {
             for kind in ["complete", "input", "permission"] {
                 if let color = styles[kind]?["color"], NSColor.cueColor(hex: color) != nil { eventStyles[kind]?["color"] = color }
                 if let sound = styles[kind]?["sound"], CueSettings.validSoundToken(sound) { eventStyles[kind]?["sound"] = sound }
+                let keys = Set(["effect", "palette", "direction", "speed", "width", "opacity", "inset", "trail", "card_style", "card_position", "card_opacity", "card_radius", "text_scale", "card_width", "card_message", "card_open"])
+                let visual = (styles[kind] ?? [:]).filter { keys.contains($0.key) }
+                if !visual.isEmpty {
+                    var fields = eventStyles[kind] ?? [:]
+                    fields.merge(visual) { _, new in new }
+                    eventStyles[kind] = CueVisualStyle.normalizedFields(fields, fallback: color(for: kind))
+                }
             }
         }
     }
@@ -168,6 +175,8 @@ struct CueSettings {
     func color(for kind: String) -> NSColor {
         NSColor.cueColor(hex: eventStyles[kind]?["color"] ?? "") ?? CueEvent(kind: kind, title: "", message: "").color
     }
+    func visualStyle(for kind: String) -> CueVisualStyle { CueVisualStyle(fields: eventStyles[kind] ?? [:], fallback: color(for: kind)) }
+    func cardStyle(for kind: String) -> CueCardStyle { CueCardStyle(fields: eventStyles[kind] ?? [:]) }
     func soundToken(for kind: String) -> String { eventStyles[kind]?["sound"] ?? kind }
     func soundName(for kind: String) -> String {
         let token = soundToken(for: kind)
@@ -271,91 +280,36 @@ extension Data {
     }
 }
 
-final class GlowView: NSView {
-    var glow = NSColor.systemGreen
-    override var isOpaque: Bool { false }
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.clear.setFill(); bounds.fill(using: .copy)
-        let width: CGFloat = 34
-        let gradient = NSGradient(colors: [glow.withAlphaComponent(0.62), glow.withAlphaComponent(0.12), glow.withAlphaComponent(0)])!
-        gradient.draw(in: NSRect(x: 0, y: 0, width: width, height: bounds.height), angle: 0)
-        gradient.draw(in: NSRect(x: bounds.width - width, y: 0, width: width, height: bounds.height), angle: 180)
-        gradient.draw(in: NSRect(x: 0, y: 0, width: bounds.width, height: width), angle: 90)
-        gradient.draw(in: NSRect(x: 0, y: bounds.height - width, width: bounds.width, height: width), angle: 270)
-        glow.withAlphaComponent(0.85).setStroke()
-        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5), xRadius: 10, yRadius: 10)
-        outline.lineWidth = 2; outline.stroke()
-    }
-}
-
 final class CuePanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }
 
-final class BannerView: NSView {
-    let statusLabel = NSTextField(labelWithString: "")
-    let conversationLabel = NSTextField(labelWithString: "")
-    let messageLabel = NSTextField(wrappingLabelWithString: "")
-    let icon = NSImageView()
-    let openButton = NSButton(title: "打开对话 ↗", target: nil, action: nil)
-    let closeButton = NSButton(title: "×", target: nil, action: nil)
-
-    init(event: CueEvent, target: AnyObject, color: NSColor) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 560, height: 164))
-        wantsLayer = true
-        layer?.backgroundColor = NSColor(srgbRed: 0.055, green: 0.07, blue: 0.09, alpha: 0.97).cgColor
-        layer?.cornerRadius = 20
-        layer?.borderColor = color.withAlphaComponent(0.55).cgColor
-        layer?.borderWidth = 1
-
-        icon.image = NSImage(systemSymbolName: event.symbol, accessibilityDescription: event.label)
-        icon.contentTintColor = color
-        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 27, weight: .medium)
-        icon.frame = NSRect(x: 22, y: 105, width: 35, height: 35)
-        addSubview(icon)
-
-        statusLabel.stringValue = "\(event.providerLabel.uppercased())  ·  \(event.label)"
-        statusLabel.font = .systemFont(ofSize: 12, weight: .semibold)
-        statusLabel.textColor = color
-        statusLabel.frame = NSRect(x: 72, y: 127, width: 420, height: 18)
-        addSubview(statusLabel)
-
-        conversationLabel.stringValue = event.title
-        conversationLabel.font = .systemFont(ofSize: 19, weight: .semibold)
-        conversationLabel.textColor = .white
-        conversationLabel.lineBreakMode = .byTruncatingTail
-        conversationLabel.frame = NSRect(x: 72, y: 96, width: 445, height: 27)
-        conversationLabel.toolTip = event.title
-        addSubview(conversationLabel)
-
-        messageLabel.stringValue = event.message.isEmpty ? "回到这个对话查看最新进度。" : event.message
-        messageLabel.font = .systemFont(ofSize: 12)
-        messageLabel.textColor = NSColor.white.withAlphaComponent(0.70)
-        messageLabel.maximumNumberOfLines = 2
-        messageLabel.lineBreakMode = .byWordWrapping
-        messageLabel.frame = NSRect(x: 72, y: 49, width: 445, height: 38)
-        addSubview(messageLabel)
-
-        openButton.bezelStyle = .inline
-        openButton.contentTintColor = color
-        openButton.font = .systemFont(ofSize: 12, weight: .semibold)
-        openButton.target = target; openButton.action = #selector(CueController.openCurrent)
-        openButton.frame = NSRect(x: 71, y: 14, width: 116, height: 24)
-        openButton.isEnabled = event.provider == "codex" && !event.threadID.isEmpty
-        addSubview(openButton)
-
-        closeButton.bezelStyle = .inline
-        closeButton.contentTintColor = NSColor.white.withAlphaComponent(0.70)
-        closeButton.font = .systemFont(ofSize: 24, weight: .light)
-        closeButton.target = target; closeButton.action = #selector(CueController.dismissCurrent)
-        closeButton.frame = NSRect(x: 519, y: 119, width: 27, height: 29)
-        closeButton.setAccessibilityLabel("关闭提醒")
-        addSubview(closeButton)
-        setAccessibilityElement(true)
-        setAccessibilityLabel("\(event.providerLabel) 提醒：\(event.label)，\(event.title)")
+struct CueResolution {
+    let targetID: String
+    init?(_ data: Data) {
+        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              raw["action"] as? String == "resolve",
+              raw["source"] as? String == "codex client approval stream",
+              let target = raw["target_id"] as? String, !target.isEmpty, target.count <= 200 else { return nil }
+        let date: Date?
+        if let timestamp = raw["created_at"] as? Double { date = Date(timeIntervalSince1970: timestamp) }
+        else if let text = raw["created_at"] as? String {
+            let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            date = formatter.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+        } else { date = nil }
+        guard let date, abs(date.timeIntervalSinceNow) <= 120 else { return nil }
+        targetID = target
     }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+struct CueResolutionTracker {
+    private var ids: [String] = []
+    mutating func insert(_ id: String) {
+        if !ids.contains(id) { ids.append(id) }
+        if ids.count > 1024 { ids.removeFirst(ids.count - 1024) }
+    }
+    func contains(_ id: String) -> Bool { ids.contains(id) }
 }
 
 final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate {
@@ -364,13 +318,20 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     let inflightDirectory: URL
     var statusItem: NSStatusItem!
     var edges: [NSPanel] = []
+    var edgeViews: [CueEdgeEffectView] = []
     var banner: NSPanel?
     var current: CueEvent?
     var pending: [CueEvent] = []
     var recent: [CueEvent] = []
     var seen: [String] = []
+    var resolutions = CueResolutionTracker()
+    var manualApprovalConnected = false
+    var manualApprovalStatus = "人工批准监听未连接"
+    var approvalLauncher: Process?
+    var approvalLaunchLog: FileHandle?
     var readTimer: Timer?
     var pulseTimer: Timer?
+    var effectFrameRate = 0.0
     var hideTimer: Timer?
     var pausedUntil: Date?
     var settings = CueSettings()
@@ -455,6 +416,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 if let kindIndex = args.firstIndex(of: "--settings-kind"), args.indices.contains(kindIndex + 1), ["complete", "input", "permission"].contains(args[kindIndex + 1]) {
                     self.settingsPanel?.selectedKind = args[kindIndex + 1]
                 }
+                if let tabIndex = args.firstIndex(of: "--settings-editor-tab"), args.indices.contains(tabIndex + 1), let tab = Int(args[tabIndex + 1]) { self.settingsPanel?.appearanceTab = min(2, max(0, tab)) }
                 if let pageIndex = args.firstIndex(of: "--settings-page"), args.indices.contains(pageIndex + 1), let page = Int(args[pageIndex + 1]) {
                     self.settingsPanel?.selectPage(page)
                 }
@@ -495,7 +457,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         if nextHealthCheck <= Date() { updateWatcherHealth() }
         if let until = pausedUntil, until <= Date() { pausedUntil = nil; refreshMenu(); writeStatus() }
         guard let files = try? FileManager.default.contentsOfDirectory(at: eventsDirectory, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else { return }
-        for file in files.filter({ $0.pathExtension == "json" }).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).prefix(50) {
+        var batch: [Data] = []
+        for file in files.filter({ $0.pathExtension == "json" }).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).prefix(100) {
             guard let properties = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
                   properties.isRegularFile == true, properties.isSymbolicLink != true,
                   let size = properties.fileSize, size <= 1_048_576 else { continue }
@@ -503,14 +466,33 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             do {
                 try FileManager.default.moveItem(at: file, to: claim)
                 defer { try? FileManager.default.removeItem(at: claim) }
-                guard let event = CueEvent(try Data(contentsOf: claim)), abs(event.date.timeIntervalSinceNow) <= 120 else { continue }
-                enqueue(event)
-            } catch { /* A producer or another process may have moved the file. */ }
+                batch.append(try Data(contentsOf: claim))
+            } catch { /* Another process may have moved the file. */ }
         }
+        // Resolve controls first: a request approved before this poll must never
+        // briefly play a stale alert simply because its show file sorted first.
+        for data in batch { if let resolution = CueResolution(data) { applyResolution(resolution, resume: false) } }
+        for data in batch {
+            guard let event = CueEvent(data), abs(event.date.timeIntervalSinceNow) <= 120,
+                  !resolutions.contains(event.id) else { continue }
+            enqueue(event)
+        }
+        if current == nil, pausedUntil == nil { showNext() }
+    }
+
+    func applyResolution(_ resolution: CueResolution, resume: Bool = true) {
+        resolutions.insert(resolution.targetID)
+        pending.removeAll { $0.kind == "permission" && $0.id == resolution.targetID }
+        recent.removeAll { $0.kind == "permission" && $0.id == resolution.targetID }
+        if let current, current.kind == "permission", current.id == resolution.targetID {
+            audioPlayer?.stop(); hideWindows(); self.current = nil
+        }
+        refreshMenu(); writeStatus()
+        if resume, current == nil, pausedUntil == nil { showNext() }
     }
 
     func enqueue(_ event: CueEvent) {
-        guard !seen.contains(event.id) else { return }
+        guard !seen.contains(event.id), !resolutions.contains(event.id) else { return }
         seen.append(event.id)
         if seen.count > 512 { seen.removeFirst(seen.count - 512) }
         recent.removeAll { $0.threadID == event.threadID && $0.kind == event.kind && !event.threadID.isEmpty }
@@ -551,43 +533,58 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         lastShownTitle = event.title
         makeWindows(for: event)
         playChime(kind: event.kind, name: event.sound)
-        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-                guard let self else { return }
-                let opacity = self.settings.glowIntensity * (0.76 + 0.20 * sin(Date().timeIntervalSince(self.shownAt) * .pi * 0.75))
-                self.edges.forEach { $0.alphaValue = opacity }
-            }
-            RunLoop.main.add(pulseTimer!, forMode: .common)
-        }
         hideTimer = Timer.scheduledTimer(timeInterval: settings.duration(event.kind), target: self, selector: #selector(dismissCurrent), userInfo: nil, repeats: false)
         RunLoop.main.add(hideTimer!, forMode: .common)
         writeStatus()
     }
 
     func makeWindows(for event: CueEvent) {
-        edges.forEach { $0.close() }; edges.removeAll()
+        edges.forEach { $0.close() }; edges.removeAll(); edgeViews.removeAll()
         banner?.close(); banner = nil
         let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
         let screens = settings.allDisplays ? NSScreen.screens : targetScreen.map { [$0] } ?? []
         for screen in settings.glowEnabled ? screens : [] {
             let panel = CuePanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             configure(panel, clickThrough: true)
-            let glow = GlowView(frame: NSRect(origin: .zero, size: screen.frame.size))
-            glow.glow = settings.color(for: event.kind)
+            let glow = CueEdgeEffectView(frame: NSRect(origin: .zero, size: screen.frame.size), style: settings.visualStyle(for: event.kind))
+            glow.advance(to: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : Date().timeIntervalSince(shownAt))
             panel.contentView = glow
+            edgeViews.append(glow)
             panel.alphaValue = settings.glowIntensity
             panel.orderFrontRegardless()
             edges.append(panel)
         }
         guard let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main else { return }
-        let width = min(CGFloat(560), screen.visibleFrame.width - 40)
-        let rect = NSRect(x: screen.visibleFrame.midX - width / 2, y: screen.visibleFrame.maxY - 188, width: width, height: 164)
+        let cardStyle = settings.cardStyle(for: event.kind)
+        let rect = cardStyle.frame(in: screen.visibleFrame, mouse: NSEvent.mouseLocation)
         let panel = CuePanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         configure(panel, clickThrough: false)
         panel.hasShadow = true
-        panel.contentView = BannerView(event: event, target: self, color: settings.color(for: event.kind))
+        panel.contentView = CueStyledBannerView(event: event, target: self, color: settings.color(for: event.kind), palette: settings.visualStyle(for: event.kind).palette, style: cardStyle, availableWidth: rect.width)
         panel.orderFrontRegardless()
         banner = panel
+        startEffectClock()
+    }
+
+    func startEffectClock() {
+        pulseTimer?.invalidate(); pulseTimer = nil
+        effectFrameRate = 0
+        guard !edgeViews.isEmpty, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        var fps = 30.0
+        if current.map({ settings.visualStyle(for: $0.kind).effectID }) == "spectrum-aurora" {
+            let pixels = edgeViews.reduce(CGFloat(0)) { total, view in
+                let scale = view.window?.backingScaleFactor ?? 2
+                return total + view.bounds.width * view.bounds.height * scale * scale
+            }
+            fps = pixels > 18_000_000 ? 12 : pixels > 9_000_000 ? 15 : pixels > 3_500_000 || edgeViews.count > 1 ? 20 : 24
+        }
+        effectFrameRate = fps
+        pulseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / fps, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let elapsed = Date().timeIntervalSince(self.shownAt)
+            self.edgeViews.forEach { $0.advance(to: elapsed) }
+        }
+        RunLoop.main.add(pulseTimer!, forMode: .common)
     }
 
     func configure(_ panel: NSPanel, clickThrough: Bool) {
@@ -600,9 +597,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
 
     func hideWindows() {
-        pulseTimer?.invalidate(); pulseTimer = nil
+        pulseTimer?.invalidate(); pulseTimer = nil; effectFrameRate = 0
         hideTimer?.invalidate(); hideTimer = nil
-        edges.forEach { $0.close() }; edges.removeAll()
+        edges.forEach { $0.close() }; edges.removeAll(); edgeViews.removeAll()
         banner?.close(); banner = nil
     }
 
@@ -717,12 +714,29 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     func updateWatcherHealth() {
         nextHealthCheck = Date().addingTimeInterval(2)
         var message = "监控进程未连接"
+        let previousManual = manualApprovalConnected
+        manualApprovalConnected = false
+        manualApprovalStatus = approvalLauncher?.isRunning == true ? "等待 Codex 退出后接通" : "人工批准监听未连接"
+        if let launchData = try? Data(contentsOf: home.appendingPathComponent("bridge-launch-state.json")), launchData.count < 65_536,
+           let launch = try? JSONSerialization.jsonObject(with: launchData) as? [String: Any] {
+            switch launch["status"] as? String {
+            case "waiting_for_codex_exit" where approvalLauncher?.isRunning == true: manualApprovalStatus = "等待你退出 Codex 后接通"
+            case "launching" where approvalLauncher?.isRunning == true: manualApprovalStatus = "正在重新打开 Codex"
+            case "launched": manualApprovalStatus = "Codex 已启动，等待人工批准监听连接"
+            case "error": manualApprovalStatus = "人工批准监听启动失败，请查看诊断日志"
+            default: break
+            }
+        }
         let path = home.appendingPathComponent("watcher-state.json")
         if let data = try? Data(contentsOf: path), data.count <= 2_097_152,
            let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            state["running"] as? Bool == true,
            let heartbeat = state["heartbeat"] as? Double,
            (0...15).contains(Date().timeIntervalSince1970 - heartbeat) {
+            if let manual = state["manual_approval"] as? [String: Any] {
+                manualApprovalConnected = manual["connected"] as? Bool == true
+                if manualApprovalConnected { manualApprovalStatus = "人工批准监听已连接" }
+            }
             let count = state["watched_threads"] as? Int ?? 0
             let errors = state["read_error_count"] as? Int ?? 0
             if errors > 0 {
@@ -737,6 +751,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             watcherHealthText = message
             if statusItem != nil { refreshMenu() }
         }
+        if previousManual != manualApprovalConnected { settingsPanel?.rebuild() }
         settingsPanel?.updateHealth()
     }
 
@@ -867,6 +882,49 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         updateWatcherHealth(); writeStatus()
     }
 
+    @objc func connectManualApproval() {
+        guard approvalLauncher?.isRunning != true else { return }
+        let alert = NSAlert()
+        alert.messageText = "接通人工批准监听"
+        alert.informativeText = "首次连接需要退出并重新打开 Codex 一次。请先完成或保存当前工作，再自行退出；VibeCue 会等待退出后启动带只读监听的 Codex。不会替你批准动作、改变权限策略或强制结束 Codex。"
+        alert.addButton(withTitle: "准备连接，等待我退出")
+        alert.addButton(withTitle: "稍后")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let helper = home.appendingPathComponent("vibecuectl")
+        guard FileManager.default.isExecutableFile(atPath: helper.path) else {
+            let failure = NSAlert(); failure.messageText = "本机接入模块尚未安装"; failure.informativeText = "请先安装最新版 VibeCue。"; failure.runModal(); return
+        }
+        let process = Process(); process.executableURL = helper
+        process.arguments = ["launch-codex", "--wait-for-exit"]
+        var environment = ProcessInfo.processInfo.environment
+        environment["VIBECUE_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
+        process.environment = environment
+        process.currentDirectoryURL = home
+        let logs = home.appendingPathComponent("logs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let path = logs.appendingPathComponent("manual-approval-launch.err.log")
+        if !FileManager.default.fileExists(atPath: path.path) { FileManager.default.createFile(atPath: path.path, contents: nil, attributes: [.posixPermissions: 0o600]) }
+        if let handle = try? FileHandle(forWritingTo: path) {
+            handle.seekToEndOfFile(); approvalLaunchLog = handle; process.standardError = handle; process.standardOutput = handle
+        }
+        process.terminationHandler = { [weak self] ended in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.approvalLauncher = nil
+                try? self.approvalLaunchLog?.close(); self.approvalLaunchLog = nil
+                self.updateWatcherHealth(); self.settingsPanel?.rebuild(); self.writeStatus()
+                if ended.terminationStatus != 0 { self.manualApprovalStatus = "连接启动失败，请查看诊断日志"; self.settingsPanel?.updateHealth() }
+            }
+        }
+        do {
+            approvalLauncher = process; try process.run()
+            manualApprovalStatus = "等待 Codex 退出后接通"; settingsPanel?.rebuild(); writeStatus()
+        } catch {
+            approvalLauncher = nil
+            let failure = NSAlert(); failure.messageText = "无法准备监听"; failure.informativeText = error.localizedDescription; failure.runModal()
+        }
+    }
+
     @objc func openSettings() {
         if settingsPanel == nil { settingsPanel = CueSettingsController(cue: self) }
         settingsPanel?.showWindow(nil)
@@ -959,6 +1017,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "current_id": current?.id ?? "", "current_kind": current?.kind ?? "",
             "current_title": current?.title ?? "", "last_shown_title": lastShownTitle,
             "current_color": current.map { settings.color(for: $0.kind).cueHex } ?? "",
+            "effect_frame_rate": effectFrameRate,
+            "effect_preset_count": CueEffectCatalog.presets.count, "card_style_count": CueCardCatalog.presets.count,
+            "current_effect": current.map { settings.visualStyle(for: $0.kind).effectID } ?? "",
+            "current_card_style": current.map { settings.cardStyle(for: $0.kind).id } ?? "",
             "selected_sound": current.map { settings.soundToken(for: $0.kind) } ?? "",
             "edge_count": edges.count, "last_sound": lastSound, "sound_play_started": lastSoundPlayStarted,
             "audio_backend": "AVAudioPlayer", "sound_is_playing": audioPlayer?.isPlaying ?? false,
@@ -971,7 +1033,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "watcher_launch_error": watcherLaunchError, "watcher_restart_delay": watcherRestartDelay,
             "history_scope_active": historyScopeActive, "history_selected_path": historyURL?.path ?? "",
             "provider": current?.provider ?? "codex", "supported_providers": ["codex"],
-            "codex_permission_wait_supported": false, "raw_permission_requests_suppressed": true,
+            "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
+            "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
         if let json = try? JSONSerialization.data(withJSONObject: data, options: [.sortedKeys]) {
             try? json.write(to: home.appendingPathComponent("app-status.json"), options: .atomic)
@@ -993,6 +1056,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     func applicationWillTerminate(_ notification: Notification) {
         guard ownsLock else { if lockFD >= 0 { Darwin.close(lockFD) }; return }
         shuttingDown = true
+        approvalLauncher?.terminate()
+        try? approvalLaunchLog?.close(); approvalLaunchLog = nil
         watcherRestartTimer?.invalidate()
         if let process = watcherProcess, process.isRunning { process.terminate() }
         if historyScopeActive { historyURL?.stopAccessingSecurityScopedResource() }
@@ -1020,6 +1085,9 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     var hookLabel: NSTextField?
     var sliderLabels: [String: NSTextField] = [:]
     var selectedKind = "complete"
+    var appearanceTab = 0
+    var galleryWindow: NSWindow?
+    var appearanceValues: [String: NSTextField] = [:]
 
     init(cue: CueController) {
         self.cue = cue
@@ -1077,7 +1145,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         let line = NSView(frame: NSRect(x: 20, y: 517, width: 142, height: 1))
         line.wantsLayer = true; line.layer?.backgroundColor = NSColor.separatorColor.cgColor; sidebar.addSubview(line)
         label("本机运行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 533, width: 154, height: 19), size: 10.5, color: .secondaryLabelColor)
-        label("VibeCue 0.1.1", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
+        label("VibeCue 0.2.0", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
     }
 
     @objc func navigate(_ sender: NSButton) { selectPage(sender.tag) }
@@ -1096,7 +1164,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case 2: glowAndSound()
         default: providers()
         }
-        label("变更会立即保存到本机。", in: content, frame: NSRect(x: 26, y: 558, width: 525, height: 18), size: 10.5, color: .tertiaryLabelColor)
+        if page != 1 { label("变更会立即保存到本机。", in: content, frame: NSRect(x: 26, y: 558, width: 525, height: 18), size: 10.5, color: .tertiaryLabelColor) }
         updateHealth()
     }
 
@@ -1176,54 +1244,217 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func notifications() {
-        heading("提醒自定义", "分别设置每一种提醒的颜色、声音与显示时间。")
-        let selector = NSPopUpButton(frame: NSRect(x: 26, y: 106, width: 526, height: 32), pullsDown: false)
-        for (name, kind) in [("本轮已完成", "complete"), ("需要回答或判断", "input"), ("人工批准 · 仅供预览", "permission")] {
+        heading("提醒样式实验室", "50 种屏幕特效 · 多色调色板 · 12 种提示卡，自由组合。")
+        let selector = NSPopUpButton(frame: NSRect(x: 26, y: 106, width: 526, height: 31), pullsDown: false)
+        for (name, kind) in [("本轮已完成", "complete"), ("需要回答或判断", "input"), ("人工批准", "permission")] {
             selector.addItem(withTitle: name); selector.lastItem?.representedObject = kind
             if kind == selectedKind { selector.select(selector.lastItem) }
         }
-        selector.target = self; selector.action = #selector(selectEventKind(_:))
-        selector.identifier = NSUserInterfaceItemIdentifier("event.kind"); selector.setAccessibilityLabel("自定义提醒类型")
-        content.addSubview(selector)
-        let view = card(154, 356)
+        selector.target = self; selector.action = #selector(selectEventKind(_:)); selector.identifier = NSUserInterfaceItemIdentifier("event.kind")
+        selector.setAccessibilityLabel("自定义提醒类型"); content.addSubview(selector)
+        for (index, title) in ["屏幕特效", "提示框", "声音与规则"].enumerated() {
+            let control = NSButton(title: title, target: self, action: #selector(selectAppearanceTab(_:)))
+            control.frame = NSRect(x: 26 + index * 178, y: 151, width: 170, height: 30)
+            control.bezelStyle = .rounded; control.tag = index; control.state = appearanceTab == index ? .on : .off
+            control.isBordered = false; control.wantsLayer = true; control.layer?.cornerRadius = 8
+            control.layer?.backgroundColor = (appearanceTab == index ? NSColor(srgbRed: 0.16, green: 0.27, blue: 0.25, alpha: 1) : NSColor(srgbRed: 0.14, green: 0.15, blue: 0.18, alpha: 1)).cgColor
+            control.contentTintColor = appearanceTab == index ? NSColor(srgbRed: 0.58, green: 0.96, blue: 0.83, alpha: 1) : .secondaryLabelColor
+            control.identifier = NSUserInterfaceItemIdentifier("appearance.tab.\(index)")
+            control.font = .systemFont(ofSize: 12, weight: appearanceTab == index ? .semibold : .regular)
+            content.addSubview(control)
+        }
+        let scroll = NSScrollView(frame: NSRect(x: 26, y: 196, width: 526, height: 330))
+        scroll.hasVerticalScroller = true; scroll.scrollerStyle = .legacy; scroll.drawsBackground = false; scroll.borderType = .noBorder
+        let document = CueFlippedView(frame: NSRect(x: 0, y: 0, width: 510, height: appearanceTab == 0 ? 930 : appearanceTab == 1 ? 720 : 388))
+        document.wantsLayer = true; document.layer?.backgroundColor = NSColor(srgbRed: 0.12, green: 0.135, blue: 0.155, alpha: 1).cgColor; document.layer?.cornerRadius = 14
+        scroll.documentView = document; content.addSubview(scroll)
+        appearanceValues = [:]
+        if appearanceTab == 0 { edgeEditor(in: document) }
+        else if appearanceTab == 1 { cardEditor(in: document) }
+        else { soundRuleEditor(in: document) }
+        _ = button("预览整套提醒", in: content, frame: NSRect(x: 23, y: 535, width: 260, height: 34), action: #selector(previewEvent))
+        _ = button("恢复此类默认", in: content, frame: NSRect(x: 293, y: 535, width: 260, height: 34), action: #selector(resetEventStyle))
+        label("向下滚动可调整更多参数。按类型独立保存；预览遵循全局静音与暂停。", in: content, frame: NSRect(x: 28, y: 573, width: 520, height: 16), size: 9.5, color: .secondaryLabelColor)
+    }
+
+    func editorLabel(_ title: String, _ subtitle: String, in parent: NSView, y: CGFloat) {
+        label(title, in: parent, frame: NSRect(x: 18, y: y, width: 472, height: 22), size: 13, weight: .semibold)
+        if !subtitle.isEmpty { label(subtitle, in: parent, frame: NSRect(x: 18, y: y + 27, width: 472, height: 34), size: 11, color: .secondaryLabelColor, lines: 2) }
+    }
+
+    @discardableResult
+    func appearancePopup(_ title: String, values: [(String, String)], selected: String, in parent: NSView, y: CGFloat, key: String) -> NSPopUpButton {
+        label(title, in: parent, frame: NSRect(x: 18, y: y + 4, width: 150, height: 22), size: 12, weight: .medium)
+        let popup = NSPopUpButton(frame: NSRect(x: 176, y: y, width: 314, height: 30), pullsDown: false)
+        for (id, name) in values {
+            popup.addItem(withTitle: name); popup.lastItem?.representedObject = id
+            if id == selected { popup.select(popup.lastItem) }
+        }
+        popup.identifier = NSUserInterfaceItemIdentifier(key); popup.setAccessibilityLabel(title)
+        popup.target = self; popup.action = #selector(changeAppearancePopup(_:)); parent.addSubview(popup)
+        return popup
+    }
+
+    func appearanceSlider(_ title: String, value: Double, minimum: Double, maximum: Double, unit: String, in parent: NSView, y: CGFloat, key: String) {
+        label(title, in: parent, frame: NSRect(x: 18, y: y, width: 325, height: 21), size: 12, weight: .medium)
+        let amount = label(formatAppearance(value, unit: unit), in: parent, frame: NSRect(x: 362, y: y, width: 127, height: 21), size: 11.5, color: .secondaryLabelColor)
+        amount.alignment = .right; appearanceValues[key] = amount; amount.identifier = NSUserInterfaceItemIdentifier(unit)
+        let control = NSSlider(value: value, minValue: minimum, maxValue: maximum, target: self, action: #selector(changeAppearanceSlider(_:)))
+        control.frame = NSRect(x: 18, y: y + 29, width: 472, height: 23); control.isContinuous = true
+        control.identifier = NSUserInterfaceItemIdentifier(key); control.setAccessibilityLabel(title); parent.addSubview(control)
+    }
+    func formatAppearance(_ value: Double, unit: String) -> String {
+        if unit == "%" { return "\(Int((value * 100).rounded()))%" }
+        if unit == "×" { return String(format: "%.2f ×", value) }
+        return String(format: "%.0f %@", value, unit)
+    }
+
+    func edgeEditor(in view: NSView) {
+        let style = cue.settings.visualStyle(for: selectedKind)
+        editorLabel("屏幕边缘特效", "沿屏幕内侧运动；支持顺时针、逆时针和往返。", in: view, y: 18)
+        _ = appearancePopup("特效样式", values: CueEffectCatalog.presets.map { ($0.id, $0.name) }, selected: style.effectID, in: view, y: 89, key: "effect")
+        _ = button("浏览全部 50 种特效…", in: view, frame: NSRect(x: 174, y: 131, width: 314, height: 30), action: #selector(openEffectGallery))
+        editorLabel("多色调色板", "从单色到八色自由搭配，颜色会参与流动与渐变。", in: view, y: 188)
+        let colors = style.paletteHex
+        for (index, hex) in colors.enumerated() {
+            let well = NSColorWell(frame: NSRect(x: 18 + index * 48, y: 252, width: 41, height: 31))
+            well.color = NSColor.cueColor(hex: hex) ?? .systemTeal; well.tag = index
+            well.identifier = NSUserInterfaceItemIdentifier("palette.\(index)"); well.setAccessibilityLabel("调色板颜色 \(index + 1)")
+            well.target = self; well.action = #selector(changePaletteColor(_:)); view.addSubview(well)
+        }
+        let add = button("＋", in: view, frame: NSRect(x: 411, y: 252, width: 36, height: 30), action: #selector(addPaletteColor)); add.isEnabled = colors.count < 8
+        let remove = button("−", in: view, frame: NSRect(x: 453, y: 252, width: 36, height: 30), action: #selector(removePaletteColor)); remove.isEnabled = colors.count > 1
+        for (index, item) in [("彩虹", "rainbow"), ("霓虹", "neon"), ("极光", "aurora"), ("火焰", "fire"), ("预设配色", "preset")].enumerated() {
+            _ = button(item.0, in: view, frame: NSRect(x: 15 + index * 96, y: 300, width: 91, height: 29), action: #selector(applyPalettePreset(_:)), represented: item.1)
+        }
+        _ = appearancePopup("运动方向", values: [("clockwise", "顺时针"), ("counterclockwise", "逆时针"), ("pingpong", "往返流动")], selected: style.direction, in: view, y: 356, key: "direction")
+        appearanceSlider("运动速度", value: style.speed, minimum: 0.15, maximum: 4, unit: "×", in: view, y: 413, key: "speed")
+        appearanceSlider("边缘宽度", value: Double(style.width), minimum: 2, maximum: 80, unit: "px", in: view, y: 489, key: "width")
+        appearanceSlider("特效不透明度", value: style.opacity, minimum: 0.1, maximum: 1, unit: "%", in: view, y: 565, key: "opacity")
+        appearanceSlider("距离屏幕边缘", value: Double(style.inset), minimum: 0, maximum: 80, unit: "px", in: view, y: 641, key: "inset")
+        appearanceSlider("光迹长度", value: style.trail, minimum: 0.03, maximum: 0.65, unit: "%", in: view, y: 717, key: "trail")
+        label("动态效果仅在提醒显示时运行，最高 30 帧/秒；遵循系统“减少动态效果”。", in: view, frame: NSRect(x: 18, y: 813, width: 472, height: 40), size: 11, color: .secondaryLabelColor, lines: 2)
+    }
+
+    func cardEditor(in view: NSView) {
+        let style = cue.settings.cardStyle(for: selectedKind)
+        editorLabel("提示框外观", "从紧凑胶囊到终端面板，每种都有独立排版。", in: view, y: 18)
+        _ = appearancePopup("卡片样式", values: CueCardCatalog.presets.map { ($0.id, $0.name) }, selected: style.id, in: view, y: 89, key: "card_style")
+        _ = appearancePopup("显示位置", values: CueCardCatalog.positions, selected: style.position, in: view, y: 144, key: "card_position")
+        appearanceSlider("提示框不透明度", value: style.opacity, minimum: 0.35, maximum: 1, unit: "%", in: view, y: 205, key: "card_opacity")
+        appearanceSlider("圆角大小", value: Double(style.radius ?? 20), minimum: 0, maximum: 48, unit: "px", in: view, y: 281, key: "card_radius")
+        appearanceSlider("文字大小", value: Double(style.textScale), minimum: 0.8, maximum: 1.25, unit: "×", in: view, y: 357, key: "text_scale")
+        appearanceSlider("提示框宽度", value: Double(style.width ?? CueCardCatalog.preset(id: style.id).size.width), minimum: 380, maximum: 800, unit: "px", in: view, y: 433, key: "card_width")
+        appearanceCheck("显示说明文字", on: style.showMessage, in: view, y: 518, key: "card_message")
+        appearanceCheck("显示“打开对话”入口", on: style.showOpenButton, in: view, y: 560, key: "card_open")
+        label("提示框不会抢走键盘焦点；关闭对话入口后仍可从菜单栏最近提醒打开。", in: view, frame: NSRect(x: 18, y: 620, width: 472, height: 40), size: 11, color: .secondaryLabelColor, lines: 2)
+    }
+    func appearanceCheck(_ title: String, on: Bool, in parent: NSView, y: CGFloat, key: String) {
+        let control = NSButton(checkboxWithTitle: title, target: self, action: #selector(changeAppearanceCheck(_:)))
+        control.state = on ? .on : .off; control.font = .systemFont(ofSize: 12)
+        control.frame = NSRect(x: 18, y: y, width: 472, height: 29); control.identifier = NSUserInterfaceItemIdentifier(key)
+        parent.addSubview(control)
+    }
+
+    func soundRuleEditor(in view: NSView) {
         let isPermission = selectedKind == "permission"
-        let on = selectedKind == "complete" ? cue.settings.completeEnabled : cue.settings.inputEnabled
-        let detail = isPermission ? "Codex 尚无可确认人工等待的信号；自动批准不提醒。可先自定义并预览。" : (selectedKind == "complete" ? "目前一轮运行结束，不一定代表整个需求已交付。" : "Codex 提出问题时提醒你回答或选择。")
-        toggle(isPermission ? "人工批准（尚未接入）" : "启用这一类提醒", detail, in: view, y: 17, key: selectedKind + "_enabled", on: isPermission ? false : on, enabled: !isPermission)
-        label("泛光颜色", in: view, frame: NSRect(x: 20, y: 91, width: 170, height: 23), size: 12, weight: .medium)
-        let color = NSColorWell(frame: NSRect(x: 391, y: 84, width: 116, height: 32))
-        color.color = cue.settings.color(for: selectedKind); color.target = self; color.action = #selector(changeEventColor(_:))
-        color.identifier = NSUserInterfaceItemIdentifier("event.color"); color.setAccessibilityLabel("提醒泛光颜色")
-        view.addSubview(color)
-        label("提示音", in: view, frame: NSRect(x: 20, y: 136, width: 170, height: 23), size: 12, weight: .medium)
-        let sounds = NSPopUpButton(frame: NSRect(x: 200, y: 129, width: 307, height: 31), pullsDown: false)
-        let selectedSound = cue.settings.soundToken(for: selectedKind)
-        var options = [("上行三音", "complete"), ("问答三音", "input"), ("双短一长", "permission"), ("低音警示", "error"), ("静音", "silent")]
-        if selectedSound.hasPrefix("custom:") { options.append(("自选音效（已导入）", selectedSound)) }
-        for (name, token) in options {
-            sounds.addItem(withTitle: name); sounds.lastItem?.representedObject = token
-            if token == selectedSound { sounds.select(sounds.lastItem) }
-        }
-        sounds.target = self; sounds.action = #selector(changeEventSound(_:))
-        sounds.identifier = NSUserInterfaceItemIdentifier("event.sound"); sounds.setAccessibilityLabel("提醒提示音")
-        view.addSubview(sounds)
-        _ = button("选取音效文件…", in: view, frame: NSRect(x: 200, y: 172, width: 147, height: 30), action: #selector(importEventSound))
-        _ = button("只试听", in: view, frame: NSRect(x: 356, y: 172, width: 151, height: 30), action: #selector(previewEventSound))
-        label("显示时间", in: view, frame: NSRect(x: 20, y: 226, width: 170, height: 23), size: 12, weight: .medium)
-        let duration = NSPopUpButton(frame: NSRect(x: 391, y: 218, width: 116, height: 30), pullsDown: false)
+        let on = selectedKind == "complete" ? cue.settings.completeEnabled : selectedKind == "input" ? cue.settings.inputEnabled : cue.settings.permissionEnabled
+        let detail = isPermission ? (cue.manualApprovalConnected ? "只在确实等待你人工批准时提醒，自动审查不提醒。" : "需要先接通人工批准监听；可先保存开关和自定义样式。") : (selectedKind == "complete" ? "本轮执行结束时提醒，保留你的每类样式设置。" : "需要回答或选择时提醒。")
+        toggle(isPermission ? "启用人工批准提醒" : "启用这一类提醒", detail, in: view, y: 17, key: selectedKind + "_enabled", on: on)
+        _ = appearancePopup("提示音", values: soundOptions(), selected: cue.settings.soundToken(for: selectedKind), in: view, y: 105, key: "sound")
+        _ = button("选取音效文件…", in: view, frame: NSRect(x: 174, y: 148, width: 154, height: 30), action: #selector(importEventSound))
+        _ = button("只试听", in: view, frame: NSRect(x: 337, y: 148, width: 152, height: 30), action: #selector(previewEventSound))
         var seconds: [Double] = [3, 5, 8, 14, 20, 30, 60]
-        let selectedDuration = cue.settings.duration(selectedKind)
-        if !seconds.contains(selectedDuration) { seconds.append(selectedDuration); seconds.sort() }
-        for value in seconds {
-            duration.addItem(withTitle: "\(Int(value)) 秒"); duration.lastItem?.representedObject = value
-            if value == selectedDuration { duration.select(duration.lastItem) }
+        let duration = cue.settings.duration(selectedKind)
+        if !seconds.contains(duration) { seconds.append(duration); seconds.sort() }
+        _ = appearancePopup("显示时间", values: seconds.map { (String($0), "\(Int($0)) 秒") }, selected: String(duration), in: view, y: 212, key: "duration")
+        label("自选音效限制 20 MB、30 秒以内。静音、暂停和全局开关始终生效。", in: view, frame: NSRect(x: 18, y: 279, width: 472, height: 40), size: 11, color: .secondaryLabelColor, lines: 2)
+    }
+    func soundOptions() -> [(String, String)] {
+        var options = [("complete", "上行三音"), ("input", "问答三音"), ("permission", "双短一长"), ("error", "低音警示"), ("silent", "静音")]
+        let selected = cue.settings.soundToken(for: selectedKind)
+        if selected.hasPrefix("custom:") { options.append((selected, "自选音效（已导入）")) }
+        return options
+    }
+
+    @objc func selectAppearanceTab(_ sender: NSButton) { appearanceTab = sender.tag; rebuild() }
+    @objc func changeAppearancePopup(_ sender: NSPopUpButton) {
+        guard let key = sender.identifier?.rawValue, let value = sender.selectedItem?.representedObject as? String else { return }
+        if key == "duration", let seconds = Double(value) {
+            if selectedKind == "complete" { cue.settings.completeDuration = seconds }
+            else if selectedKind == "input" { cue.settings.inputDuration = seconds }
+            else { cue.settings.permissionDuration = seconds }
+        } else { cue.settings.eventStyles[selectedKind]?[key] = value }
+        cue.applySettings()
+        if key == "card_style" || key == "effect" { rebuild() }
+    }
+    @objc func changeAppearanceSlider(_ sender: NSSlider) {
+        guard let key = sender.identifier?.rawValue else { return }
+        cue.settings.eventStyles[selectedKind]?[key] = String(format: "%.4f", sender.doubleValue)
+        let unit = appearanceValues[key]?.identifier?.rawValue ?? ""
+        appearanceValues[key]?.stringValue = formatAppearance(sender.doubleValue, unit: unit)
+        cue.applySettings()
+    }
+    @objc func changeAppearanceCheck(_ sender: NSButton) {
+        guard let key = sender.identifier?.rawValue else { return }
+        cue.settings.eventStyles[selectedKind]?[key] = sender.state == .on ? "true" : "false"; cue.applySettings()
+    }
+    func setPalette(_ colors: [String]) {
+        let valid = colors.filter { NSColor.cueColor(hex: $0) != nil }.prefix(8)
+        guard let first = valid.first else { return }
+        cue.settings.eventStyles[selectedKind]?["palette"] = valid.joined(separator: ",")
+        cue.settings.eventStyles[selectedKind]?["color"] = first
+        cue.applySettings()
+    }
+    @objc func changePaletteColor(_ sender: NSColorWell) {
+        var colors = cue.settings.visualStyle(for: selectedKind).paletteHex
+        guard colors.indices.contains(sender.tag) else { return }
+        colors[sender.tag] = sender.color.cueHex; setPalette(colors)
+    }
+    @objc func addPaletteColor() {
+        var colors = cue.settings.visualStyle(for: selectedKind).paletteHex
+        guard colors.count < 8 else { return }
+        let accents = ["#5CE1E6", "#997BFF", "#FF6FB1", "#FFD166", "#3BE8AB", "#167DCE", "#FF7A61", "#FFFFFF"]
+        colors.append(accents[colors.count % accents.count]); setPalette(colors); rebuild()
+    }
+    @objc func removePaletteColor() {
+        var colors = cue.settings.visualStyle(for: selectedKind).paletteHex
+        guard colors.count > 1 else { return }; colors.removeLast(); setPalette(colors); rebuild()
+    }
+    @objc func applyPalettePreset(_ sender: NSButton) {
+        let colors: [String]
+        switch sender.identifier?.rawValue {
+        case "rainbow": colors = ["#FF5E7E", "#FFBE0B", "#7CE38B", "#38CFFF", "#9A7DFF", "#F46DDA"]
+        case "neon": colors = ["#3CEFFF", "#EC55FF", "#FFF657"]
+        case "aurora": colors = ["#3BE8AB", "#4EC5FF", "#9A7DFF"]
+        case "fire": colors = ["#FF4D4D", "#FFAD33", "#FFF4B0"]
+        default: colors = CueEffectCatalog.preset(id: cue.settings.visualStyle(for: selectedKind).effectID).defaultPalette
         }
-        duration.identifier = NSUserInterfaceItemIdentifier(selectedKind + "_duration")
-        duration.target = self; duration.action = #selector(changeDuration(_:)); duration.setAccessibilityLabel("提醒显示时间")
-        view.addSubview(duration)
-        _ = button("预览这种提醒", in: view, frame: NSRect(x: 17, y: 282, width: 240, height: 34), action: #selector(previewEvent))
-        _ = button("重置此类默认", in: view, frame: NSRect(x: 267, y: 282, width: 240, height: 34), action: #selector(resetEventStyle))
-        label("设置立即保存。音效文件会验证后复制到本机；全局音量与亮度仍然生效。", in: content, frame: NSRect(x: 27, y: 526, width: 520, height: 36), size: 10.5, color: .secondaryLabelColor, lines: 2)
+        setPalette(colors); rebuild()
+    }
+    @objc func openEffectGallery() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 640), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "50 种屏幕特效 · 选择后预览"; window.appearance = NSAppearance(named: .darkAqua); window.isReleasedWhenClosed = false
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 800, height: 640)); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
+        let doc = CueFlippedView(frame: NSRect(x: 0, y: 0, width: 782, height: 1210)); doc.wantsLayer = true
+        doc.layer?.backgroundColor = NSColor(srgbRed: 0.085, green: 0.095, blue: 0.115, alpha: 1).cgColor
+        for (index, preset) in CueEffectCatalog.presets.enumerated() {
+            let x = 14 + CGFloat(index % 5) * 153, y = 15 + CGFloat(index / 5) * 118
+            var fields = cue.settings.eventStyles[selectedKind] ?? [:]; fields["effect"] = preset.id; fields["palette"] = preset.defaultPalette.joined(separator: ","); fields["width"] = "5"; fields["inset"] = "4"
+            let preview = CueEdgeEffectView(frame: NSRect(x: x + 5, y: y + 4, width: 138, height: 75), style: CueVisualStyle(fields: fields, fallback: cue.settings.color(for: selectedKind)))
+            preview.wantsLayer = true; preview.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.25).cgColor; preview.advance(to: 1.35)
+            doc.addSubview(preview)
+            let choose = NSButton(title: preset.name, target: self, action: #selector(chooseGalleryEffect(_:)))
+            choose.bezelStyle = .inline; choose.font = .systemFont(ofSize: 10.5, weight: .medium); choose.frame = NSRect(x: x, y: y + 84, width: 148, height: 25)
+            choose.identifier = NSUserInterfaceItemIdentifier(preset.id); choose.toolTip = preset.name + " · " + preset.family
+            doc.addSubview(choose)
+        }
+        scroll.scrollerStyle = .legacy
+        scroll.documentView = doc; window.contentView = scroll; window.center(); window.makeKeyAndOrderFront(nil); galleryWindow = window
+    }
+    @objc func chooseGalleryEffect(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        cue.settings.eventStyles[selectedKind]?["effect"] = id; cue.applySettings(); galleryWindow?.close(); galleryWindow = nil; rebuild()
     }
 
     func glowAndSound() {
@@ -1243,19 +1474,21 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
 
     func providers() {
         heading("集成与文件", "AI Coding Companion · 目前已接入 Codex。")
-        let provider = card(106, 270)
+        let provider = card(106, 294)
         label("Codex", in: provider, frame: NSRect(x: 20, y: 17, width: 486, height: 27), size: 18, weight: .semibold)
-        healthLabel = label("", in: provider, frame: NSRect(x: 20, y: 53, width: 486, height: 21), size: 12, weight: .medium)
-        label("完成与结构化问题由本机对话记录监控。自动批准后继续运行的权限请求不提醒。目前尚无可确认人工批准等待的信号，因此 Codex 的人工批准提醒暂不启用。", in: provider, frame: NSRect(x: 20, y: 88, width: 486, height: 73), size: 12, color: .secondaryLabelColor, lines: 4)
-        hookLabel = label("", in: provider, frame: NSRect(x: 20, y: 169, width: 486, height: 20), size: 11, color: .secondaryLabelColor)
-        _ = button("授权读取本机 Codex 记录…", in: provider, frame: NSRect(x: 16, y: 200, width: 283, height: 31), action: #selector(authorizeHistoryRead))
-        label("没有本机记录的云端对话不在涵盖范围；尚未接入其他 AI 工具。", in: provider, frame: NSRect(x: 20, y: 242, width: 486, height: 23), size: 10.5, color: .tertiaryLabelColor)
-        let files = card(392, 145)
-        label("本机文件", in: files, frame: NSRect(x: 20, y: 17, width: 480, height: 24), size: 13, weight: .semibold)
-        label(cue.home.path, in: files, frame: NSRect(x: 20, y: 52, width: 486, height: 35), size: 10.5, color: .secondaryLabelColor, lines: 2)
-        _ = button("原代码文件夹", in: files, frame: NSRect(x: 16, y: 96, width: 160, height: 31), action: #selector(openSource))
-        _ = button("设置文件夹", in: files, frame: NSRect(x: 181, y: 96, width: 160, height: 31), action: #selector(openConfig))
-        _ = button("诊断日志", in: files, frame: NSRect(x: 346, y: 96, width: 160, height: 31), action: #selector(openLogs))
+        healthLabel = label("", in: provider, frame: NSRect(x: 20, y: 53, width: 486, height: 21), size: 12, weight: .semibold)
+        label("完成和提问由本机记录监控。人工批准通过独立的只读监听接入；只监听交给你的请求，自动审查不会触发提醒，批准后会撤下提示。", in: provider, frame: NSRect(x: 20, y: 87, width: 486, height: 67), size: 11.5, color: .secondaryLabelColor, lines: 4)
+        hookLabel = label("", in: provider, frame: NSRect(x: 20, y: 158, width: 486, height: 21), size: 11, color: .secondaryLabelColor)
+        let connect = button(cue.manualApprovalConnected ? "重新连接人工批准监听…" : "接通人工批准监听…", in: provider, frame: NSRect(x: 16, y: 194, width: 244, height: 31), action: #selector(connectManualApproval))
+        connect.isEnabled = cue.approvalLauncher?.isRunning != true
+        _ = button("授权读取本机记录…", in: provider, frame: NSRect(x: 269, y: 194, width: 238, height: 31), action: #selector(authorizeHistoryRead))
+        label("首次接通需要在当前任务结束后自行退出并重新打开 Codex。不会强制退出或更改批准策略。", in: provider, frame: NSRect(x: 20, y: 239, width: 486, height: 42), size: 10.5, color: .tertiaryLabelColor, lines: 3)
+        let files = card(418, 126)
+        label("本机文件", in: files, frame: NSRect(x: 20, y: 15, width: 480, height: 22), size: 13, weight: .semibold)
+        label(cue.home.path, in: files, frame: NSRect(x: 20, y: 43, width: 486, height: 27), size: 10.5, color: .secondaryLabelColor, lines: 2)
+        _ = button("源码文件夹", in: files, frame: NSRect(x: 16, y: 81, width: 160, height: 31), action: #selector(openSource))
+        _ = button("设置文件夹", in: files, frame: NSRect(x: 181, y: 81, width: 160, height: 31), action: #selector(openConfig))
+        _ = button("诊断日志", in: files, frame: NSRect(x: 346, y: 81, width: 160, height: 31), action: #selector(openLogs))
     }
 
     func updateHealth() {
@@ -1264,7 +1497,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         let pause = cue.pausedUntil == nil ? (cue.settings.enabled ? "提醒已启用" : "提醒已关闭") : "提醒已暂停"
         threadLabel?.stringValue = "\(pause)  ·  \(cue.settings.soundEnabled ? "声音已启用" : "声音已关闭")"
         latestLabel?.stringValue = cue.recent.first.map { "\($0.label) · \($0.title)" } ?? "尚无提醒。可以先测试一则提醒效果。"
-        hookLabel?.stringValue = "普通权限请求已忽略；结构化提问 hook 为可选补充。"
+        hookLabel?.stringValue = cue.manualApprovalStatus
     }
 
     @objc func changeToggle(_ sender: NSSwitch) {
@@ -1273,7 +1506,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case "enabled": cue.settings.enabled = value
         case "complete_enabled": cue.settings.completeEnabled = value
         case "input_enabled": cue.settings.inputEnabled = value
-        case "permission_enabled": return
+        case "permission_enabled": cue.settings.permissionEnabled = value
         case "glow_enabled": cue.settings.glowEnabled = value
         case "all_displays": cue.settings.allDisplays = value
         case "sound_enabled": cue.settings.soundEnabled = value
@@ -1376,6 +1609,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
     @objc func openConfig() { NSWorkspace.shared.open(cue.home) }
     @objc func authorizeHistoryRead() { cue.authorizeHistoryRead() }
+    @objc func connectManualApproval() { cue.connectManualApproval() }
     @objc func openLogs() {
         let logs = cue.home.appendingPathComponent("logs", isDirectory: true)
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
@@ -1388,6 +1622,43 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         root.cacheDisplay(in: root.bounds, to: rep)
         if let data = rep.representation(using: .png, properties: [:]) { try? data.write(to: URL(fileURLWithPath: path)) }
     }
+}
+
+if CommandLine.arguments.contains("--appearance-self-test") {
+    var settings = CueSettings()
+    settings.eventStyles["input"] = ["color": "#123456", "sound": "silent", "effect": CueEffectCatalog.presets[12].id, "palette": "#F05A90,#44DDFF,#FCDD55", "direction": "counterclockwise", "speed": "2.4", "width": "35", "opacity": "0.65", "inset": "18", "trail": "0.3", "card_style": "terminal", "card_position": "bottom-right", "card_opacity": "0.82", "text_scale": "1.1", "card_message": "false"]
+    let data = try! JSONSerialization.data(withJSONObject: settings.json)
+    let restored = CueSettings(json: try! JSONSerialization.jsonObject(with: data) as! [String: Any])
+    let visual = restored.visualStyle(for: "input"), card = restored.cardStyle(for: "input")
+    var results = CueEffectCatalog.validationReport()
+    results["twelve_unique_card_styles"] = CueCardCatalog.presets.count == 12 && Set(CueCardCatalog.presets.map(\.id)).count == 12
+    results["palette_direction_roundtrip"] = visual.effectID == CueEffectCatalog.presets[12].id && visual.paletteHex == ["#F05A90", "#44DDFF", "#FCDD55"] && visual.direction == "counterclockwise" && visual.speed == 2.4
+    results["card_layout_roundtrip"] = card.id == "terminal" && card.position == "bottom-right" && card.opacity == 0.82 && card.textScale == 1.1 && !card.showMessage
+    results["legacy_single_color_and_sound"] = CueSettings(json: ["event_styles": ["input": ["color": "#167DCE", "sound": "silent"]]]).visualStyle(for: "input").paletteHex == ["#167DCE"]
+    if let json = try? JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), let output = String(data: json, encoding: .utf8) { print(output) }
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--resolution-self-test") {
+    let raw: [String: Any] = ["action": "resolve", "target_id": "same-batch-request", "source": "codex client approval stream", "created_at": Date().timeIntervalSince1970]
+    let resolution = CueResolution(try! JSONSerialization.data(withJSONObject: raw))
+    var tracker = CueResolutionTracker()
+    if let resolution { tracker.insert(resolution.targetID) }
+    var invalid = raw; invalid["source"] = "PermissionRequest hook"
+    let results: [String: Bool] = ["confirmed_control_accepted": resolution != nil, "same_batch_show_filtered": tracker.contains("same-batch-request"), "other_request_preserved": !tracker.contains("other-request"), "raw_hook_control_ignored": CueResolution(try! JSONSerialization.data(withJSONObject: invalid)) == nil]
+    if let json = try? JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), let output = String(data: json, encoding: .utf8) { print(output) }
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--effects-contact-sheet"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do { try CueEffectCatalog.renderContactSheet(to: URL(fileURLWithPath: CommandLine.arguments[index + 1])); exit(0) }
+    catch { fputs("VibeCue: effect capture failed\n", stderr); exit(1) }
+}
+if let index = CommandLine.arguments.firstIndex(of: "--cards-contact-sheet"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do { try CueCardCatalog.renderContactSheet(to: URL(fileURLWithPath: CommandLine.arguments[index + 1])); exit(0) }
+    catch { fputs("VibeCue: card capture failed\n", stderr); exit(1) }
 }
 
 if CommandLine.arguments.contains("--customization-self-test") {
@@ -1414,7 +1685,7 @@ if CommandLine.arguments.contains("--event-validation-self-test") {
         ("raw-request", "PermissionRequest hook", false, false),
         ("raw-request-cannot-self-confirm", "PermissionRequest hook", true, false),
         ("unconfirmed-unknown-source", "", false, false),
-        ("confirmed-runtime-wait", "runtime waitingOnApproval", true, true),
+        ("confirmed-client-wait", "codex client approval stream", true, true),
         ("explicit-manual-test", "manual test", false, true)
     ]
     var failed = false

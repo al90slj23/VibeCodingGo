@@ -38,6 +38,10 @@ def completion_event_id(thread_id, turn_id):
     return f'finished:{thread_id}:{turn_id}'
 
 
+def event_identifier(raw_id, provider='codex'):
+    return hashlib.sha256((clean_text(provider, 64).lower() + ':' + str(raw_id)).encode()).hexdigest()
+
+
 def clean_text(value, limit=160):
     return ' '.join(str(value or '').replace('\x00', '').split())[:limit]
 
@@ -156,7 +160,7 @@ def emit_event(kind, thread_id, turn_id='', title='', message='', event_id='',
     if not thread_id and not turn_id and not event_id:
         raw_id += f':{time.time_ns()}'
     provider = clean_text(provider, 64).lower()
-    identifier = hashlib.sha256((provider + ':' + raw_id).encode()).hexdigest()
+    identifier = event_identifier(raw_id, provider)
     event = {
         'id': identifier, 'kind': kind, 'provider': provider,
         'requires_user_action': requires_user_action is True,
@@ -185,6 +189,31 @@ def emit_event(kind, thread_id, turn_id='', title='', message='', event_id='',
         connection.execute('INSERT INTO emitted VALUES (?,?)', (identifier, now))
         connection.execute('DELETE FROM emitted WHERE at < ?', (now - 172800,))
         connection.execute('DELETE FROM emitted WHERE id IN (SELECT id FROM emitted ORDER BY at DESC LIMIT -1 OFFSET 10000)')
+    return True
+
+
+def emit_resolution(target_id, thread_id='', vibecue_home=None,
+                    source='codex client approval stream'):
+    """Dismiss a previously emitted request without producing a new alert."""
+    if not re.fullmatch(r'[a-f0-9]{64}', str(target_id)):
+        return False
+    home = vibecue_directory(vibecue_home)
+    spool = home / 'events'
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    spool.mkdir(mode=0o700, exist_ok=True)
+    now = time.time_ns()
+    event = {'id': f'resolve:{now}:{target_id[:16]}', 'action': 'resolve',
+             'target_id': target_id, 'thread_id': clean_text(thread_id, 160),
+             'created_at': datetime.now(timezone.utc).isoformat(), 'source': source}
+    fd, temporary = tempfile.mkstemp(prefix='.resolve-', dir=spool)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(event, stream, ensure_ascii=False)
+            stream.write('\n')
+        os.replace(temporary, spool / f'{now:020d}-resolve.json')
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return True
 
 

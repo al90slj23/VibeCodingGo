@@ -24,6 +24,7 @@ import time
 from ..events import (vibecue_directory, codex_directory, emit_event, clean_text,
                      resolve_title, is_main_source, classify_final_message,
                      completion_event_id, input_event_id, state_databases)
+from .approval_status import approval_status
 
 MAX_READ = 1_048_576
 MAX_RECORD = 2_097_152
@@ -358,12 +359,14 @@ class Watcher:
             self.write_status()
 
     def write_status(self):
+        approvals = approval_status(self.vibecue_home)
         state = {
             'pid': os.getpid(), 'heartbeat': time.time(), 'running': self.running,
             'started_at': self.started_at, 'watched_threads': len(self.watched),
             'source': 'local-transcripts', 'provider': 'codex',
             'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic'],
-            'permission_status': 'unavailable-without-confirmed-human-wait',
+            'permission_status': 'connected' if approvals['connected'] else 'requires-codex-bridge-launch',
+            'manual_approval': approvals,
             'pending_deliveries': sum(len(i.pending) for _, i in self.watched.values()),
             'dropped_deliveries': sum(i.dropped_deliveries for _, i in self.watched.values()),
             'read_error_count': sum(bool(tail.read_error) for tail, _ in self.watched.values()),

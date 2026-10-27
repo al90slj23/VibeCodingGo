@@ -1,107 +1,107 @@
 # VibeCue — AI Coding Companion
 
-界面和文档使用简体中文，对话输入识别同时兼容简体、繁体及英文。升级保留个人设置，并备份上一版 App。
+原生 macOS AI 开发提醒助手。目前支持 Codex，提供 50 种屏幕边缘特效、12 套提示卡，以及按事件类型保存的颜色、声音和显示设置。界面和文档使用简体中文；对话输入识别兼容简体、繁体和英文。
 
-AI 开发提醒助手：在 macOS 用屏幕四周泛光、不同提示音与对话卡，提醒你回到需要注意的 AI coding 工作。目前先支持 Codex，事件接入层与提醒接口分开，之后可扩充其他开发工具。
+## 提醒样式实验室
 
-| 事件 | 默认画面 | 默认提示音 |
-| --- | --- | --- |
-| 本轮运行完成 | 绿色泛光 | 上行和弦 |
-| 提问或要求确认／选择 | 琥珀色泛光 | 三段提问音 |
-| 人工批准（目前仅样式预览） | 珊瑚色泛光 | 两短一长 |
+在设置的「提醒规则」中选择完成、等待输入或人工批准，再切换「屏幕特效」「提示框」「声音与规则」。
 
-提示卡显示 Codex 的对话名称。边缘窗口不拦截鼠标、不抢键盘焦点，涵盖所有屏幕；提示卡显示在鼠标所在屏幕。完成提醒约 8 秒，其他提醒约 14 秒。需要回答的提醒会优先显示。遵循 macOS 减少动态效果设置。
+- **50 种边缘特效**：呼吸、霓虹、琉璃、彩虹跑马灯、顺逆追光、彗星、虚线、扫描、四角、波纹、粒子、极光与光环等。效果库提供全部预览。
+- **多色调色板**：每类提醒可以单独配置最多 8 种颜色，或应用预设配色；保留旧版单色设置。
+- **运动参数**：顺时针、逆时针、往返、速度、边框宽度、透明度、内缩距离和尾迹长度。
+- **12 套提示卡**：多种玻璃、紧凑、极简、控制台、霓虹等布局，支持位置、宽度、圆角、透明度、字号、正文与打开对话入口设置。
+- **声音**：内置音效、静音或自选音频文件。自选文件验证后复制到私有目录；全局音量、暂停和静音始终有效。
+- **独立规则**：每种事件有自己的开关、持续时间和样式，支持实际效果预览与恢复默认。
 
-## 安装与启动
+提醒窗口不抢键盘焦点，屏幕边缘不会拦截鼠标。支持多显示器，并遵循系统减少动态效果设置。动画仅在显示提醒时运行，普通效果最高 30 fps，较重的多屏效果会降低帧率。
 
-需要 macOS 13 以上、Xcode Command Line Tools 中的 Swift 与 `/usr/bin/python3`。无第三方套件、无 API key。
+## 安装
+
+需要 macOS 13 以上、Xcode Command Line Tools 的 Swift 与 `/usr/bin/python3`。没有第三方运行依赖，不需要给 VibeCue 配置 API key。
 
 ```sh
 ./scripts/build.sh
 /usr/bin/python3 scripts/install.py
 ```
 
-安装位置：
+- App：`/Applications/VibeCue.app`
+- 私有设置和事件：`~/Library/Application Support/VibeCue/`
+- 登录启动：`~/Library/LaunchAgents/local.vibecue.plist`
 
-- `/Applications/VibeCue.app`：原生菜单列应用程序。
-- `~/Library/Application Support/VibeCue/`：程序、事件队列与私有状态。
-- `~/Library/LaunchAgents/local.vibecue.plist`：登录后启动应用程序，由 App 管理监控子进程。
-- `~/.codex/hooks.json`：加入可选的结构化提问 hook，保留其他工具的 hooks；升级时移除 VibeCue 旧的权限请求回调。
+升级会保留个人设置，停止旧进程，以新的签名包替换 App，并备份上一版。双击 App 或点击菜单栏入口即可打开设置。
 
-**自动批准不提醒。** `PermissionRequest` 发生在批准流程之前，不能证明需要用户操作。因此不再用它发出提醒，即使旧的已信任回调仍被调用，也不会产生提示。现有 Codex 接入无法可靠确认请求是否真的交给人工处理，人工批准类型目前只提供自定义样式及明确的测试预览，实际提醒开关暂不可用。
+## 真正的人工批准提醒
 
-完成与提问的本机纪录监控不依赖 hooks。可选的提问 hook 若需要启用，请在 Codex CLI 的 `/hooks` 中审阅并信任指向 `VibeCue/vibecuectl hook` 的 `PreToolUse` 项目。安装不会改动信任纪录或略过审阅。
+原始 `PermissionRequest` hook 发生在审批流程之前，**不能证明正在等人操作**。VibeCue 不用它触发提醒，也不根据等待时间、命令速度、自动审核状态或单一 `waitingOnApproval` 标志猜测。
 
-官方依据：[Hooks](https://learn.chatgpt.com/docs/hooks)、[Notifications](https://learn.chatgpt.com/docs/notifications)。
+人工批准接入采用透明 stdio 监听：官方 Codex app-server 与桌面客户端的原始字节双向直通；VibeCue 只观察实际发给客户端的 `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval` 及兼容的旧请求。匹配的客户端响应、`serverRequest/resolved`、任务结束或断线会立即解除对应提醒。自动审查和额外安全检查事件不触发人工提醒。
 
-若全局 `codex` 命令不可用，可使用官方 App 内置 CLI 打开审阅：
+首次接通需要让 Codex 从监听入口启动一次：
+
+1. 在 VibeCue 的「集成与文件」点击「接通人工批准监听」。
+2. 确认准备连接后，先完成正在进行的 Codex 工作，再正常退出 Codex。VibeCue 不会替你强制退出。
+3. VibeCue 会重新打开 Codex；收到实际请求流后，面板才显示「已连接」。
+4. 在「提醒规则」选择人工批准，设置其开关、特效、提示卡、音效与显示时间。
+
+也可以在正常退出 Codex 后执行：
+
+```sh
+./scripts/vibecuectl launch-codex
+# 或先等待用户退出，再自动打开
+./scripts/vibecuectl launch-codex --wait-for-exit
+```
+
+当前桌面版本通过启动环境中的 `CODEX_CLI_PATH` 支持这个覆盖入口，未公开承诺为稳定 API，未来 Codex 更新可能需要适配。覆盖只作用于这次启动，不改动 Codex 安装包、登录凭证、沙箱或审批模式。没有设置覆盖的普通启动会使用官方默认入口；需要监听时通过 VibeCue 启动。未连接时，人工批准类型仍可自定义和预览，面板不会假称已经接通。
+
+监听器不发初始化请求、不启动任务、不批准或拒绝操作。原始命令、提示词和 RPC 内容不写入 VibeCue 日志；只保存必要的请求标识、连接健康状态和提醒元数据。队列丢失、无法解析或来源断开时停止不确定的提醒，而不是猜测用户需要操作。
+
+协议依据：[Codex App Server](https://learn.chatgpt.com/docs/app-server)、[Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)。真正桌面接入与人工批准验收需要在通过此入口重新打开 Codex 后进行；模拟协议测试不等同于这项验收。
+
+## 完成与提问来源
+
+本地适配器只读 `~/.codex/state_*.sqlite` 的对话元数据与 session JSONL 的新增事件，不修改 Codex 数据库或对话，不读取登录凭证。启动时跳过历史，过滤子代理和用户中断，支持部分写入、文件替换与截断。
+
+- `task_complete` 表示本轮结束，不保证整个项目已经交付。
+- 结构化 `request_user_input`／`request_user_input_async` 触发等待输入提醒。
+- Code Mode 的嵌套调用依运行记录识别，无法证明未执行分支，提示中会注明。
+- 最后回复中明确要求用户确认或选择，也会以保守文本规则识别；提示会标注「依回复文本判断」，可能存在漏判或误判。
+- 本地记录格式属于内部接口；没有落到这台电脑上的云端或其他电脑对话不在本地记录监控范围。
+
+原有 `config.toml`、computer-use 的 `notify` 与其他工具的 hooks 保持原样。安装器仅加入可选的结构化提问 hook，并移除 VibeCue 自己的旧权限请求回调。完成和提问监控不依赖 hooks。可选提问 hook 若要启用，在 `/hooks` 中审阅 `PreToolUse` 项目；安装器不会替用户信任。
 
 ```sh
 ./scripts/review-hooks.sh
-# 进入 CLI 后输入 /hooks
+# 进入官方 CLI 后输入 /hooks
 ```
 
-此脚本只启动官方 CLI，不会替你信任 hooks。
+若记录放在外置磁盘，可在「集成与文件」为实际记录目录授予读取访问，不需要完整磁盘访问。读取被拒绝时面板会显示异常。
 
-## 操作
-
-点击 Mac 顶部菜单列的 VibeCue 图标，可以打开设置面板、预览三种提示样式、关闭声音、暂停 30 分钟，或查看最近提醒。双击 App 也会打开设置面板。在「提醒规则」选择类型后，可个别设置开关、泛光颜色、提示音与显示时间，并立即预览。人工批准类型目前仅可编辑及预览样式，实际提醒开关不可用。音量与泛光强度为全局设置。
-
-声音使用 AVAudioPlayer 播放本机合成 WAV，也可选择静音或导入自己的音效档；自选文件会验证后复制到 VibeCue 私有文件夹。播放走一般媒体音频输出，不改动系统音量或静音设置。提醒卡中的「打开对话」使用 `codex://threads/<id>`，需要系统已注册 Codex URL handler。
+## 控制与验证
 
 ```sh
-# 项目内的控制命令
 ./scripts/vibecuectl status
 ./scripts/vibecuectl test complete
 ./scripts/vibecuectl test input
-./scripts/vibecuectl test permission
-
-# 完全停止或恢复 App 及其监控子进程
+./scripts/vibecuectl test permission  # 明确的人工提醒测试，不是假装有真实待批请求
 ./scripts/vibecuectl stop
 ./scripts/vibecuectl start
-
-# 移除登录启动与 VibeCue 自己的 hook，保留程序与数据
 /usr/bin/python3 scripts/uninstall.py
 ```
 
-也可使用安装后的 `~/Library/Application Support/VibeCue/vibecuectl`。菜单列结束功能会连同监控进程一起停止，再次打开 App 恢复。
-
-若 Codex 记录在外置磁盘，macOS 可能要求 VibeCue 的读取授权。请使用面板「集成与文件」中的记录目录授权，或接受系统针对该磁盘的读取提示；不需要授予完整磁盘访问。读取被拒绝时，面板会显示异常，不能只以进程仍在运行判断监控健康。
-
-## 事件来源与准确性
-
-监控进程只读本机 `~/.codex/state_*.sqlite` 对话中继数据与 session JSONL 的添加事件，不修改 Codex 数据库或对话，不读取登录凭证，不连网。对话名称优先取本机正式名称；启动时从既有文件尾端开始，不重播历史提醒。跨进程以工具自己的 SQLite 去重，队列有数量与过期上限。
-
-- `task_complete` 表示**本轮结束**，并非保证整个项目已完成。中断及子代理结束不提醒。
-- 结构化 `request_user_input`／`request_user_input_async` 调用产生提问提醒。Code Mode 的嵌套调用依运行记录辨识，无法证明未运行分支，提醒文本会注明记录判断。
-- 如果最后一段回复明确要求用户确认或选择，也会标为提问；这是保守文本规则，提示卡会标示「依回复文本判断」，可能有漏判或误判。
-- `PermissionRequest` 只表示发生权限请求，没有可靠的人工等待或自动审查结果字段，因此一律不提醒。也不会以等待时间、命令运行速度或单一审批旗标猜测。未来实际人工批准事件必须提供已确认的 `requires_user_action: true`，且不能来自原始 `PermissionRequest hook`。VibeCue 不会替你批准、拒绝或回复。
-- 本机纪录格式是内部接口，Codex 更新后可能需要调整。监控状态显示 `local-transcripts`，不能视为官方稳定事件 API。
-- 没有落在本机 session 纪录中的云端或其他电脑对话，不在此监控范围。云端协调的对话也可能不支持本机 command hooks。
-
-原有 `config.toml` 及 computer-use 的 `notify` 设置维持原样。安装器会备份被修改的既有 `hooks.json`；卸载只移除 VibeCue 自己的项目。
-
-## 开发与验证
+菜单栏提供暂停、静音、最近提醒、测试和设置入口。卸载会移除 VibeCue 的登录入口与 hook，保留程序及个人数据。
 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -v
-# 在隔离目录验证安装，不启动进程
-/usr/bin/python3 scripts/install.py --no-start --user-home /private/tmp/vibecue-install-qa
-# 单独显示测试，截取应用程序自己的卡片与泛光画面
-VIBECUE_HOME=/private/tmp/vibecue-qa \
-  'build/VibeCue.app/Contents/MacOS/VibeCue' \
-  --demo input --capture /private/tmp/vibecue-banner.png \
-  --capture-glow /private/tmp/vibecue-glow.png
+build/VibeCue.app/Contents/MacOS/VibeCue --appearance-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --resolution-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --event-validation-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --customization-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --effects-contact-sheet /private/tmp/vibecue-effects.png
+build/VibeCue.app/Contents/MacOS/VibeCue --cards-contact-sheet /private/tmp/vibecue-cards.png
 ```
 
-测试涵盖启动不重播、部分写入、文件替换／截断、子代理与中断过滤、事件去重、暂时错误重试、提问规则、停用标记、队列上限、进程单例、hook 不产生批准决策，以及安装保留原设置。实际播放状态、播放进度与音频电平可在 `app-status.json` 查看；该状态不能代替人耳确认。
+验证覆盖原始字节转发、自动审查静默、人工请求与解除配对、快速响应竞态、隐私文件、历史不重播、异常恢复，以及样式迁移和渲染。测试使用模拟后端，不会创建真实任务。声音播放状态不能代替人耳确认。
 
-## 接入其他 AI 开发工具
+## 后续工具接入
 
-`vibecue/providers/codex.py` 是目前实际运作的 Codex adapter。它输出统一的本机事件给 `vibecue/events.py`，原生 App 只负责显示、声音与设置。添加工具时应提供自己的事件与对话名称来源，不沿用 Codex 的内部纪录格式。
-
-```json
-{"provider":"codex","id":"stable-event-id","kind":"input","thread_id":"thread-id","title":"对话名称","message":"需要回答","created_at":"2026-10-27T12:00:00Z"}
-```
-
-此版本尚未接入 Claude Desktop 或其他工具。VibeCue 是独立项目；安装后运行不依赖原代码所在目录。
+`vibecue/providers/codex.py` 读取本地记录；`approval_bridge.py` 观察实际客户端审批流；`vibecue/events.py` 输出统一事件和解除控制；原生 Swift App 处理样式、声音与设置。新增工具应提供自己的可靠来源，不复用 Codex 内部格式。目前没有声称已经支持 Claude Desktop。

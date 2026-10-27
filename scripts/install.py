@@ -175,6 +175,12 @@ def install(start=True, with_hooks=True, user_home=None):
                 'exec /usr/bin/python3 -m vibecue.cli "$@"\n')
     private_write(control, launcher.encode())
     os.chmod(control, 0o700)
+    bridge_wrapper = home / 'vibecue-codex'
+    bridge_launcher = ('#!/bin/sh\nset -eu\nexport PYTHONPATH=' + shlex.quote(str(runtime)) + '\n'
+                      'export VIBECUE_HOME=' + shlex.quote(str(home)) + '\n'
+                      'exec /usr/bin/python3 -m vibecue.providers.approval_bridge "$@"\n')
+    private_write(bridge_wrapper, bridge_launcher.encode())
+    os.chmod(bridge_wrapper, 0o700)
     env = {'VIBECUE_HOME': str(home), 'PYTHONPATH': str(runtime),
            'PYTHONUNBUFFERED': '1', 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
     jobs = [
@@ -190,7 +196,7 @@ def install(start=True, with_hooks=True, user_home=None):
         private_write(agents / (job['Label'] + '.plist'), plistlib.dumps(job))
     # Preserve config.toml and the existing computer-use notify command verbatim.
     hooks = install_hooks(user_home / '.codex', control, home) if with_hooks else previous.get('hooks')
-    record = {'version': '0.1.1', 'app': str(app), 'home': str(home), 'hooks': hooks,
+    record = {'version': '0.2.0', 'app': str(app), 'home': str(home), 'hooks': hooks,
               'source_dir': str(PROJECT),
               'labels': list(LABELS), 'installed_at': datetime.now(timezone.utc).isoformat()}
     json_write(home / 'install.json', record)

@@ -132,6 +132,8 @@ def main(argv=None):
     notify.add_argument('payload')
     sub.add_parser('stop', help='停止 App 与其监控进程')
     sub.add_parser('start', help='重新启动 App 与其监控进程')
+    launch = sub.add_parser('launch-codex', help='通过真实人工批准监听入口启动 Codex；不改变审批设置')
+    launch.add_argument('--wait-for-exit', action='store_true', help='等待用户正常退出 Codex 后再启动，绝不强制退出')
     args = parser.parse_args(argv)
     if args.command == 'watch':
         from .providers.codex import main as watch_main
@@ -158,6 +160,13 @@ def main(argv=None):
             pass
     elif args.command in ('start', 'stop'):
         control(args.command)
+    elif args.command == 'launch-codex':
+        from .codex_launch import launch_codex
+        try:
+            return launch_codex(args.wait_for_exit)
+        except Exception as error:
+            print(str(error), file=sys.stderr)
+            return 1
     return 0
 
 
