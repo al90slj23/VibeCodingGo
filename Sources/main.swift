@@ -255,6 +255,7 @@ struct CueResolutionTracker {
 }
 
 final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegate {
+    static let previewDuration: TimeInterval = 6
     let home: URL
     let eventsDirectory: URL
     let inflightDirectory: URL
@@ -470,6 +471,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard pausedUntil == nil, settings.allows(event) else { return }
         // A real event immediately replaces a preview, including completion events.
         if current?.isPreview == true {
+            previewFeedback = "任务提醒优先显示，预览已停止。"
+            settingsPanel?.updatePreviewFeedback(previewFeedback)
             audioPlayer?.stop(); hideWindows(); current = nil
         }
         // Keep the latest state per conversation while preserving other conversations.
@@ -498,15 +501,21 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     @discardableResult
     func preview(kind: String, component: String) -> String {
-        func finish(_ text: String) -> String { previewFeedback = text; writeStatus(); return text }
+        func finish(_ text: String) -> String {
+            previewFeedback = text; settingsPanel?.updatePreviewFeedback(text); writeStatus(); return text
+        }
         guard settings.enabled else { return finish("已保存选择。全局提醒已关闭，预览未播放。") }
         guard pausedUntil == nil else { return finish("已保存选择。全局提醒已暂停，预览未播放。") }
+        guard component != "effect" || settings.glowEnabled else {
+            return finish("屏幕光效已关闭。请在“泛光与声音”中开启后预览。")
+        }
         guard current == nil || current?.isPreview == true,
               !pending.contains(where: { !$0.isPreview }) else {
             return finish("已保存选择，右侧可查看样例。真实任务提醒正在显示或排队，稍后可再次预览。")
         }
         if current?.isPreview == true { hideWindows(); current = nil }
         audioPlayer?.stop()
+        previewComponent = component
         if component == "sound" {
             playChime(kind: kind, name: settings.soundName(for: kind))
             return finish(muted || settings.soundToken(for: kind) == "silent" ? "已保存音效。当前处于静音状态。" : "正在试听：\(lastSound)")
@@ -516,7 +525,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         makeWindows(for: event)
         if component == "all" { playChime(kind: kind, name: settings.soundName(for: kind)) }
         let id = event.id
-        hideTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
+        hideTimer = Timer.scheduledTimer(withTimeInterval: Self.previewDuration, repeats: false) { [weak self] _ in
             guard let self, self.current?.id == id, self.current?.isPreview == true else { return }
             self.dismissCurrent()
         }
@@ -550,7 +559,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             let panel = CuePanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             configure(panel, clickThrough: true)
             let glow = CueEdgeEffectView(frame: NSRect(origin: .zero, size: screen.frame.size), style: resolvedVisualStyle(for: event))
-            glow.displayDuration = event.isPreview ? 3 : settings.duration(event.kind)
+            glow.displayDuration = event.isPreview ? Self.previewDuration : settings.duration(event.kind)
             glow.advance(to: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : Date().timeIntervalSince(shownAt))
             panel.contentView = glow
             edgeViews.append(glow)
@@ -602,7 +611,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     func configure(_ panel: NSPanel, clickThrough: Bool) {
         panel.isOpaque = false; panel.backgroundColor = .clear
         panel.hasShadow = false; panel.ignoresMouseEvents = clickThrough
-        panel.level = clickThrough ? .floating : .statusBar
+        // Stay above menu/Dock surfaces, below system/security and popup layers.
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + (clickThrough ? 1 : 2))
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.hidesOnDeactivate = false; panel.isReleasedWhenClosed = false
         panel.animationBehavior = .none
@@ -640,6 +650,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
 
     @objc func dismissCurrent() {
+        if current?.isPreview == true {
+            previewFeedback = "预览已结束。点击样式或“预览”可再次查看。"
+            settingsPanel?.updatePreviewFeedback(previewFeedback)
+        }
         hideWindows(); current = nil; writeStatus()
         if !pending.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
@@ -716,6 +730,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard audioPlayer === player else { return }
         lastSoundFinished = true; lastSoundFinishSucceeded = flag
         lastSoundPlaybackTime = player.duration
+        if current == nil, previewComponent == "sound" {
+            previewFeedback = flag ? "试听已结束。点击音效可再次试听。" : "试听未完成，请查看音频状态。"
+            settingsPanel?.updatePreviewFeedback(previewFeedback)
+        }
         writeStatus()
     }
 
@@ -998,7 +1016,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 resolveStyles(for: current, reroll: false)
                 makeWindows(for: current)
                 hideTimer?.invalidate()
-                let remaining = max(0.1, (current.isPreview ? 3 : settings.duration(current.kind)) - Date().timeIntervalSince(shownAt))
+                let remaining = max(0.1, (current.isPreview ? Self.previewDuration : settings.duration(current.kind)) - Date().timeIntervalSince(shownAt))
                 let id = current.id
                 hideTimer = Timer.scheduledTimer(withTimeInterval: remaining, repeats: false) { [weak self] _ in
                     guard let self, self.current?.id == id else { return }
@@ -1062,6 +1080,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "current_title": current?.title ?? "", "last_shown_title": lastShownTitle,
             "current_color": current.map { settings.color(for: $0.kind).cueHex } ?? "",
             "effect_frame_rate": effectFrameRate,
+            "preview_duration": Self.previewDuration,
+            "edge_windows": edges.map { ["visible": $0.isVisible, "level": $0.level.rawValue, "alpha": $0.alphaValue, "frame": NSStringFromRect($0.frame)] as [String: Any] },
+            "banner_visible": banner?.isVisible ?? false,
             "effect_preset_count": CueEffectCatalog.presets.count, "card_style_count": CueCardCatalog.presets.count,
             "sound_preset_count": CueSoundCatalog.presets.count,
             "current_is_preview": current?.isPreview ?? false, "preview_component": previewComponent,
@@ -1150,6 +1171,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     var appearanceTab = 0
     var presetBrowser: CuePresetBrowserController?
     var appearanceValues: [String: NSTextField] = [:]
+    var previewStatusLabel: NSTextField?
 
     init(cue: CueController) {
         self.cue = cue
@@ -1206,7 +1228,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         let line = NSView(frame: NSRect(x: 20, y: 517, width: 142, height: 1))
         line.wantsLayer = true; line.layer?.backgroundColor = NSColor.separatorColor.cgColor; sidebar.addSubview(line)
         label("本机运行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 533, width: 154, height: 19), size: 10.5, color: .secondaryLabelColor)
-        label("VibeCue \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0")", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
+        label("VibeCue \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.1")", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
     }
 
     @objc func navigate(_ sender: NSButton) { selectPage(sender.tag) }
@@ -1214,7 +1236,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
 
     func rebuild() {
         content.subviews.forEach { $0.removeFromSuperview() }
-        healthLabel = nil; threadLabel = nil; latestLabel = nil; hookLabel = nil; sliderLabels = [:]
+        healthLabel = nil; threadLabel = nil; latestLabel = nil; hookLabel = nil; sliderLabels = [:]; previewStatusLabel = nil
         for (index, button) in navigation.enumerated() {
             button.layer?.backgroundColor = (index == page ? NSColor.controlAccentColor.withAlphaComponent(0.1) : .clear).cgColor
             button.contentTintColor = index == page ? .labelColor : .secondaryLabelColor
@@ -1335,7 +1357,13 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         else { soundRuleEditor(in: document) }
         _ = button("预览整套提醒", in: content, frame: NSRect(x: 23, y: 535, width: 260, height: 34), action: #selector(previewEvent))
         _ = button("恢复此类默认", in: content, frame: NSRect(x: 293, y: 535, width: 260, height: 34), action: #selector(resetEventStyle))
-        label("分类可以多选，随机遵循所选分类。设置即时保存，预览遵循静音与暂停。", in: content, frame: NSRect(x: 28, y: 573, width: 520, height: 16), size: 11, color: .secondaryLabelColor)
+        previewStatusLabel = label(cue.previewFeedback.isEmpty ? "分类可多选，随机遵循分类。设置即时保存，预览遵循静音与暂停。" : cue.previewFeedback, in: content, frame: NSRect(x: 28, y: 573, width: 520, height: 16), size: 11, color: .secondaryLabelColor)
+    }
+
+    func updatePreviewFeedback(_ text: String) {
+        previewStatusLabel?.stringValue = text
+        previewStatusLabel?.toolTip = text
+        presetBrowser?.updateFeedback(text)
     }
 
     func editorLabel(_ title: String, _ subtitle: String, in parent: NSView, y: CGFloat) {
@@ -1701,6 +1729,40 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 }
 
+if CommandLine.arguments.contains("--window-preview-self-test") {
+    let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-window-preview-\(UUID().uuidString)")
+    try! FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    setenv("VIBECUE_HOME", home.path, 1)
+    let application = NSApplication.shared
+    application.setActivationPolicy(.accessory)
+    let cue = CueController()
+    cue.settings.soundEnabled = false
+    cue.settings.eventStyles["complete"]?["effect"] = "quiet-outline"
+    var results: [String: Bool] = [:]
+    DispatchQueue.main.async {
+        _ = cue.preview(kind: "complete", component: "effect")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            results["edge_panels_visible_on_all_screens"] = cue.edges.count == NSScreen.screens.count && !cue.edges.isEmpty && cue.edges.allSatisfy(\.isVisible)
+            results["edge_panels_above_menu_and_dock"] = cue.edges.allSatisfy { $0.level.rawValue > NSWindow.Level.statusBar.rawValue && $0.level.rawValue < NSWindow.Level.screenSaver.rawValue }
+            results["edge_panels_cover_screen_frames"] = zip(cue.edges, NSScreen.screens).allSatisfy { $0.frame == $1.frame }
+            results["edge_clock_advances_after_fade_in"] = cue.effectFrameRate > 0 && cue.edgeViews.allSatisfy { $0.elapsed > 0.4 }
+            results["recommended_line_has_readable_width"] = CueEffectCatalog.preset(id: "quiet-outline").recipe.layers.contains { $0.minimumWidth >= 1 }
+            results["six_second_preview_is_active"] = CueController.previewDuration == 6 && cue.current?.isPreview == true && cue.hideTimer?.isValid == true
+            _ = cue.preview(kind: "complete", component: "card")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                results["card_preview_visible_after_fade_in"] = cue.banner?.isVisible == true && (cue.banner?.alphaValue ?? 0) > 0.95
+                results["card_preview_has_no_edge_windows"] = cue.edges.isEmpty
+                cue.shuttingDown = true; cue.hideWindows(); cue.current = nil
+                try? FileManager.default.removeItem(at: home)
+                print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+                exit(results.values.allSatisfy { $0 } ? 0 : 1)
+            }
+        }
+    }
+    application.run()
+    exit(1)
+}
+
 if CommandLine.arguments.contains("--appearance-self-test") {
     var settings = CueSettings()
     settings.eventStyles["input"] = ["color": "#123456", "sound": "silent", "effect": CueEffectCatalog.presets[12].id, "palette": "#F05A90,#44DDFF,#FCDD55", "direction": "counterclockwise", "speed": "2.4", "width": "35", "opacity": "0.65", "inset": "18", "trail": "0.3", "card_style": "terminal", "card_position": "bottom-right", "card_opacity": "0.82", "text_scale": "1.1", "card_message": "false"]
@@ -1784,6 +1846,9 @@ if CommandLine.arguments.contains("--preview-self-test") {
     let browser = CuePresetBrowserController(category: .sound, fields: ["sound": "random", "sound_random_tags": "nature,urban"], color: .systemBlue, selectedID: "random", eventName: "自检", shouldAnimate: { false }, onSelect: { _, _ in ("", nil) })
     results["browser_reopens_saved_multi_tag_scope"] = browser.selectedTags == Set(["nature", "urban"])
     browser.close()
+    cue.settings.glowEnabled = false
+    _ = cue.preview(kind: "input", component: "effect")
+    results["disabled_edge_preview_reports_reason"] = cue.current == nil && cue.previewFeedback.contains("屏幕光效已关闭")
     cue.hideWindows(); NSStatusBar.system.removeStatusItem(cue.statusItem)
     try? FileManager.default.removeItem(at: directory)
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)

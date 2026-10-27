@@ -12,7 +12,7 @@
 - **随机**：在当前所选标签范围抽取；三个分类独立。单次提醒和多显示器共用同一份抽取结果，窗口重建不会重新抽取。搜索词只筛选可见列表，不缩小随机池。
 - **自定义**：保留 1–8 色、方向、速度、宽度、内缩、透明度、尾迹、卡片位置和音量；尺寸单位为 AppKit 逻辑点（pt）。
 
-提示卡的标题、正文、图标和空白区域可点击打开对应对话；按钮保留各自操作。预览没有真实对话时不跳转。真实提醒优先，连续预览只替换上一预览，不写入最近任务列表。全局暂停、静音、减少动态效果仍有效。
+提示卡的标题、正文、图标和空白区域可点击打开对应对话；按钮保留各自操作。预览没有真实对话时不跳转。视觉预览持续 6 秒；结束、暂停或被真实提醒阻止时显示原因。真实提醒优先，连续预览只替换上一预览，不写入最近任务列表。全局暂停、静音、减少动态效果仍有效。
 
 设置与图库跟随系统外观。升级到本代视觉时先将旧设置完整备份到私有 `backups/styles-before-native-*.json`，然后应用推荐光效/卡片；保留声音选择、音量、开关、配色和对话入口偏好。旧样式仍可从分类库选择。
 
@@ -96,6 +96,7 @@
 build/VibeCue.app/Contents/MacOS/VibeCue --appearance-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --sound-source-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --preview-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --window-preview-self-test  # 短暂显示无声测试窗口
 build/VibeCue.app/Contents/MacOS/VibeCue --resolution-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --event-validation-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --customization-self-test

@@ -10,6 +10,7 @@ enum CueEffectMotionKind { case still, breathe, orbit, pulse }
 struct CueEffectLayer {
     let brush: CueEffectBrush
     var width: Double = 0.10
+    var minimumWidth: Double = 0.65
     var opacity: Double = 0.8
     var offset: Double = 0
     var count: Int = 1
@@ -81,20 +82,20 @@ enum CueEffectCatalog {
         return [
             preset("quiet-edge", "轻柔边光", ["stationary"], .init(layers: [
                 .init(brush: .line, width: 0.42, opacity: 0.035),
-                .init(brush: .line, width: 0.055, opacity: 0.52, glow: 0.35)])),
+                .init(brush: .line, width: 0.055, minimumWidth: 1.2, opacity: 0.80, glow: 0.35)])),
             preset("quiet-beam", "单束流光", ["flow"], .init(layers: [
                 .init(brush: .line, width: 0.035, opacity: 0.08),
-                .init(brush: .beam, width: 0.10, opacity: 0.72, length: 0.13, glow: 0.4)], motion: .init(kind: .orbit, period: 16))),
+                .init(brush: .beam, width: 0.10, minimumWidth: 1.25, opacity: 0.85, length: 0.13, glow: 0.4)], motion: .init(kind: .orbit, period: 16))),
             preset("quiet-corners", "角落提示", ["corners", "stationary"], .init(path: .corners, layers: [
-                .init(brush: .line, width: 0.08, opacity: 0.62, glow: 0.28)])),
+                .init(brush: .line, width: 0.08, minimumWidth: 1.2, opacity: 0.82, glow: 0.28)])),
             preset("quiet-top", "顶部微光", ["stationary"], .init(path: .topEdge, layers: [
                 .init(brush: .line, width: 0.50, opacity: 0.025),
-                .init(brush: .line, width: 0.07, opacity: 0.55)])),
+                .init(brush: .line, width: 0.07, minimumWidth: 1.2, opacity: 0.80)])),
             preset("quiet-outline", "静息细线", ["stationary"], .init(layers: [
-                .init(brush: .line, width: 0.035, opacity: 0.36, offset: 0.10)])),
+                .init(brush: .line, width: 0.035, minimumWidth: 1.2, opacity: 0.82, offset: 0.10)])),
             preset("quiet-breath", "缓缓呼吸", ["flow"], .init(layers: [
                 .init(brush: .line, width: 0.25, opacity: 0.055, glow: 0.2),
-                .init(brush: .line, width: 0.075, opacity: 0.64)], motion: .init(kind: .breathe, period: 8)))
+                .init(brush: .line, width: 0.075, minimumWidth: 1.2, opacity: 0.80)], motion: .init(kind: .breathe, period: 8)))
         ]
     }()
     // The old IDs are preserved; their paint now uses the same components.
@@ -225,7 +226,10 @@ enum CueEffectCatalog {
             "six_recommended_recipes": recommendedPresets.count == 6 && recommendedPresets.allSatisfy { $0.tagIDs.contains("recommended") } && legacyPresets.allSatisfy { !$0.tagIDs.contains("recommended") },
             "stable_unique_effect_ids": Set(presets.map(\.id)).count == presets.count,
             "default_is_recommended": recommendedPresets.contains { $0.id == defaultID } && CueVisualStyle(fields: [:], fallback: fallback).effectID == defaultID,
-            "recipes_use_shared_components": presets.allSatisfy { !$0.recipe.layers.isEmpty && $0.recipe.layers.count <= 4 && $0.recipe.layers.allSatisfy { $0.width > 0 && (0...1).contains($0.opacity) && $0.count > 0 } },
+            "recipes_use_shared_components": presets.allSatisfy { !$0.recipe.layers.isEmpty && $0.recipe.layers.count <= 4 && $0.recipe.layers.allSatisfy { $0.width > 0 && $0.minimumWidth > 0 && (0...1).contains($0.opacity) && $0.count > 0 } },
+            "recommended_cores_have_visible_minimum": recommendedPresets.allSatisfy { preset in
+                preset.recipe.layers.contains { $0.minimumWidth >= 1.1 && (0.76...0.85).contains($0.opacity) }
+            },
             "effect_tags_valid": presets.allSatisfy { !$0.tagIDs.isEmpty && Set($0.tagIDs).isSubset(of: Set(tags.map(\.id))) },
             "bounded_finite_controls": bounded.speed.isFinite && bounded.width == 80 && bounded.opacity == 0.1 && bounded.inset == 0 && bounded.trail.isFinite,
             "palette_validation": bounded.paletteHex == ["#123456", "#ABCDEF"], "direction_validation": bounded.direction == "clockwise",
@@ -364,7 +368,7 @@ private struct CueEffectRenderer {
         let alpha = envelope * motion.strength
         for layer in recipe.layers {
             let phase = motion.phase * layer.movement + layer.phase
-            let lineWidth = max(0.65, width * CGFloat(layer.width)), offset = width * CGFloat(layer.offset)
+            let lineWidth = max(CGFloat(layer.minimumWidth), width * CGFloat(layer.width)), offset = width * CGFloat(layer.offset)
             switch layer.brush {
             case .line, .wave:
                 for (start, length) in ranges(perimeter, width: width) {

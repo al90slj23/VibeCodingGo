@@ -173,8 +173,9 @@ final class CuePresetBrowserController: NSWindowController, NSWindowDelegate, NS
     func selectAndPreview() {
         let result = onSelect(selectedID, Array(selectedTags).sorted())
         sampleID = result.previewID ?? (selectedID == "random" ? category.filtered(tags: selectedTags).randomElement()?.id ?? category.entries[0].id : selectedID)
-        updateSelection(); feedbackLabel.stringValue = result.feedback + soundDescription()
+        updateSelection(); updateFeedback(result.feedback)
     }
+    func updateFeedback(_ text: String) { feedbackLabel.stringValue = text + soundDescription() }
     func soundDescription() -> String {
         guard category == .sound, let preset = CueSoundCatalog.preset(id: sampleID) else { return "" }
         return "\n\n" + preset.sourceDescription + String(format: " · %.1f 秒\n", preset.duration) + preset.description
