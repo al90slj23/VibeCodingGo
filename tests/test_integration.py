@@ -17,19 +17,17 @@ spec.loader.exec_module(installer)
 
 
 class HookAdapterTests(unittest.TestCase):
-    def test_passive_permission_hook_does_not_collapse_distinct_requests(self):
+    def test_raw_permission_requests_never_claim_human_wait(self):
         payload = {'hook_event_name': 'PermissionRequest', 'session_id': 'parent',
                    'turn_id': 't1', 'tool_name': 'Bash', 'tool_input': {'command': 'first'}}
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'VIBECUE_HOME': directory}), \
                 patch.object(cli, '_main_thread', return_value=True), patch.object(cli, 'emit_event') as emit:
+            for mode in ['default', 'dontAsk', 'acceptEdits', 'bypassPermissions']:
+                payload['permission_mode'] = mode
+                cli.handle_hook(payload)
+            payload.update(tool_input={'command': 'second'}, requires_user_action=True)
             cli.handle_hook(payload)
-            payload['tool_input'] = {'command': 'second'}
-            cli.handle_hook(payload)
-            self.assertEqual(emit.call_count, 2)
-            first, second = [call.kwargs for call in emit.call_args_list]
-            self.assertNotEqual(first['event_id'], second['event_id'])
-            self.assertNotIn('first', first['event_id'])
-            self.assertEqual(emit.call_args_list[0].args[0], 'permission')
+            emit.assert_not_called()
 
     def test_subagent_hook_is_silent(self):
         with patch.object(cli, '_main_thread', return_value=False), patch.object(cli, 'emit_event') as emit:
@@ -44,6 +42,22 @@ class HookAdapterTests(unittest.TestCase):
 
 
 class InstallTests(unittest.TestCase):
+    def test_upgrade_removes_only_our_raw_permission_handler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory)
+            codex=home/'.codex'
+            codex.mkdir()
+            control=home/'VibeCue/vibecuectl'
+            own={'type':'command','command':installer.shlex.quote(str(control))+' hook','async':True,'timeout':3}
+            other={'type':'command','command':'other-permission-handler'}
+            config={'hooks':{'PermissionRequest':[{'matcher':'Bash','hooks':[own,other]},{'hooks':[own]}]}}
+            (codex/'hooks.json').write_text(json.dumps(config))
+            result=installer.install_hooks(codex,control,home/'VibeCue')
+            after=json.loads((codex/'hooks.json').read_text())
+            self.assertEqual(after['hooks']['PermissionRequest'],[{'matcher':'Bash','hooks':[other]}])
+            self.assertNotIn('PermissionRequest',result['groups'])
+            self.assertIn('PreToolUse',result['groups'])
+
     def test_install_merge_reinstall_and_preserve_original_notify(self):
         if not (PROJECT / 'build/VibeCue.app').exists():
             self.skipTest('Build app before running installer integration test')

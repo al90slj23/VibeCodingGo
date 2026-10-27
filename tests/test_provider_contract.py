@@ -8,6 +8,16 @@ from vibecue.providers import PROVIDERS
 
 
 class ProviderContractTests(unittest.TestCase):
+    def test_permission_requires_positive_human_action_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args=dict(kind='permission',thread_id='thread',turn_id='turn',title='對話',vibecue_home=directory)
+            self.assertFalse(emit_event(**args))
+            self.assertFalse(emit_event(**args,source='PermissionRequest hook',requires_user_action=True))
+            self.assertFalse((Path(directory)/'events').exists())
+            self.assertTrue(emit_event(**args,source='confirmed human wait',requires_user_action=True))
+            event=json.loads(next((Path(directory)/'events').glob('*.json')).read_text())
+            self.assertIs(event['requires_user_action'],True)
+
     def test_only_implemented_provider_advertised(self):
         self.assertEqual(set(PROVIDERS), {'codex'})
         self.assertEqual(PROVIDERS['codex']['status'], 'available')

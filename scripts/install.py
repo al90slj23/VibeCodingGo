@@ -35,7 +35,6 @@ def hook_groups(control_path):
     handler = {'type': 'command', 'command': shlex.quote(str(control_path)) + ' hook',
                'timeout': 3, 'async': True}
     return {
-        'PermissionRequest': {'hooks': [handler.copy()]},
         'PreToolUse': {'matcher': r'(^|.*[._])request_user_input(_async)?$',
                        'hooks': [handler.copy()]},
     }
@@ -48,6 +47,23 @@ def install_hooks(codex_home, control_path, home):
     if not isinstance(config, dict) or not isinstance(config.get('hooks', {}), dict):
         raise RuntimeError('Existing hooks.json has an unexpected shape; left unchanged.')
     hooks = config.setdefault('hooks', {})
+    # Retire only VibeCue's old raw approval callback. Preserve handlers from
+    # other tools, including those sharing a matcher group with ours.
+    own_command = shlex.quote(str(control_path)) + ' hook'
+    permission_groups = hooks.get('PermissionRequest', [])
+    if not isinstance(permission_groups, list):
+        raise RuntimeError('Existing hook event is not a list; left unchanged.')
+    retained = []
+    for group in permission_groups:
+        if isinstance(group, dict) and isinstance(group.get('hooks'), list):
+            handlers = [h for h in group['hooks'] if not (
+                isinstance(h, dict) and h.get('type') == 'command' and h.get('command') == own_command)]
+            if handlers:
+                retained.append(dict(group, hooks=handlers))
+        else:
+            retained.append(group)
+    if permission_groups:
+        hooks['PermissionRequest'] = retained
     groups = hook_groups(control_path)
     for event, group in groups.items():
         current = hooks.setdefault(event, [])
@@ -112,7 +128,7 @@ def install(start=True, with_hooks=True, user_home=None):
         private_write(agents / (job['Label'] + '.plist'), plistlib.dumps(job))
     # Preserve config.toml and the existing computer-use notify command verbatim.
     hooks = install_hooks(user_home / '.codex', control, home) if with_hooks else previous.get('hooks')
-    record = {'version': '0.1.0', 'app': str(app), 'home': str(home), 'hooks': hooks,
+    record = {'version': '0.1.1', 'app': str(app), 'home': str(home), 'hooks': hooks,
               'source_dir': str(PROJECT),
               'labels': list(LABELS), 'installed_at': datetime.now(timezone.utc).isoformat()}
     json_write(home / 'install.json', record)

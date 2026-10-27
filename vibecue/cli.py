@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,19 +47,9 @@ def handle_hook(payload):
         # another hook continues the task. Leave completion to the watcher.
         return
     if event == 'PermissionRequest':
-        # This is a *request*, not proof human approval remains pending. Auto
-        # review can resolve it; the banner explicitly says to inspect Codex.
-        tool = clean_text(payload.get('tool_name'), 64)
-        request_key = str(payload.get('tool_use_id') or payload.get('call_id') or '')
-        if not request_key:
-            encoded = json.dumps(payload.get('tool_input', {}), sort_keys=True, ensure_ascii=False)
-            # Do not store commands/arguments. Distinct requests in one turn
-            # must not collapse; an identical later retry should also alert.
-            request_key = hashlib.sha256(encoded.encode()).hexdigest() + ':' + str(int(time.time() / 5))
-        emit_event('permission', thread_id, turn_id,
-                   message='有權限請求，請查看 Codex 是否仍需要你批准' + (f' · {tool}' if tool else ''),
-                   event_id=f'permission:{thread_id}:{turn_id}:{tool}:{request_key}',
-                   source='PermissionRequest hook')
+        # A request precedes auto-review and other approval handlers. Neither
+        # its existence nor permission_mode proves a person must act. Keep old
+        # trusted callbacks harmless after upgrading; never guess from delay.
         return
     if event == 'PreToolUse':
         name = str(payload.get('tool_name') or '')
@@ -149,7 +138,8 @@ def main(argv=None):
         return watch_main(['--interval', str(max(0.25, args.interval))])
     if args.command == 'test':
         emit_event(args.kind, args.thread_id, title=args.title, message=args.message,
-                   event_id=f'test:{time.time_ns()}', source='manual test')
+                   event_id=f'test:{time.time_ns()}', source='manual test',
+                   requires_user_action=args.kind == 'permission')
     elif args.command == 'status':
         print(json.dumps(status(), ensure_ascii=False, indent=2))
     elif args.command == 'hook':

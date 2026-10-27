@@ -125,7 +125,8 @@ def prune_event_spool(spool, now=None, retain=500):
 
 
 def emit_event(kind, thread_id, turn_id='', title='', message='', event_id='',
-               source='watcher', vibecue_home=None, provider='codex'):
+               source='watcher', vibecue_home=None, provider='codex',
+               requires_user_action=False):
     """Atomically enqueue once across concurrent watcher/hook processes.
 
     Returns False for an already emitted ID. Only this tool's private state is
@@ -133,6 +134,9 @@ def emit_event(kind, thread_id, turn_id='', title='', message='', event_id='',
     """
     if kind not in KINDS:
         raise ValueError(f'Unsupported event kind: {kind}')
+    if kind == 'permission' and (
+            requires_user_action is not True or source == 'PermissionRequest hook'):
+        return False
     home = vibecue_directory(vibecue_home)
     if (home / 'disabled').exists():
         return False
@@ -155,6 +159,7 @@ def emit_event(kind, thread_id, turn_id='', title='', message='', event_id='',
     identifier = hashlib.sha256((provider + ':' + raw_id).encode()).hexdigest()
     event = {
         'id': identifier, 'kind': kind, 'provider': provider,
+        'requires_user_action': requires_user_action is True,
         'title': clean_text(title or resolve_title(thread_id), 160),
         'thread_id': clean_text(thread_id, 160),
         'message': clean_text(message, 240),

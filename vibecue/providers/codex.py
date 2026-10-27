@@ -363,7 +363,7 @@ class Watcher:
             'started_at': self.started_at, 'watched_threads': len(self.watched),
             'source': 'local-transcripts', 'provider': 'codex',
             'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic'],
-            'permission_status': 'requires-optional-hook',
+            'permission_status': 'unavailable-without-confirmed-human-wait',
             'pending_deliveries': sum(len(i.pending) for _, i in self.watched.values()),
             'dropped_deliveries': sum(i.dropped_deliveries for _, i in self.watched.values()),
             'read_error_count': sum(bool(tail.read_error) for tail, _ in self.watched.values()),
