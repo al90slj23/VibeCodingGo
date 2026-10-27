@@ -8,7 +8,7 @@ struct CueLibraryTag {
 
 enum CuePresetCategory: String {
     case effect, card, sound
-    var title: String { self == .effect ? "屏幕光效" : self == .card ? "提示卡" : "声音" }
+    var title: String { self == .effect ? "屏幕光影" : self == .card ? "提示卡" : "声音" }
     var settingKey: String { self == .effect ? "effect" : self == .card ? "card_style" : "sound" }
     var entries: [(id: String, name: String)] {
         switch self {
@@ -37,9 +37,9 @@ enum CuePresetCategory: String {
             (search.isEmpty || item.name.localizedCaseInsensitiveContains(search) || tagIDs(for: item.id).contains { $0.localizedCaseInsensitiveContains(search) })
         }
     }
-    var defaultTag: String { self == .effect ? "recommended" : self == .card ? "native" : "synthesized" }
+    var defaultTag: String { self == .effect ? "lighting" : self == .card ? "native" : "synthesized" }
     var tags: [CueLibraryTag] {
-        [CueLibraryTag(id: "all", name: "全部", count: entries.count)] + tagNames.filter { $0.id != "all" }.map { CueLibraryTag(id: $0.id, name: $0.name, count: filtered(tags: [$0.id]).count) }.filter { $0.count > 0 }
+        [CueLibraryTag(id: "all", name: "全部", count: entries.count)] + tagNames.filter { $0.id != "all" && !(self == .effect && $0.id == "recommended") }.map { CueLibraryTag(id: $0.id, name: $0.name, count: filtered(tags: [$0.id]).count) }.filter { $0.count > 0 }
     }
     var choices: [(id: String, name: String)] { [("random", "随机")] + entries }
 }
@@ -47,7 +47,8 @@ enum CuePresetCategory: String {
 final class CuePresetBrowserController: NSWindowController, NSWindowDelegate, NSSearchFieldDelegate {
     let category: CuePresetCategory
     var fields: [String: String]
-    let accent: NSColor
+    var accent: NSColor
+    var windowOpacity: Double
     let onSelect: (String, [String]) -> (feedback: String, previewID: String?)
     let shouldAnimate: () -> Bool
     var selectedID: String
@@ -62,19 +63,20 @@ final class CuePresetBrowserController: NSWindowController, NSWindowDelegate, NS
     let feedbackLabel = NSTextField(wrappingLabelWithString: "")
     let countLabel = NSTextField(labelWithString: "")
     var effectView: CueEdgeEffectView?
+    var materialView: CueMaterialPreviewView?
     var clock: Timer?
     var startedAt = Date()
 
     init(category: CuePresetCategory, fields: [String: String], color: NSColor, selectedID: String,
-         eventName: String, shouldAnimate: @escaping () -> Bool,
+         eventName: String, windowOpacity: Double = 1, shouldAnimate: @escaping () -> Bool,
          onSelect: @escaping (String, [String]) -> (feedback: String, previewID: String?)) {
-        self.category = category; self.fields = fields; accent = color
+        self.category = category; self.fields = fields; accent = color; self.windowOpacity = windowOpacity
         self.selectedID = selectedID; self.onSelect = onSelect; self.shouldAnimate = shouldAnimate
         let scope: Set<String>
         if let saved = fields[category.settingKey + "_random_tags"] {
             let valid = Set(category.tagNames.map(\.id) + ["all"])
             let parsed = Set(saved.split(separator: ",").map { value in
-                category == .effect && value == "subtle" ? "recommended" : category == .effect && value == "vivid" ? "classic" : String(value)
+                category == .effect && (value == "subtle" || value == "recommended") ? "lighting" : category == .effect && value == "vivid" ? "classic" : String(value)
             }).intersection(valid)
             scope = saved.isEmpty || parsed.contains("all") ? ["all"] : parsed.isEmpty ? [category.defaultTag] : parsed
         } else { scope = [category.defaultTag] }
@@ -156,7 +158,11 @@ final class CuePresetBrowserController: NSWindowController, NSWindowDelegate, NS
         if id == "random" { return NSImage(systemSymbolName: "shuffle", accessibilityDescription: "随机当前分类") ?? NSImage(size: size) }
         switch category {
         case .effect:
-            var styleFields = fields; styleFields["effect"] = id; styleFields["width"] = "3"; styleFields["inset"] = "5"
+            var styleFields = fields; styleFields["effect"] = id
+            if CueEffectCatalog.preset(id: id).recipe.material != nil {
+                return CueMaterialPreviewView.image(style: CueVisualStyle(fields: styleFields, fallback: accent), size: size, time: 1.35, opacity: windowOpacity)
+            }
+            styleFields["width"] = "3"; styleFields["inset"] = "5"
             let rep = CueEdgeEffectView.bitmap(style: CueVisualStyle(fields: styleFields, fallback: accent), size: size, time: 1.35, background: false)
             let image = NSImage(size: size); image.addRepresentation(rep); return image
         case .card: return CueCardCatalog.previewImage(for: CueCardCatalog.preset(id: id), size: size, fields: fields, color: accent)
@@ -175,8 +181,16 @@ final class CuePresetBrowserController: NSWindowController, NSWindowDelegate, NS
         sampleID = result.previewID ?? (selectedID == "random" ? category.filtered(tags: selectedTags).randomElement()?.id ?? category.entries[0].id : selectedID)
         updateSelection(); updateFeedback(result.feedback)
     }
-    func updateFeedback(_ text: String) { feedbackLabel.stringValue = text + soundDescription() }
-    func soundDescription() -> String {
+    func updateFeedback(_ text: String) { feedbackLabel.stringValue = text + selectionDescription() }
+    func selectionDescription() -> String {
+        if category == .effect {
+            switch sampleID {
+            case "luminous-flow": return "\n\n材质近景：柔亮光体、局部高光与柔散射。点选可查看实际环屏运动。"
+            case "pearl-flow": return "\n\n材质近景：半透光体与珍珠反射。点选可查看实际环屏运动。"
+            case "prism-flow": return "\n\n材质近景：双折射光体与细微色散；多色配色会呈现更丰富的色彩层次。"
+            default: return ""
+            }
+        }
         guard category == .sound, let preset = CueSoundCatalog.preset(id: sampleID) else { return "" }
         return "\n\n" + preset.sourceDescription + String(format: " · %.1f 秒\n", preset.duration) + preset.description
     }
@@ -189,19 +203,30 @@ final class CuePresetBrowserController: NSWindowController, NSWindowDelegate, NS
         }
     }
     func updateSelection() {
-        clock?.invalidate(); clock = nil; effectView = nil; previewHost.subviews.forEach { $0.removeFromSuperview() }
+        clock?.invalidate(); clock = nil; effectView = nil; materialView = nil; previewHost.subviews.forEach { $0.removeFromSuperview() }
         let name = category.entries.first { $0.id == sampleID }?.name ?? "自选音效"
         selectedLabel.stringValue = selectedID == "random" ? "随机 · \(name)" : name
         refreshTileSelection()
         if category == .effect {
-            var previewFields = fields; previewFields["effect"] = sampleID; previewFields["width"] = "3"; previewFields["inset"] = "5"
-            let effect = CueEdgeEffectView(frame: previewHost.bounds.insetBy(dx: 8, dy: 8), style: CueVisualStyle(fields: previewFields, fallback: accent))
-            previewHost.addSubview(effect); effectView = effect; startedAt = Date(); effect.advance(to: 0)
-            if shouldAnimate(), !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-                clock = Timer.scheduledTimer(withTimeInterval: 1.0 / 24, repeats: true) { [weak self] _ in
+            var previewFields = fields; previewFields["effect"] = sampleID
+            let material = CueEffectCatalog.preset(id: sampleID).recipe.material != nil
+            if material {
+                let preview = CueMaterialPreviewView(frame: previewHost.bounds.insetBy(dx: 8, dy: 8), style: CueVisualStyle(fields: previewFields, fallback: accent), opacity: windowOpacity)
+                previewHost.addSubview(preview); materialView = preview
+            } else {
+                previewFields["width"] = "3"; previewFields["inset"] = "5"
+                let preview = CueEdgeEffectView(frame: previewHost.bounds.insetBy(dx: 8, dy: 8), style: CueVisualStyle(fields: previewFields, fallback: accent))
+                preview.alphaValue = windowOpacity; previewHost.addSubview(preview); effectView = preview; preview.advance(to: 0)
+            }
+            startedAt = Date()
+            // A selection starts a full-screen preview first. Keep the clock
+            // installed so the close view resumes when that preview finishes.
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                clock = Timer.scheduledTimer(withTimeInterval: 1.0 / (material ? 18 : 24), repeats: true) { [weak self] _ in
                     guard let self, self.window?.isVisible == true, self.shouldAnimate() else { return }
-                    if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { self.clock?.invalidate(); self.clock = nil; self.effectView?.advance(to: 0); return }
-                    self.effectView?.advance(to: Date().timeIntervalSince(self.startedAt))
+                    if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { self.clock?.invalidate(); self.clock = nil; self.effectView?.advance(to: 0); self.materialView?.advance(to: 0); return }
+                    let time = Date().timeIntervalSince(self.startedAt)
+                    self.effectView?.advance(to: time); self.materialView?.advance(to: time)
                 }
                 RunLoop.main.add(clock!, forMode: .common)
             }

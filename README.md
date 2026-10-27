@@ -4,17 +4,17 @@
 
 ## 外观与分类
 
-0.4 将光效构建改为统一的声明式配方：**路径 → 光层 → 运动 → 出现／消退包络**。旧 50 个光效 ID 继续可用，并由同一个渲染器绘制；不再保留按每种样式写绘图分支的旧引擎。推荐页先呈现 6 种克制光效，跑马灯、角落、流动、静态、经典等作为可交叉的标签。
+0.5 在统一配方上加入光影材质：**路径 → 光体／暗部／高光／散射／反射 → 运动 → 出现／消退包络**。推荐 3 种环屏光影跑马灯：柔光流体、珍珠流光、棱镜流光。原 6 种极简方案和 50 个经典 ID 继续可选，并由同一渲染器绘制。材质截面沿屏幕法线着色，亮头和长尾连续流动；这是二维原生绘制的体积与光影表现，不声称是实时三维光线追踪。
 
 - **提示卡**：3 套精修推荐使用真实 AppKit 标准材质和语义文字色，跟随系统明暗；旧 50 套按玻璃、纸张、经典等分类保留。装饰不再伪装为任务进度或音频仪表。
 - **声音**：合成提示音 50 段；自然实录 4 段；城市与生活实录 4 段；系统音效从本机动态读取（数量随系统变化）。实录附 [音源与许可记录](assets/Sounds/CREDITS.md)，Apple 音频不打包分发。
 - **分类与预览**：可多选标签（并集）、搜索名称，点选保存并立即预览。常用页提供精简选择，完整目录在分类库中。声音只试听、视觉只预览画面；整套预览才组合三者。
 - **随机**：在当前所选标签范围抽取；三个分类独立。单次提醒和多显示器共用同一份抽取结果，窗口重建不会重新抽取。搜索词只筛选可见列表，不缩小随机池。
-- **自定义**：保留 1–8 色、方向、速度、宽度、内缩、透明度、尾迹、卡片位置和音量；尺寸单位为 AppKit 逻辑点（pt）。
+- **自定义**：主界面提供材质、柔和／清晰／醒目的存在感与 1–8 色配色；方向、速度、宽度、内缩、透明度和尾迹放在“更多调整”。尺寸单位为 AppKit 逻辑点（pt）。棱镜的色散取样沿用所选配色，单色不会被强行改成彩虹。
 
 提示卡的标题、正文、图标和空白区域可点击打开对应对话；按钮保留各自操作。预览没有真实对话时不跳转。视觉预览持续 6 秒；结束、暂停或被真实提醒阻止时显示原因。真实提醒优先，连续预览只替换上一预览，不写入最近任务列表。全局暂停、静音、减少动态效果仍有效。
 
-设置与图库跟随系统外观。升级到本代视觉时先将旧设置完整备份到私有 `backups/styles-before-native-*.json`，然后应用推荐光效/卡片；保留声音选择、音量、开关、配色和对话入口偏好。旧样式仍可从分类库选择。
+设置与图库跟随系统外观。升级到本代视觉时先将旧设置完整备份到私有 `backups/styles-before-lighting-*.json`，然后应用光影跑马灯及更清楚的默认光带宽度和亮度；保留声音选择、音量、开关、配色、方向、已选卡片和对话入口偏好。旧样式仍可从分类库选择。
 
 ## 安装
 
@@ -97,6 +97,7 @@ build/VibeCue.app/Contents/MacOS/VibeCue --appearance-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --sound-source-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --preview-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --window-preview-self-test  # 短暂显示无声测试窗口
+/usr/bin/python3 scripts/check-lighting.py --output /private/tmp/vibecue-lighting-review
 build/VibeCue.app/Contents/MacOS/VibeCue --resolution-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --event-validation-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --customization-self-test

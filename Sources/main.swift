@@ -95,9 +95,9 @@ struct CueEvent {
 
 struct CueSettings {
     static let defaultStyles: [String: [String: String]] = [
-        "complete": ["color": "#698DA8", "sound": "complete", "effect": "quiet-edge", "card_style": "native-compact", "width": "3", "inset": "3", "opacity": "0.55", "speed": "0.6", "trail": "0.14"],
-        "input": ["color": "#B58B49", "sound": "input", "effect": "quiet-beam", "card_style": "native-focus", "width": "3", "inset": "3", "opacity": "0.6", "speed": "0.6", "trail": "0.14"],
-        "permission": ["color": "#B87461", "sound": "permission", "effect": "quiet-corners", "card_style": "native-focus", "width": "3", "inset": "3", "opacity": "0.6", "speed": "0.6", "trail": "0.14"]
+        "complete": ["color": "#698DA8", "sound": "complete", "effect": "luminous-flow", "card_style": "native-compact", "width": "8", "inset": "3", "opacity": "0.85", "speed": "0.7", "trail": "0.28", "presence": "clear"],
+        "input": ["color": "#B58B49", "sound": "input", "effect": "prism-flow", "card_style": "native-focus", "width": "8", "inset": "3", "opacity": "0.85", "speed": "0.7", "trail": "0.28", "presence": "clear"],
+        "permission": ["color": "#B87461", "sound": "permission", "effect": "pearl-flow", "card_style": "native-focus", "width": "8", "inset": "3", "opacity": "0.85", "speed": "0.7", "trail": "0.28", "presence": "clear"]
     ]
     var enabled = true
     var completeEnabled = true
@@ -111,7 +111,7 @@ struct CueSettings {
     var completeDuration = 8.0
     var inputDuration = 14.0
     var permissionDuration = 14.0
-    var designGeneration = 2
+    var designGeneration = 3
     var eventStyles = CueSettings.defaultStyles
 
     init() {}
@@ -133,7 +133,7 @@ struct CueSettings {
             for kind in ["complete", "input", "permission"] {
                 if let color = styles[kind]?["color"], NSColor.cueColor(hex: color) != nil { eventStyles[kind]?["color"] = color }
                 if let sound = styles[kind]?["sound"], CueSettings.validSoundToken(sound) { eventStyles[kind]?["sound"] = sound }
-                let keys = Set(["effect", "palette", "direction", "speed", "width", "opacity", "inset", "trail", "card_style", "card_position", "card_opacity", "card_radius", "text_scale", "card_width", "card_message", "card_open", "effect_random_tags", "card_style_random_tags", "sound_random_tags"])
+                let keys = Set(["effect", "palette", "direction", "speed", "width", "opacity", "inset", "trail", "card_style", "card_position", "card_opacity", "card_radius", "text_scale", "card_width", "card_message", "card_open", "effect_random_tags", "card_style_random_tags", "sound_random_tags", "presence"])
                 let visual = (styles[kind] ?? [:]).filter { keys.contains($0.key) }
                 if !visual.isEmpty {
                     var fields = eventStyles[kind] ?? [:]
@@ -153,16 +153,20 @@ struct CueSettings {
          "event_styles": eventStyles]
     }
     mutating func useNativeRecommendedLook() {
-        designGeneration = 2
+        let previousGeneration = designGeneration
+        designGeneration = 3
         for kind in ["complete", "input", "permission"] {
             let old = eventStyles[kind] ?? [:]
             var next = CueSettings.defaultStyles[kind] ?? [:]
-            for key in ["color", "palette", "sound", "card_position", "card_message", "card_open"] {
+            for key in ["color", "palette", "sound", "sound_random_tags", "direction", "card_position", "card_message", "card_open"] {
                 if let value = old[key] { next[key] = value }
             }
-            for (key, tag) in [("effect", "recommended"), ("card_style", "native"), ("sound", "synthesized")] where old[key] == "random" {
-                next[key] = "random"; next[key + "_random_tags"] = tag
+            if previousGeneration >= 2 {
+                for (key, value) in old where key.hasPrefix("card_") || key == "text_scale" { next[key] = value }
             }
+            if old["effect"] == "random" { next["effect"] = "random"; next["effect_random_tags"] = "lighting" }
+            if old["sound"] == "random", next["sound_random_tags"] == nil { next["sound_random_tags"] = "synthesized" }
+            if old["card_style"] == "random", next["card_style_random_tags"] == nil { next["card_style"] = "random"; next["card_style_random_tags"] = "native" }
             eventStyles[kind] = next
         }
     }
@@ -282,6 +286,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var readTimer: Timer?
     var pulseTimer: Timer?
     var effectFrameRate = 0.0
+    var nextEffectTelemetry = Date.distantPast
     var hideTimer: Timer?
     var pausedUntil: Date?
     var settings = CueSettings()
@@ -341,11 +346,11 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         if let data = try? Data(contentsOf: home.appendingPathComponent("settings.json")),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             settings = CueSettings(json: json)
-            if (json["design_generation"] as? Int ?? 1) < 2 {
+            if (json["design_generation"] as? Int ?? 1) < 3 {
                 let backups = home.appendingPathComponent("backups", isDirectory: true)
                 do {
                     try FileManager.default.createDirectory(at: backups, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                    let backup = backups.appendingPathComponent("styles-before-native-" + UUID().uuidString + ".json")
+                    let backup = backups.appendingPathComponent("styles-before-lighting-" + UUID().uuidString + ".json")
                     try data.write(to: backup, options: .atomic)
                     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
                     settings.useNativeRecommendedLook()
@@ -592,18 +597,28 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         effectFrameRate = 0
         guard !edgeViews.isEmpty, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         var fps = 30.0
-        if current.map({ resolvedVisualStyle(for: $0).effectID }) == "spectrum-aurora" {
+        if let event = current {
+            let visual = resolvedVisualStyle(for: event)
             let pixels = edgeViews.reduce(CGFloat(0)) { total, view in
                 let scale = view.window?.backingScaleFactor ?? 2
                 return total + view.bounds.width * view.bounds.height * scale * scale
             }
-            fps = pixels > 18_000_000 ? 12 : pixels > 9_000_000 ? 15 : pixels > 3_500_000 || edgeViews.count > 1 ? 20 : 24
+            if CueEffectCatalog.preset(id: visual.effectID).recipe.material != nil {
+                fps = pixels > 33_000_000 ? 12 : pixels > 18_000_000 ? 15 : pixels > 8_000_000 ? 18 : 24
+            } else if visual.effectID == "spectrum-aurora" {
+                fps = pixels > 18_000_000 ? 12 : pixels > 9_000_000 ? 15 : pixels > 3_500_000 || edgeViews.count > 1 ? 20 : 24
+            }
         }
         effectFrameRate = fps
+        nextEffectTelemetry = Date().addingTimeInterval(0.5)
         pulseTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / fps, repeats: true) { [weak self] _ in
             guard let self else { return }
             let elapsed = Date().timeIntervalSince(self.shownAt)
             self.edgeViews.forEach { $0.advance(to: elapsed) }
+            if self.nextEffectTelemetry <= Date() {
+                self.nextEffectTelemetry = Date().addingTimeInterval(1)
+                self.writeStatus()
+            }
         }
         RunLoop.main.add(pulseTimer!, forMode: .common)
     }
@@ -1080,6 +1095,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "current_title": current?.title ?? "", "last_shown_title": lastShownTitle,
             "current_color": current.map { settings.color(for: $0.kind).cueHex } ?? "",
             "effect_frame_rate": effectFrameRate,
+            "effect_render_ms": edgeViews.map { $0.lastRenderDuration * 1000 },
+            "effect_rendered_frames": edgeViews.map(\.renderedFrameCount),
             "preview_duration": Self.previewDuration,
             "edge_windows": edges.map { ["visible": $0.isVisible, "level": $0.level.rawValue, "alpha": $0.alphaValue, "frame": NSStringFromRect($0.frame)] as [String: Any] },
             "banner_visible": banner?.isVisible ?? false,
@@ -1171,6 +1188,8 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     var appearanceTab = 0
     var presetBrowser: CuePresetBrowserController?
     var appearanceValues: [String: NSTextField] = [:]
+    var advancedEffectsExpanded = false
+    var appearanceScroll: NSScrollView?
     var previewStatusLabel: NSTextField?
 
     init(cue: CueController) {
@@ -1228,7 +1247,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         let line = NSView(frame: NSRect(x: 20, y: 517, width: 142, height: 1))
         line.wantsLayer = true; line.layer?.backgroundColor = NSColor.separatorColor.cgColor; sidebar.addSubview(line)
         label("本机运行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 533, width: 154, height: 19), size: 10.5, color: .secondaryLabelColor)
-        label("VibeCue \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.1")", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
+        label("VibeCue \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.5.0")", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
     }
 
     @objc func navigate(_ sender: NSButton) { selectPage(sender.tag) }
@@ -1335,7 +1354,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         }
         selector.target = self; selector.action = #selector(selectEventKind(_:)); selector.identifier = NSUserInterfaceItemIdentifier("event.kind")
         selector.setAccessibilityLabel("自定义提醒类型"); content.addSubview(selector)
-        for (index, title) in ["屏幕光效", "提示卡", "声音与规则"].enumerated() {
+        for (index, title) in ["屏幕光影", "提示卡", "声音与规则"].enumerated() {
             let control = NSButton(title: title, target: self, action: #selector(selectAppearanceTab(_:)))
             control.frame = NSRect(x: 26 + index * 178, y: 151, width: 170, height: 30)
             control.bezelStyle = .rounded; control.tag = index; control.state = appearanceTab == index ? .on : .off
@@ -1348,9 +1367,9 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         }
         let scroll = NSScrollView(frame: NSRect(x: 26, y: 196, width: 526, height: 330))
         scroll.hasVerticalScroller = true; scroll.scrollerStyle = .legacy; scroll.drawsBackground = false; scroll.borderType = .noBorder
-        let document = CueFlippedView(frame: NSRect(x: 0, y: 0, width: 510, height: appearanceTab == 0 ? 930 : appearanceTab == 1 ? 780 : 465))
+        let document = CueFlippedView(frame: NSRect(x: 0, y: 0, width: 510, height: appearanceTab == 0 ? (advancedEffectsExpanded ? 1040 : 520) : appearanceTab == 1 ? 780 : 465))
         document.wantsLayer = true; document.backgroundColor = .controlBackgroundColor; document.layer?.cornerRadius = 14
-        scroll.documentView = document; content.addSubview(scroll)
+        scroll.documentView = document; content.addSubview(scroll); appearanceScroll = scroll
         appearanceValues = [:]
         if appearanceTab == 0 { edgeEditor(in: document) }
         else if appearanceTab == 1 { cardEditor(in: document) }
@@ -1405,29 +1424,44 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
     func edgeEditor(in view: NSView) {
         let style = cue.settings.visualStyle(for: selectedKind)
-        editorLabel("屏幕边缘特效", "沿屏幕内侧运动；支持顺时针、逆时针和往返。", in: view, y: 18)
-        _ = appearancePopup("特效样式", values: quickChoices(.effect, selected: cue.settings.eventStyles[selectedKind]?["effect"] ?? style.effectID), selected: cue.settings.eventStyles[selectedKind]?["effect"] == "random" ? "random" : style.effectID, in: view, y: 89, key: "effect")
+        editorLabel("光影跑马灯", "有层次的环屏流光；支持顺时针、逆时针和往返。", in: view, y: 18)
+        _ = appearancePopup("光影材质", values: quickChoices(.effect, selected: cue.settings.eventStyles[selectedKind]?["effect"] ?? style.effectID), selected: cue.settings.eventStyles[selectedKind]?["effect"] == "random" ? "random" : style.effectID, in: view, y: 89, key: "effect")
         _ = button("浏览光效分类…", in: view, frame: NSRect(x: 174, y: 131, width: 314, height: 30), action: #selector(openEffectGallery))
-        editorLabel("多色调色板", "从单色到八色自由搭配，颜色会参与流动与渐变。", in: view, y: 188)
+        _ = appearancePopup("存在感", values: [("gentle", "柔和"), ("clear", "清晰"), ("strong", "醒目")], selected: style.presence.rawValue, in: view, y: 184, key: "presence")
+        editorLabel("多色调色板", "从单色到八色自由搭配，颜色会参与流动与渐变。", in: view, y: 243)
         let colors = style.paletteHex
         for (index, hex) in colors.enumerated() {
-            let well = NSColorWell(frame: NSRect(x: 18 + index * 48, y: 252, width: 41, height: 31))
+            let well = NSColorWell(frame: NSRect(x: 18 + index * 48, y: 307, width: 41, height: 31))
             well.color = NSColor.cueColor(hex: hex) ?? .systemTeal; well.tag = index
             well.identifier = NSUserInterfaceItemIdentifier("palette.\(index)"); well.setAccessibilityLabel("调色板颜色 \(index + 1)")
             well.target = self; well.action = #selector(changePaletteColor(_:)); view.addSubview(well)
         }
-        let add = button("＋", in: view, frame: NSRect(x: 411, y: 252, width: 36, height: 30), action: #selector(addPaletteColor)); add.isEnabled = colors.count < 8
-        let remove = button("−", in: view, frame: NSRect(x: 453, y: 252, width: 36, height: 30), action: #selector(removePaletteColor)); remove.isEnabled = colors.count > 1
+        let add = button("＋", in: view, frame: NSRect(x: 411, y: 307, width: 36, height: 30), action: #selector(addPaletteColor)); add.isEnabled = colors.count < 8
+        let remove = button("−", in: view, frame: NSRect(x: 453, y: 307, width: 36, height: 30), action: #selector(removePaletteColor)); remove.isEnabled = colors.count > 1
         for (index, item) in [("彩虹", "rainbow"), ("霓虹", "neon"), ("极光", "aurora"), ("火焰", "fire"), ("预设配色", "preset")].enumerated() {
-            _ = button(item.0, in: view, frame: NSRect(x: 15 + index * 96, y: 300, width: 91, height: 29), action: #selector(applyPalettePreset(_:)), represented: item.1)
+            _ = button(item.0, in: view, frame: NSRect(x: 15 + index * 96, y: 361, width: 91, height: 29), action: #selector(applyPalettePreset(_:)), represented: item.1)
         }
-        _ = appearancePopup("运动方向", values: [("clockwise", "顺时针"), ("counterclockwise", "逆时针"), ("pingpong", "往返流动")], selected: style.direction, in: view, y: 356, key: "direction")
-        appearanceSlider("运动速度", value: style.speed, minimum: 0.15, maximum: 4, unit: "×", in: view, y: 413, key: "speed")
-        appearanceSlider("边缘宽度", value: Double(style.width), minimum: 2, maximum: 80, unit: "pt", in: view, y: 489, key: "width")
-        appearanceSlider("特效不透明度", value: style.opacity, minimum: 0.1, maximum: 1, unit: "%", in: view, y: 565, key: "opacity")
-        appearanceSlider("距离屏幕边缘", value: Double(style.inset), minimum: 0, maximum: 80, unit: "pt", in: view, y: 641, key: "inset")
-        appearanceSlider("光迹长度", value: style.trail, minimum: 0.03, maximum: 0.65, unit: "%", in: view, y: 717, key: "trail")
-        label("动态效果仅在提醒显示时运行，最高 30 帧/秒；遵循系统“减少动态效果”。", in: view, frame: NSRect(x: 18, y: 813, width: 472, height: 40), size: 11, color: .secondaryLabelColor, lines: 2)
+        let more = NSButton(title: advancedEffectsExpanded ? "收起更多调整" : "更多调整…", target: self, action: #selector(toggleAdvancedEffects))
+        more.bezelStyle = .rounded; more.frame = NSRect(x: 18, y: 412, width: 472, height: 30); more.font = .systemFont(ofSize: 12)
+        view.addSubview(more)
+        guard advancedEffectsExpanded else { return }
+        _ = appearancePopup("运动方向", values: [("clockwise", "顺时针"), ("counterclockwise", "逆时针"), ("pingpong", "往返流动")], selected: style.direction, in: view, y: 456, key: "direction")
+        appearanceSlider("运动速度", value: style.speed, minimum: 0.15, maximum: 4, unit: "×", in: view, y: 513, key: "speed")
+        appearanceSlider("边缘宽度", value: Double(style.width), minimum: 2, maximum: 80, unit: "pt", in: view, y: 589, key: "width")
+        appearanceSlider("特效不透明度", value: style.opacity, minimum: 0.1, maximum: 1, unit: "%", in: view, y: 665, key: "opacity")
+        appearanceSlider("距离屏幕边缘", value: Double(style.inset), minimum: 0, maximum: 80, unit: "pt", in: view, y: 741, key: "inset")
+        appearanceSlider("光迹长度", value: style.trail, minimum: 0.03, maximum: 0.65, unit: "%", in: view, y: 817, key: "trail")
+        label("动态效果仅在提醒显示时运行，最高 30 帧/秒；遵循系统“减少动态效果”。", in: view, frame: NSRect(x: 18, y: 913, width: 472, height: 40), size: 11, color: .secondaryLabelColor, lines: 2)
+    }
+
+    @objc func toggleAdvancedEffects() {
+        let origin = appearanceScroll?.contentView.bounds.origin ?? .zero
+        advancedEffectsExpanded.toggle(); rebuild()
+        if let scroll = appearanceScroll {
+            let proposed = NSRect(origin: origin, size: scroll.contentView.bounds.size)
+            scroll.contentView.scroll(to: scroll.contentView.constrainBoundsRect(proposed).origin)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
     }
 
     func cardEditor(in view: NSView) {
@@ -1487,9 +1521,9 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
             }
         }
         cue.applySettings(updateCurrent: false)
-        if key == "card_style" || key == "effect" || key == "sound" {
+        if key == "card_style" || key == "effect" || key == "sound" || key == "presence" {
             rebuild()
-            _ = cue.preview(kind: selectedKind, component: key == "card_style" ? "card" : key)
+            _ = cue.preview(kind: selectedKind, component: key == "card_style" ? "card" : key == "presence" ? "effect" : key)
         }
     }
     @objc func changeAppearanceSlider(_ sender: NSSlider) {
@@ -1545,14 +1579,17 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         let fields = cue.settings.eventStyles[kind] ?? [:]
         let id = fields[category.settingKey] == "random" ? "random" : category == .effect ? cue.settings.visualStyle(for: kind).effectID : category == .card ? cue.settings.cardStyle(for: kind).id : cue.settings.soundToken(for: kind)
         let eventName = kind == "complete" ? "本轮完成" : kind == "input" ? "等待输入" : "人工批准"
-        presetBrowser = CuePresetBrowserController(category: category, fields: fields, color: cue.settings.color(for: kind), selectedID: id, eventName: eventName, shouldAnimate: { [weak self] in
-            self?.cue.settings.enabled == true && self?.cue.pausedUntil == nil
+        presetBrowser = CuePresetBrowserController(category: category, fields: fields, color: cue.settings.color(for: kind), selectedID: id, eventName: eventName, windowOpacity: cue.settings.glowIntensity, shouldAnimate: { [weak self] in
+            self?.cue.settings.enabled == true && self?.cue.pausedUntil == nil && self?.cue.current == nil
         }) { [weak self] id, tags in
             guard let self else { return ("", nil) }
             self.selectedKind = kind
             self.cue.settings.eventStyles[kind]?[category.settingKey] = id
             if id == "random" { self.cue.settings.eventStyles[kind]?[category.settingKey + "_random_tags"] = tags.filter { $0 != "all" }.joined(separator: ",") }
             self.cue.applySettings(updateCurrent: false); self.rebuild()
+            self.presetBrowser?.fields = self.cue.settings.eventStyles[kind] ?? [:]
+            self.presetBrowser?.accent = self.cue.settings.color(for: kind)
+            self.presetBrowser?.windowOpacity = self.cue.settings.glowIntensity
             let allowed = self.cue.settings.enabled && self.cue.pausedUntil == nil && (self.cue.current == nil || self.cue.current?.isPreview == true) && !self.cue.pending.contains { !$0.isPreview }
             let feedback = self.cue.preview(kind: kind, component: category.rawValue)
             let resolved = category == .sound ? self.cue.lastPlayedSoundToken : self.cue.resolvedFields[category.settingKey]
@@ -1729,6 +1766,15 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--material-preview-contact-sheet"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do {
+        let results = try CueMaterialPreviewView.renderContactSheet(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
+        print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+        exit(results.values.allSatisfy { $0 } ? 0 : 1)
+    } catch { fputs("VibeCue: material detail capture failed\n", stderr); exit(1) }
+}
+
 if CommandLine.arguments.contains("--window-preview-self-test") {
     let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-window-preview-\(UUID().uuidString)")
     try! FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
@@ -1737,7 +1783,7 @@ if CommandLine.arguments.contains("--window-preview-self-test") {
     application.setActivationPolicy(.accessory)
     let cue = CueController()
     cue.settings.soundEnabled = false
-    cue.settings.eventStyles["complete"]?["effect"] = "quiet-outline"
+    cue.settings.eventStyles["complete"]?["effect"] = "luminous-flow"
     var results: [String: Bool] = [:]
     DispatchQueue.main.async {
         _ = cue.preview(kind: "complete", component: "effect")
@@ -1746,7 +1792,8 @@ if CommandLine.arguments.contains("--window-preview-self-test") {
             results["edge_panels_above_menu_and_dock"] = cue.edges.allSatisfy { $0.level.rawValue > NSWindow.Level.statusBar.rawValue && $0.level.rawValue < NSWindow.Level.screenSaver.rawValue }
             results["edge_panels_cover_screen_frames"] = zip(cue.edges, NSScreen.screens).allSatisfy { $0.frame == $1.frame }
             results["edge_clock_advances_after_fade_in"] = cue.effectFrameRate > 0 && cue.edgeViews.allSatisfy { $0.elapsed > 0.4 }
-            results["recommended_line_has_readable_width"] = CueEffectCatalog.preset(id: "quiet-outline").recipe.layers.contains { $0.minimumWidth >= 1 }
+            results["lighting_material_actually_renders"] = cue.edgeViews.allSatisfy { $0.renderedFrameCount > 1 && $0.lastRenderDuration > 0 }
+            results["recommended_line_has_readable_width"] = CueEffectCatalog.preset(id: "luminous-flow").recipe.layers.contains { $0.minimumWidth >= 1 }
             results["six_second_preview_is_active"] = CueController.previewDuration == 6 && cue.current?.isPreview == true && cue.hideTimer?.isValid == true
             _ = cue.preview(kind: "complete", component: "card")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
@@ -1828,10 +1875,17 @@ if CommandLine.arguments.contains("--preview-self-test") {
     results["random_snapshot_uses_real_catalog_ids"] = CueEffectCatalog.presets.contains { $0.id == selected["effect"] } && CueCardCatalog.presets.contains { $0.id == selected["card_style"] } && CueSoundCatalog.contains(id: selected["sound"] ?? "")
     results["multi_tag_filter_unions_sources"] = CuePresetCategory.sound.filtered(tags: ["nature", "urban"]).count == 8
     results["tag_search_filters_visible_names"] = CuePresetCategory.sound.filtered(tags: ["nature"], search: "雨").map(\.id) == ["nature-rain"]
-    results["recommended_filter_excludes_classic"] = CuePresetCategory.effect.filtered(tags: ["recommended"]).count == 6 && CuePresetCategory.card.filtered(tags: ["native"]).count == 3
+    results["recommended_filter_excludes_classic"] = CuePresetCategory.effect.filtered(tags: ["recommended"]).count == CueEffectCatalog.recommendedPresets.count && CuePresetCategory.card.filtered(tags: ["native"]).count == 3
     var oldLook = CueSettings(json: ["sound_enabled": false, "sound_volume": 0.3, "event_styles": ["input": ["effect": "random", "sound": "nature-rain", "color": "#123456"]]])
     oldLook.useNativeRecommendedLook()
-    results["look_migration_preserves_sound_colors_and_controls"] = !oldLook.soundEnabled && oldLook.soundVolume == 0.3 && oldLook.eventStyles["input"]?["sound"] == "nature-rain" && oldLook.eventStyles["input"]?["color"] == "#123456" && oldLook.eventStyles["input"]?["effect"] == "random" && oldLook.eventStyles["input"]?["effect_random_tags"] == "recommended"
+    results["look_migration_preserves_sound_colors_and_controls"] = !oldLook.soundEnabled && oldLook.soundVolume == 0.3 && oldLook.eventStyles["input"]?["sound"] == "nature-rain" && oldLook.eventStyles["input"]?["color"] == "#123456" && oldLook.eventStyles["input"]?["effect"] == "random" && oldLook.eventStyles["input"]?["effect_random_tags"] == "lighting"
+    var secondGeneration = CueSettings(json: ["design_generation": 2, "sound_enabled": false, "event_styles": ["complete": ["effect": "dash-circuit", "card_style": "frosted-glass", "card_width": "620", "sound": "random", "sound_random_tags": "nature,urban", "palette": "#123456,#ABCDEF", "direction": "counterclockwise"]]])
+    secondGeneration.useNativeRecommendedLook()
+    let upgraded = secondGeneration.eventStyles["complete"] ?? [:]
+    results["lighting_upgrade_preserves_cards_audio_palette_direction"] = secondGeneration.designGeneration == 3 && !secondGeneration.soundEnabled && upgraded["effect"] == "luminous-flow" && upgraded["card_style"] == "frosted-glass" && upgraded["card_width"] == "620" && upgraded["sound"] == "random" && upgraded["sound_random_tags"] == "nature,urban" && upgraded["palette"] == "#123456,#ABCDEF" && upgraded["direction"] == "counterclockwise"
+    let strongPresence = CueSettings(json: ["event_styles": ["input": ["presence": "strong"]]])
+    results["presence_setting_survives_restart"] = CueSettings(json: strongPresence.json).eventStyles["input"]?["presence"] == "strong"
+
     let scoped = CueSettings(json: ["event_styles": ["input": ["effect": "random", "effect_random_tags": "recommended", "card_style": "random", "card_style_random_tags": "native", "sound": "random", "sound_random_tags": "nature,urban"]]])
     let scopedRestored = CueSettings(json: scoped.json)
     results["random_tag_scopes_survive_restart"] = ["effect_random_tags", "card_style_random_tags", "sound_random_tags"].allSatisfy { scopedRestored.eventStyles["input"]?[$0] == scoped.eventStyles["input"]?[$0] }

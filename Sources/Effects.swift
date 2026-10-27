@@ -3,8 +3,37 @@ import Foundation
 
 struct CueEffectTag { let id: String; let name: String }
 enum CueEffectPath { case perimeter, topEdge, corners }
-enum CueEffectBrush { case line, beam, dashes, points, squares, wave, ripple }
+enum CueEffectBrush { case ribbon, line, beam, dashes, points, squares, wave, ripple }
 enum CueEffectMotionKind { case still, breathe, orbit, pulse }
+
+enum CueEffectPresence: String, CaseIterable {
+    case gentle, clear, strong
+    var name: String { self == .gentle ? "柔和" : self == .clear ? "清晰" : "醒目" }
+    var coreScale: Double { self == .gentle ? 0.72 : self == .clear ? 1 : 1.45 }
+    var peakGain: Double { self == .gentle ? 0.78 : self == .clear ? 1.35 : 1.70 }
+    var motionScale: Double { self == .gentle ? 2.3 : self == .clear ? 3.5 : 4.8 }
+    func haloSpread(for width: CGFloat) -> CGFloat {
+        let scale = self == .gentle ? 1.7 : self == .clear ? 2.7 : 3.8
+        return min(28, max(self == .gentle ? 4.5 : self == .clear ? 8 : 11, width * scale))
+    }
+}
+
+/// An optical light field, shaded along the local screen normal independently
+/// of its path, moving head/tail and lifetime envelope.
+struct CueEffectMaterial {
+    var body: Double = 0.86
+    var occlusion: Double = 0.20
+    var specular: Double = 0.72
+    var bloom: Double = 0.42
+    var reflection: Double = 0.16
+    var roughness: Double = 28
+    var whiteness: Double = 0.12
+    var dispersion: Double = 0
+    var bodyWidth: Double = 1.25
+    var edgeSoftness: Double = 0.78
+    var doubleRefraction: Double = 0
+    var reflectionOffset: Double = 1.7
+}
 
 /// Geometry, paint, movement and lifetime are independent recipe components.
 struct CueEffectLayer {
@@ -55,6 +84,7 @@ struct CueEffectRecipe {
     let layers: [CueEffectLayer]
     var motion: CueEffectMotion = .init(kind: .still)
     var envelope = CueEffectEnvelope()
+    var material: CueEffectMaterial?
 }
 struct CueEffectPreset {
     let id: String
@@ -67,17 +97,32 @@ struct CueEffectPreset {
 }
 
 enum CueEffectCatalog {
-    static let defaultID = "quiet-edge"
+    static let defaultID = "luminous-flow"
     static let tags: [CueEffectTag] = [
         .init(id: "recommended", name: "推荐"),
+        .init(id: "lighting", name: "光影"), .init(id: "minimal", name: "极简"),
         .init(id: "flow", name: "流动"), .init(id: "corners", name: "角落"),
         .init(id: "stationary", name: "静态"), .init(id: "classic", name: "经典"),
         .init(id: "marquee", name: "跑马灯")
     ]
-    static let recommendedPresets: [CueEffectPreset] = {
+    static let recommendedPresets: [CueEffectPreset] = [
+        .init(id: "luminous-flow", name: "柔光流体", family: "lighting", variant: 0,
+              defaultPalette: ["#64B6D7", "#A29BD7"], tagIDs: ["recommended", "lighting", "marquee", "flow"],
+              recipe: .init(layers: [.init(brush: .ribbon, width: 1, minimumWidth: 2.2, opacity: 0.88)],
+                            motion: .init(kind: .orbit, period: 10), material: .init())),
+        .init(id: "pearl-flow", name: "珍珠流光", family: "lighting", variant: 1,
+              defaultPalette: ["#B7CDD7", "#C7BED4"], tagIDs: ["recommended", "lighting", "marquee", "flow"],
+              recipe: .init(layers: [.init(brush: .ribbon, width: 1, minimumWidth: 2.2, opacity: 0.86)],
+                            motion: .init(kind: .orbit, period: 14), material: .init(body: 0.64, occlusion: 0.12, specular: 0.82, bloom: 0.22, reflection: 0.46, roughness: 42, whiteness: 0.30, dispersion: 0.035, bodyWidth: 0.96, edgeSoftness: 0.58, reflectionOffset: 0.92))),
+        .init(id: "prism-flow", name: "棱镜流光", family: "lighting", variant: 2,
+              defaultPalette: ["#6ABED2", "#8B96D1", "#C8A7C9"], tagIDs: ["recommended", "lighting", "marquee", "flow"],
+              recipe: .init(layers: [.init(brush: .ribbon, width: 1, minimumWidth: 2.2, opacity: 0.90)],
+                            motion: .init(kind: .orbit, period: 12), material: .init(body: 0.82, occlusion: 0.14, specular: 0.68, bloom: 0.29, reflection: 0.17, roughness: 22, whiteness: 0.08, dispersion: 0.42, bodyWidth: 0.78, edgeSoftness: 0.52, doubleRefraction: 0.90, reflectionOffset: 1.4)))
+    ]
+    static let minimalPresets: [CueEffectPreset] = {
         let palette = ["#A5B8CB", "#D4DEE7"]
         func preset(_ id: String, _ name: String, _ tags: [String], _ recipe: CueEffectRecipe) -> CueEffectPreset {
-            .init(id: id, name: name, family: "quiet", variant: 0, defaultPalette: palette, tagIDs: ["recommended"] + tags, recipe: recipe)
+            .init(id: id, name: name, family: "quiet", variant: 0, defaultPalette: palette, tagIDs: ["minimal"] + tags, recipe: recipe)
         }
         return [
             preset("quiet-edge", "轻柔边光", ["stationary"], .init(layers: [
@@ -120,7 +165,7 @@ enum CueEffectCatalog {
             }
         }
     }()
-    static let presets = recommendedPresets + legacyPresets
+    static let presets = recommendedPresets + minimalPresets + legacyPresets
 
     private static func legacyRecipe(family: String, variant: Int) -> CueEffectRecipe {
         let v = Double(variant), base = CueEffectLayer(brush: .line, width: 0.04, opacity: 0.10)
@@ -223,17 +268,19 @@ enum CueEffectCatalog {
         let envelope = CueEffectEnvelope(), steady = CueEffectMotion(kind: .orbit).sample(at: 8, speed: 2, direction: "clockwise", reduceMotion: true)
         return [
             "legacy_50_ids_preserved": legacyPresets.count == 50 && Set(legacyPresets.map(\.id)).count == 50 && legacyPresets.allSatisfy { preset(id: $0.id).id == $0.id },
-            "six_recommended_recipes": recommendedPresets.count == 6 && recommendedPresets.allSatisfy { $0.tagIDs.contains("recommended") } && legacyPresets.allSatisfy { !$0.tagIDs.contains("recommended") },
+            "three_lighting_recommendations": recommendedPresets.count == 3 && recommendedPresets.allSatisfy { $0.tagIDs.contains("lighting") && $0.recipe.material != nil } && legacyPresets.allSatisfy { !$0.tagIDs.contains("recommended") },
+            "six_minimal_ids_preserved": minimalPresets.count == 6 && minimalPresets.allSatisfy { $0.tagIDs.contains("minimal") },
             "stable_unique_effect_ids": Set(presets.map(\.id)).count == presets.count,
             "default_is_recommended": recommendedPresets.contains { $0.id == defaultID } && CueVisualStyle(fields: [:], fallback: fallback).effectID == defaultID,
             "recipes_use_shared_components": presets.allSatisfy { !$0.recipe.layers.isEmpty && $0.recipe.layers.count <= 4 && $0.recipe.layers.allSatisfy { $0.width > 0 && $0.minimumWidth > 0 && (0...1).contains($0.opacity) && $0.count > 0 } },
             "recommended_cores_have_visible_minimum": recommendedPresets.allSatisfy { preset in
-                preset.recipe.layers.contains { $0.minimumWidth >= 1.1 && (0.76...0.85).contains($0.opacity) }
+                preset.recipe.layers.contains { $0.minimumWidth >= 2.2 && $0.opacity >= 0.80 }
             },
             "effect_tags_valid": presets.allSatisfy { !$0.tagIDs.isEmpty && Set($0.tagIDs).isSubset(of: Set(tags.map(\.id))) },
             "bounded_finite_controls": bounded.speed.isFinite && bounded.width == 80 && bounded.opacity == 0.1 && bounded.inset == 0 && bounded.trail.isFinite,
             "palette_validation": bounded.paletteHex == ["#123456", "#ABCDEF"], "direction_validation": bounded.direction == "clockwise",
-            "recommended_renders_distinct": hashes(recommendedPresets).count == 6, "legacy_renders_distinct": hashes(legacyPresets).count == 50,
+            "recommended_renders_distinct": hashes(recommendedPresets).count == 3, "legacy_renders_distinct": hashes(legacyPresets).count == 50,
+            "presence_defaults_clear_and_roundtrips": bounded.presence == .clear && CueVisualStyle.normalizedFields(["presence": "strong"], fallback: fallback)["presence"] == "strong",
             "envelope_separate_from_movement": envelope.opacity(at: 0, duration: 8, reduceMotion: false) == 0 && envelope.opacity(at: 1, duration: 8, reduceMotion: false) == 1 && envelope.opacity(at: 8, duration: 8, reduceMotion: false) == 0,
             "reduce_motion_static_visible": steady.phase == 0.18 && steady.strength == 1 && envelope.opacity(at: 0, duration: 8, reduceMotion: true) == 1
         ]
@@ -251,6 +298,7 @@ struct CueVisualStyle {
     let inset: CGFloat
     let trail: Double
     let cardID: String
+    let presence: CueEffectPresence
 
     init(fields: [String: String], fallback: NSColor) {
         effectID = CueEffectCatalog.preset(id: fields["effect"] ?? CueEffectCatalog.defaultID).id
@@ -264,6 +312,7 @@ struct CueVisualStyle {
         inset = CGFloat(Self.number(fields["inset"], fallback: 10, low: 0, high: 80))
         trail = Self.number(fields["trail"], fallback: 0.18, low: 0.03, high: 0.65)
         cardID = fields["card_style"] ?? "glass-dark"
+        presence = CueEffectPresence(rawValue: fields["presence"] ?? "") ?? .clear
     }
 
     static func number(_ text: String?, fallback: Double, low: Double, high: Double) -> Double {
@@ -280,6 +329,7 @@ struct CueVisualStyle {
         result["width"] = String(Double(style.width)); result["opacity"] = String(style.opacity)
         result["inset"] = String(Double(style.inset)); result["trail"] = String(style.trail)
         result["card_style"] = style.cardID
+        result["presence"] = style.presence.rawValue
         return result
     }
 }
@@ -358,22 +408,56 @@ private struct CueEffectRenderer {
     let duration: TimeInterval?
     let capture: Bool
 
+    private struct RGB {
+        var r: Double; var g: Double; var b: Double
+        func mixed(with other: RGB, amount: Double) -> RGB {
+            let t = min(1, max(0, amount))
+            return .init(r: r + (other.r - r) * t, g: g + (other.g - g) * t, b: b + (other.b - b) * t)
+        }
+        func scaled(_ value: Double) -> RGB { .init(r: r * value, g: g * value, b: b * value) }
+    }
+    private struct LightSample {
+        var r = 0.0; var g = 0.0; var b = 0.0; var a = 0.0
+        mutating func over(_ color: RGB, alpha: Double) {
+            let opacity = min(0.985, max(0, alpha)), remain = 1 - opacity
+            r = color.r * opacity + r * remain; g = color.g * opacity + g * remain
+            b = color.b * opacity + b * remain; a = opacity + a * remain
+        }
+        var components: [CGFloat] {
+            guard a > 0.00001 else { return [0, 0, 0, 0] }
+            return [CGFloat(min(1, max(0, r / a))), CGFloat(min(1, max(0, g / a))),
+                    CGFloat(min(1, max(0, b / a))), CGFloat(a)]
+        }
+    }
+    private struct RibbonNode { let t: Double; let point: NSPoint; let normal: NSPoint }
+
     func draw(in bounds: NSRect) {
         guard bounds.width > 8, bounds.height > 8 else { return }
-        let width = min(style.width, min(bounds.width, bounds.height) / 5)
-        let perimeter = CuePerimeter(bounds: bounds, inset: style.inset + width * 0.6)
+        let width = min(style.width * style.presence.coreScale, min(bounds.width, bounds.height) / 5)
+        let spill = style.presence.haloSpread(for: width)
+        let perimeter = CuePerimeter(bounds: bounds, inset: style.inset + width * 0.6 + min(8, spill * 0.35))
         let motion = recipe.motion.sample(at: time, speed: style.speed, direction: style.direction, reduceMotion: reduceMotion)
         let envelope = capture ? 1 : recipe.envelope.opacity(at: time, duration: duration, reduceMotion: reduceMotion)
         guard envelope > 0 else { return }
         let alpha = envelope * motion.strength
+        let mainLayers = recipe.layers.filter { $0.opacity >= 0.25 }
+        let referenceWidth = max(0.001, mainLayers.map(\.width).max() ?? 1)
+        let referenceOpacity = max(0.001, mainLayers.map(\.opacity).max() ?? 1)
+        let geometryUnit = width * style.presence.motionScale
         for layer in recipe.layers {
             let phase = motion.phase * layer.movement + layer.phase
-            let lineWidth = max(CGFloat(layer.minimumWidth), width * CGFloat(layer.width)), offset = width * CGFloat(layer.offset)
+            let ratio = layer.opacity < 0.25 ? min(4, layer.width / referenceWidth) : layer.width / referenceWidth
+            let lineWidth = max(CGFloat(layer.minimumWidth) * style.presence.coreScale, width * CGFloat(ratio))
+            let offset = geometryUnit * CGFloat(layer.offset)
+            let layerAlpha = alpha * min(1, layer.opacity / referenceOpacity) * style.presence.peakGain
             switch layer.brush {
+            case .ribbon:
+                drawRibbon(perimeter, width: lineWidth, phase: phase, sign: motion.sign * layer.movement,
+                           alpha: layerAlpha * style.opacity, material: recipe.material ?? CueEffectMaterial())
             case .line, .wave:
                 for (start, length) in ranges(perimeter, width: width) {
-                    drawStroke(perimeter, start: start, length: length, width: lineWidth, alpha: alpha * layer.opacity, offset: offset,
-                               colorOffset: phase + layer.colorOffset, glow: layer.glow, wave: layer.brush == .wave ? width * CGFloat(layer.amplitude) : 0,
+                    drawStroke(perimeter, start: start, length: length, width: lineWidth, alpha: layerAlpha, offset: offset,
+                               colorOffset: phase + layer.colorOffset, glow: layer.glow, wave: layer.brush == .wave ? geometryUnit * CGFloat(layer.amplitude) : 0,
                                frequency: layer.frequency, phase: phase)
                 }
             case .beam:
@@ -384,14 +468,14 @@ private struct CueEffectRenderer {
                         let progress = Double(step) / 20
                         let start = head - motion.sign * layer.movement * tail * (1 - progress)
                         drawStroke(perimeter, start: start, length: tail / 20 + 0.0005, width: lineWidth * CGFloat(0.25 + 0.75 * progress),
-                                   alpha: alpha * layer.opacity * pow(progress, 1.65), offset: offset, colorOffset: layer.colorOffset + progress * 0.2, glow: layer.glow)
+                                   alpha: layerAlpha * pow(progress, 1.65), offset: offset, colorOffset: layer.colorOffset + progress * 0.2, glow: layer.glow)
                     }
                 }
             case .dashes:
                 let count = layer.count == 1 ? 36 : layer.count
                 for index in 0..<count {
                     drawStroke(perimeter, start: Double(index) / Double(count) + phase, length: min(layer.length, 0.65 / Double(count)),
-                               width: lineWidth, alpha: alpha * layer.opacity, offset: offset, colorOffset: Double(index) / Double(count) + layer.colorOffset, glow: layer.glow)
+                               width: lineWidth, alpha: layerAlpha, offset: offset, colorOffset: Double(index) / Double(count) + layer.colorOffset, glow: layer.glow)
                 }
             case .points, .squares:
                 for index in 0..<layer.count {
@@ -399,19 +483,151 @@ private struct CueEffectRenderer {
                     let point = locate(perimeter, at: position, offset: offset)
                     let radius = max(0.8, lineWidth * 0.58)
                     let rect = NSRect(x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2)
-                    let tint = color(at: position + layer.colorOffset, alpha: alpha * layer.opacity)
-                    if layer.glow > 0 { tint.withAlphaComponent(CGFloat(alpha * layer.opacity * style.opacity * 0.08)).setFill(); NSBezierPath(ovalIn: rect.insetBy(dx: -radius, dy: -radius)).fill() }
+                    let tint = color(at: position + layer.colorOffset, alpha: layerAlpha)
+                    for scale in [1.0, 0.65, 0.32] {
+                        let expansion = spill * scale
+                        color(at: position + layer.colorOffset, alpha: layerAlpha * 0.035).setFill()
+                        NSBezierPath(ovalIn: rect.insetBy(dx: -expansion, dy: -expansion)).fill()
+                    }
+                    NSColor.black.withAlphaComponent(CGFloat(min(0.28, layerAlpha * style.opacity * 0.22))).setFill()
+                    NSBezierPath(ovalIn: rect.insetBy(dx: -0.7, dy: -0.7)).fill()
                     tint.setFill(); if layer.brush == .squares { rect.fill() } else { NSBezierPath(ovalIn: rect).fill() }
                 }
             case .ripple:
                 for ring in 0..<layer.count {
                     let value = phase + Double(ring) / Double(layer.count)
                     let progress = value - floor(value)
-                    drawStroke(perimeter, start: 0, length: 1, width: lineWidth, alpha: alpha * layer.opacity * (1 - progress),
-                               offset: offset + width * CGFloat(progress * 2.5), colorOffset: Double(ring) / Double(layer.count) + layer.colorOffset, glow: layer.glow)
+                    drawStroke(perimeter, start: 0, length: 1, width: lineWidth, alpha: layerAlpha * (1 - progress),
+                               offset: offset + geometryUnit * CGFloat(progress * 1.1), colorOffset: Double(ring) / Double(layer.count) + layer.colorOffset, glow: layer.glow)
                 }
             }
         }
+    }
+
+    /// A continuous shaded strip, not a chain of round strokes. Adjacent cells
+    /// share vertices and interpolate their end colors; no overlapping LED caps.
+    /// Volume density tapers with the moving tail; specular light and a small
+    /// shadow stay near its head. Reflection and bloom are separate channels.
+    private func drawRibbon(_ perimeter: CuePerimeter, width: CGFloat, phase: Double, sign: Double,
+                            alpha: Double, material: CueEffectMaterial) {
+        guard let context = NSGraphicsContext.current?.cgContext, alpha > 0 else { return }
+        let half = min(max(1.15, width * 0.70), perimeter.radius * 0.68)
+        let extent = max(half * 2.7, style.presence.haloSpread(for: width))
+        let steps = max(72, min(160, Int(perimeter.length / 64)))
+        var fractions = (0...steps).map { Double($0) / Double(steps) }
+        // Resolve the bright head locally instead of increasing every straight
+        // edge's tessellation. Long tails still interpolate continuously.
+        for shift in [-0.028, -0.018, -0.012, -0.006, 0, 0.006, 0.012, 0.018, 0.028] {
+            let position = phase + shift
+            fractions.append(position - floor(position))
+        }
+        let arcStarts = [perimeter.horizontal, perimeter.horizontal + perimeter.arc + perimeter.vertical,
+                         perimeter.horizontal * 2 + perimeter.arc * 2 + perimeter.vertical,
+                         perimeter.horizontal * 2 + perimeter.arc * 3 + perimeter.vertical * 2]
+        for start in arcStarts {
+            for step in 0...8 { fractions.append(Double((start + perimeter.arc * CGFloat(step) / 8) / perimeter.length)) }
+        }
+        fractions.sort()
+        fractions = fractions.reduce(into: [Double]()) { result, value in
+            if result.last.map({ abs($0 - value) > 1e-8 }) ?? true { result.append(value) }
+        }
+        let epsilon = 0.8 / Double(perimeter.length)
+        let nodes = fractions.map { fraction -> RibbonNode in
+            let before = perimeter.point(fraction - epsilon), after = perimeter.point(fraction + epsilon)
+            let dx = after.x - before.x, dy = after.y - before.y, length = max(0.001, hypot(after.x - before.x, after.y - before.y))
+            return .init(t: fraction, point: perimeter.point(fraction), normal: NSPoint(x: dy / length, y: -dx / length))
+        }
+        var offsets = [-1.0, -0.85, -0.65, -0.50, -0.40, -0.31, 0.31, 0.40, 0.50, 0.65, 0.85, 1].map { CGFloat($0) * extent }
+        let radialSteps = max(20, Int(half * 2.5 / 0.30))
+        for step in 0...radialSteps { offsets.append(half * (-1.25 + CGFloat(step) * 2.5 / CGFloat(radialSteps))) }
+        offsets.append(-half); offsets.append(half)
+        offsets.sort()
+        let palette: [RGB] = style.palette.map {
+            let color = $0.usingColorSpace(.sRGB) ?? .white
+            return .init(r: Double(color.redComponent), g: Double(color.greenComponent), b: Double(color.blueComponent))
+        }
+        let white = RGB(r: 0.98, g: 0.99, b: 1), shadow = RGB(r: 0.012, g: 0.018, b: 0.028)
+        let trail = min(0.82, max(0.18, style.trail * 2.4))
+        func tint(_ position: Double) -> RGB {
+            guard palette.count > 1 else { return palette[0] }
+            let value = (position - floor(position)) * Double(palette.count)
+            let lower = Int(value) % palette.count
+            return palette[lower].mixed(with: palette[(lower + 1) % palette.count], amount: value - floor(value))
+        }
+        func shade(_ node: RibbonNode, offset: CGFloat) -> LightSample {
+            let behind = (phase - node.t) * sign - floor((phase - node.t) * sign)
+            let tail = behind < trail ? pow(max(0, 1 - behind / trail), 1.55) : 0
+            let headDistance = min(behind, 1 - behind)
+            let head = exp(-pow(headDistance / 0.012, 2))
+            // The leading Gaussian joins both sides of the modular head. A
+            // raw trailing-only ramp jumps at 0/1; using it for cross-section
+            // width would cut a bright rectangular end into the moving body.
+            let volume = tail + (1 - tail) * head
+            let energy = min(1.28, 0.004 + volume * 0.92 + head * 0.34)
+            let specularGate = min(1.15, head * 0.95 + pow(volume, 10) * 0.35)
+            let taper = 0.12 + 0.88 * pow(volume, 0.40)
+            let u = Double(offset), h = max(0.42, Double(half) * material.bodyWidth * taper), normalized = u / h
+            let colorPosition = node.t - phase * 0.32 + material.dispersion * normalized * 0.16
+            let base = tint(colorPosition).mixed(with: white, amount: material.whiteness)
+            var sample = LightSample()
+            let localSpill = max(1.4, Double(extent) * 0.43 * (0.24 + 0.76 * pow(volume, 0.30)))
+            let spill = exp(-pow(u / localSpill, 2) * 0.5)
+            sample.over(base, alpha: alpha * energy * material.bloom * spill * 0.46)
+            let reflected = exp(-pow((u - h * material.reflectionOffset) / max(0.52, h * 0.30), 2) * 0.5)
+            sample.over(tint(colorPosition + 0.08).mixed(with: white, amount: material.whiteness * 0.5),
+                        alpha: alpha * energy * material.reflection * reflected * 0.44)
+            let occlusion = exp(-pow((u - h * 1.02) / max(0.40, h * 0.18), 2) * 0.5)
+            sample.over(shadow, alpha: alpha * specularGate * material.occlusion * occlusion * 0.28)
+            // A density field with a soft boundary, not a hard cylindrical shell.
+            let sigma = max(0.35, h * material.edgeSoftness)
+            let density = exp(-pow(u / sigma, 2) * 0.5)
+            let split = max(exp(-pow((u - h * 0.62) / max(0.28, sigma * 0.43), 2) * 0.5),
+                            exp(-pow((u + h * 0.62) / max(0.28, sigma * 0.43), 2) * 0.5))
+            let volumeDensity = density * (1 - material.doubleRefraction) + split * material.doubleRefraction
+            let slope = tanh(normalized * 0.82), z = sqrt(max(0, 1 - slope * slope))
+            let light = max(0.18, z * 0.82 + slope * (Double(node.normal.x) * -0.36 + Double(node.normal.y) * 0.44))
+            let bodyColor = base.scaled(0.62 + 0.38 * light).mixed(with: white, amount: 0.025 * z)
+            sample.over(bodyColor, alpha: alpha * energy * material.body * volumeDensity)
+            let facing = Double(node.normal.x) * -0.6 + Double(node.normal.y) * 0.8
+            let ridge = -h * (0.27 + 0.18 * facing)
+            let specular = exp(-pow((u - ridge) / max(0.25, h * 0.15), 2) * 0.5)
+            let secondRidge = exp(-pow((u + ridge) / max(0.22, h * 0.12), 2) * 0.5) * material.doubleRefraction * 0.48
+            let gloss = pow(max(0, z * 0.94 + slope * facing * 0.18), material.roughness / 12)
+            sample.over(white.mixed(with: base, amount: 0.18), alpha: alpha * specularGate * material.specular * (specular + secondRidge) * gloss)
+            return sample
+        }
+        let space = CGColorSpaceCreateDeviceRGB()
+        context.saveGState()
+        context.setBlendMode(.normal)
+        context.beginTransparencyLayer(auxiliaryInfo: nil)
+        // Coverage contributions add inside an isolated surface. This avoids
+        // doubled opacity at shared AA edges, then composites the whole surface
+        // normally over the desktop. Radial body samples are <=0.3 points apart.
+        context.setBlendMode(.plusLighter)
+        context.setShouldAntialias(true)
+        func point(_ node: RibbonNode, _ offset: CGFloat) -> NSPoint {
+            let bounded = min(offset, perimeter.radius - 0.75)
+            return NSPoint(x: node.point.x + node.normal.x * bounded, y: node.point.y + node.normal.y * bounded)
+        }
+        for band in 0..<(offsets.count - 1) {
+            let midpoint = (offsets[band] + offsets[band + 1]) / 2
+            var previous = shade(nodes[0], offset: midpoint)
+            for index in 0..<(nodes.count - 1) {
+                let a = nodes[index], b = nodes[index + 1], next = shade(nodes[index + 1], offset: midpoint)
+                defer { previous = next }
+                guard max(previous.a, next.a) > 0.001 else { continue }
+                let components = previous.components + next.components
+                guard let gradient = CGGradient(colorSpace: space, colorComponents: components, locations: [0, 1], count: 2) else { continue }
+                let quad = CGMutablePath()
+                quad.move(to: point(a, offsets[band])); quad.addLine(to: point(b, offsets[band]))
+                quad.addLine(to: point(b, offsets[band + 1])); quad.addLine(to: point(a, offsets[band + 1])); quad.closeSubpath()
+                context.saveGState(); context.addPath(quad); context.clip()
+                context.drawLinearGradient(gradient, start: point(a, midpoint), end: point(b, midpoint), options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+                context.restoreGState()
+            }
+        }
+        context.endTransparencyLayer()
+        context.restoreGState()
     }
     private func ranges(_ perimeter: CuePerimeter, width: CGFloat) -> [(Double, Double)] {
         if recipe.path != .corners { return [(0, 1)] }
@@ -451,10 +667,13 @@ private struct CueEffectRenderer {
             path.lineCapStyle = segments > 1 ? .butt : .round
             path.lineJoinStyle = .round
             let position = begin + span / 2 + colorOffset
-            if glow > 0 {
-                path.lineWidth = width * CGFloat(2.2 + glow); color(at: position, alpha: alpha * 0.10 * glow).setStroke(); path.stroke()
-                path.lineWidth = width * CGFloat(1.45 + glow * 0.3); color(at: position, alpha: alpha * 0.20 * glow).setStroke(); path.stroke()
+            let spread = style.presence.haloSpread(for: min(width, style.width * 1.5))
+            for (radius, strength) in [(1.0, 0.035), (0.65, 0.055), (0.32, 0.075)] {
+                path.lineWidth = width + spread * CGFloat(radius * 2)
+                color(at: position, alpha: alpha * strength * (0.65 + glow)).setStroke(); path.stroke()
             }
+            path.lineWidth = width + 1.4
+            NSColor.black.withAlphaComponent(CGFloat(min(0.28, alpha * style.opacity * 0.20))).setStroke(); path.stroke()
             path.lineWidth = width; color(at: position, alpha: alpha).setStroke(); path.stroke()
         }
     }
@@ -464,6 +683,8 @@ final class CueEdgeEffectView: NSView {
     var style: CueVisualStyle { didSet { needsDisplay = true } }
     var elapsed: TimeInterval = 0
     var displayDuration: TimeInterval?
+    private(set) var lastRenderDuration: TimeInterval = 0
+    private(set) var renderedFrameCount = 0
     override var isOpaque: Bool { false }
     init(frame: NSRect, style: CueVisualStyle) {
         self.style = style; super.init(frame: frame); wantsLayer = true; layer?.backgroundColor = NSColor.clear.cgColor
@@ -475,6 +696,11 @@ final class CueEdgeEffectView: NSView {
         elapsed = next; needsDisplay = true
     }
     override func draw(_ dirtyRect: NSRect) {
+        let started = ProcessInfo.processInfo.systemUptime
+        defer {
+            lastRenderDuration = ProcessInfo.processInfo.systemUptime - started
+            renderedFrameCount += 1
+        }
         NSColor.clear.setFill(); dirtyRect.fill(using: .copy); NSGraphicsContext.current?.imageInterpolation = .high
         CueEffectRenderer(style: style, recipe: CueEffectCatalog.preset(id: style.effectID).recipe, time: elapsed,
                           reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, duration: displayDuration, capture: false).draw(in: bounds)
