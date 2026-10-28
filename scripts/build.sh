@@ -3,8 +3,8 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$PROJECT_ROOT/build/VibeCue.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" /private/tmp/vibecue-swift-cache
-/usr/bin/swiftc -O -module-cache-path /private/tmp/vibecue-swift-cache \
-  -framework AppKit -framework Foundation -framework AVFoundation \
+/usr/bin/swiftc -O -whole-module-optimization -module-cache-path /private/tmp/vibecue-swift-cache \
+  -framework AppKit -framework Foundation -framework AVFoundation -framework WebKit \
   "$PROJECT_ROOT"/Sources/*.swift -o "$APP_DIR/Contents/MacOS/VibeCue"
 cp "$PROJECT_ROOT/assets/Info.plist" "$APP_DIR/Contents/Info.plist"
 if [[ -f "$PROJECT_ROOT/assets/AppIcon.icns" ]]; then
@@ -12,6 +12,9 @@ if [[ -f "$PROJECT_ROOT/assets/AppIcon.icns" ]]; then
 fi
 if [[ -d "$PROJECT_ROOT/assets/Sounds" ]]; then
   /usr/bin/ditto "$PROJECT_ROOT/assets/Sounds" "$APP_DIR/Contents/Resources/Sounds"
+fi
+if [[ -d "$PROJECT_ROOT/assets/Conversation" ]]; then
+  /usr/bin/ditto "$PROJECT_ROOT/assets/Conversation" "$APP_DIR/Contents/Resources/Conversation"
 fi
 /usr/bin/codesign --force --sign - "$APP_DIR"
 printf '%s\n' "$APP_DIR"

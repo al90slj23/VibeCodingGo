@@ -752,6 +752,15 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 }, onCodex: { [weak self] in _ = self?.open(event: event) },
                 onConnect: { [weak self] in self?.connectManualApproval() },
                 onPathAction: { [weak self] command in self?.performThreadAction(threadID: event.threadID, command: command) })
+            conversationWindows[event.threadID]?.onClosed = { [weak self] in
+                // Release the offline WebView after its draft is saved. Reading
+                // many chats must not retain hidden web processes indefinitely.
+                DispatchQueue.main.async {
+                    guard let self, let controller = self.conversationWindows[event.threadID],
+                          controller.window?.isVisible != true, !controller.hasInFlightOperation else { return }
+                    self.conversationWindows.removeValue(forKey: event.threadID)?.stop()
+                }
+            }
         }
         conversationWindows[event.threadID]?.showWindow(nil)
         recentHistory.beginReview(event: event)
@@ -2332,6 +2341,12 @@ if CommandLine.arguments.contains("--sound-source-self-test") {
     exit(results.allSatisfy { $0["started"] as? Bool == true && $0["playing_after_100ms"] as? Bool == true } ? 0 : 1)
 }
 
+if CommandLine.arguments.contains("--conversation-renderer-self-test") {
+    _ = NSApplication.shared
+    let results = CueConversationController.rendererValidationReport()
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
 if let index = CommandLine.arguments.firstIndex(of: "--capture-conversation"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared
     do { try CueConversationController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }

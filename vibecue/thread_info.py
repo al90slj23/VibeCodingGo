@@ -31,7 +31,9 @@ MAX_TAIL = 8 * 1024 * 1024
 MAX_MESSAGES = 60
 MAX_CHARACTERS = 128_000
 MAX_MESSAGE_CHARACTERS = 48_000
+MAX_ACTIVITIES = 120
 DECODE_TIMEOUT = 20
+DISPLAY_SCHEMA = 2
 
 # These blocks are host context, not messages typed by the person. Remove only
 # explicit wrappers; a genuine request before/after such a block is retained.
@@ -39,7 +41,9 @@ _CONTEXT_TAGS = ('environment_context', 'turn_aborted', 'in-app-browser-context'
                  'external_codex_apps_open_page', 'codex_apps_open_page_context',
                  'permissions instructions', 'app-context', 'system-reminder',
                  'codex_apps_client_time_context', 'collaboration_mode',
-                 'subagent_notification', 'background_task_notification')
+                 'subagent_notification', 'background_task_notification',
+                 'skills_instructions', 'codex_apps_open_page_instructions',
+                 'image_resize_notice')
 _CONTEXT = re.compile('|'.join(
     r'<'+re.escape(tag)+r'(?:\s[^>]*)?>[\s\S]*?</'+re.escape(tag)+r'\s*>'
     for tag in _CONTEXT_TAGS), re.I)
@@ -47,6 +51,13 @@ _HOST_ONLY = ('# AGENTS.md instructions for ', '<skills_instructions>',
               '<environment_context>', '<permissions instructions>',
               '<in-app-browser-context', '<turn_aborted>',
               '<external_codex_apps_open_page>')
+_INTERNAL = re.compile(r'<oai-mem-citation(?:\s[^>]*)?>[\s\S]*?</oai-mem-citation\s*>', re.I)
+_FENCE = re.compile(r'^\s{0,3}(`{3,}|~{3,})')
+_FILE_HEADER = '# Files mentioned by the user:'
+_FILE_ROW = re.compile(r'^## (.+?): (/[^\n]+)\n(?:Image attachment: (true|false)\n)?', re.M)
+_IMAGE_WRAPPER = re.compile(r'<image\b[^>]*\bpath="([^"\n]+)"[^>]*>\s*</image\s*>', re.I)
+_TOOL_NAME = re.compile(r'[A-Za-z0-9_.:-]{1,160}\Z')
+_QUESTION_REPLY = re.compile(r'\A\s*<send_user_message_question_reply>\s*([\s\S]*?)\s*</send_user_message_question_reply>\s*\Z')
 
 
 class ThreadInfoError(ValueError):
@@ -120,7 +131,7 @@ def _source(path):
 def _fingerprint(info, source):
     stat = source.stat()
     values = (str(source), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns,
-              info.get('title'), info.get('cwd'), info.get('updated_at'), info.get('archived'))
+              info.get('title'), info.get('cwd'), info.get('updated_at'), info.get('archived'), DISPLAY_SCHEMA)
     return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -189,18 +200,85 @@ def _records(data, partial):
     return result, malformed, incomplete
 
 
-def user_text(value):
-    value = _CONTEXT.sub('', value).strip()
-    if not value or value.startswith(_HOST_ONLY):
-        return ''
+def _outside_fences(value, transform):
+    """Internal display markers are hidden, but quoted source code survives."""
+    output, outside, fence = [], [], None
+    for line in value.splitlines(keepends=True):
+        match = _FENCE.match(line)
+        if fence is None and match:
+            output.append(transform(''.join(outside))); outside = []
+            fence = match.group(1); output.append(line)
+        elif fence is not None:
+            output.append(line)
+            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
+                fence = None
+        else:
+            outside.append(line)
+    output.append(transform(''.join(outside)))
+    return ''.join(output)
+
+
+def display_text(value):
+    value = _outside_fences(value, lambda text: _INTERNAL.sub('', text)).strip()
     return visible_text(value)
 
 
-def conversation(records):
+def user_content(value):
+    value = _outside_fences(value, lambda text: _CONTEXT.sub('', text)).strip()
+    if not value or value.startswith(_HOST_ONLY):
+        return '', []
+    reply = _QUESTION_REPLY.fullmatch(value)
+    if reply and len(reply.group(1)) <= 65_536:
+        try:
+            answers = json.loads(reply.group(1))
+            if isinstance(answers, list) and 0 < len(answers) <= 20 and all(isinstance(row, dict) and isinstance(row.get('answer'), str) for row in answers):
+                value = '\n\n'.join((row.get('question', '') + '\n' if len(answers) > 1 and isinstance(row.get('question'), str) else '') + row['answer'] for row in answers)
+        except (ValueError, TypeError):
+            pass
+    attachments = []
+    if value.startswith(_FILE_HEADER) and '\n## My request:' in value:
+        header, value = value.split('\n## My request:', 1)
+        for match in _FILE_ROW.finditer(header[:32_768]):
+            name, path, image = match.groups()
+            path = absolute_path(path.strip())
+            if path and len(attachments) < 8:
+                attachments.append({'name': clean_text(name, 240), 'path': path,
+                                    'kind': 'image' if image == 'true' else 'file'})
+        known_paths = {row['path'] for row in attachments}
+        value = _outside_fences(value, lambda text: _IMAGE_WRAPPER.sub(
+            lambda match: '' if match.group(1) in known_paths else match.group(0), text))
+    return display_text(value), attachments
+
+
+def user_text(value):
+    return user_content(value)[0]
+
+
+def _tool_label(name):
+    short = name.replace('__', '.').rsplit('.', 1)[-1]
+    if short in ('exec_command', 'write_stdin'):
+        return '运行命令'
+    if short in ('read_file', 'read_text', 'view_image', 'read_mcp_resource'):
+        return '读取文件'
+    if short in ('apply_patch', 'write_file', 'edit_file'):
+        return '修改文件'
+    if short in ('spawn_agent', 'send_message', 'followup_task', 'wait_agent'):
+        return '协作处理'
+    if short in ('request_user_input', 'request_user_input_async'):
+        return '等待你的回答'
+    if 'web' in name or 'search' in short:
+        return '搜索资料'
+    if short in ('js', 'exec'):
+        return '使用工具'
+    return '调用工具'
+
+
+def conversation(records, include_activities=False):
     messages, current_turn, status = [], '', 'unknown'
     last_activity, last_terminal, truncated = None, 0, False
     malformed = 0
     waiting = set()
+    activities, activity_by_call = [], {}
     for item in records:
         payload = item.get('payload')
         if not isinstance(payload, dict):
@@ -223,61 +301,100 @@ def conversation(records):
             status = 'interrupted' if kind in ('turn_aborted', 'task_aborted') else 'complete'
             last_activity = last_terminal = at
             waiting.clear()
-        role, text, mirror, identifier = None, '', False, ''
+        role, text, mirror, identifier, phase, attachments = None, '', False, '', 'final_answer', []
         if category == 'response_item' and kind == 'message' and payload.get('role') in ('user', 'assistant'):
             role = payload['role']; text = message_text(payload)
             if role == 'user':
-                text = user_text(text)
+                text, attachments = user_content(text)
+            else:
+                text = display_text(text)
+                phase = payload.get('phase') if payload.get('phase') in ('commentary', 'final_answer') else 'final_answer'
             identifier = clean_text(payload.get('id'), 180)
             if role == 'assistant' and payload.get('phase') == 'final_answer':
                 status = 'complete'; last_terminal = at
         elif category == 'event_msg' and kind in ('agent_message', 'user_message'):
             role = 'assistant' if kind == 'agent_message' else 'user'
-            text = visible_text(payload.get('message', ''))
+            text = display_text(str(payload.get('message') or ''))
             if role == 'user':
-                text = user_text(text)
+                text, attachments = user_content(text)
+            else:
+                phase = payload.get('phase') if payload.get('phase') in ('commentary', 'final_answer') else 'final_answer'
             mirror = True
         elif category == 'event_msg' and kind in ('task_complete', 'task_completed'):
-            role, text, mirror = 'assistant', visible_text(payload.get('last_agent_message') or payload.get('last_assistant_message') or ''), True
+            role, text, mirror = 'assistant', display_text(payload.get('last_agent_message') or payload.get('last_assistant_message') or ''), True
         if category == 'response_item' and kind in ('function_call', 'custom_tool_call') and at > last_terminal:
             name = str(payload.get('name') or '').split('.')[-1]
             call = str(payload.get('call_id') or payload.get('id') or '')
+            safe_name = str(payload.get('name') or '')
+            effective_turn = turn or current_turn
+            activity_key = (effective_turn, call)
+            if call and len(call) <= 512 and _TOOL_NAME.fullmatch(safe_name) and activity_key not in activity_by_call:
+                activity = {'id': hashlib.sha256(json.dumps([effective_turn, call]).encode()).hexdigest()[:32],
+                            'turn_id': effective_turn, 'name': safe_name, 'label': _tool_label(safe_name),
+                            'status': 'running', 'created_at': at}
+                activities.append(activity); activity_by_call[activity_key] = activity
+                while len(activities) > MAX_ACTIVITIES:
+                    removed = activities.pop(0)
+                    activity_by_call = {key: value for key, value in activity_by_call.items() if value is not removed}
+                    truncated = True
             if kind == 'function_call' and name == 'request_user_input' and call:
                 waiting.add(call)
             status = 'waiting' if waiting else 'running'; last_activity = at
         elif category == 'response_item' and kind in ('function_call_output', 'custom_tool_call_output', 'tool_result'):
             call = str(payload.get('call_id') or payload.get('tool_call_id') or payload.get('id') or '')
+            activity = activity_by_call.get((turn or current_turn, call))
+            if activity is not None:
+                activity.update(status='complete', finished_at=at)
             if call in waiting:
                 waiting.discard(call); status = 'waiting' if waiting else 'running'; last_activity = at
-        if not role or not text:
+        if not role or not text and not attachments:
             continue
         last_activity = at
         effective_turn = turn or current_turn
-        if identifier:
-            old = next((r for r in reversed(messages) if r.get('id') == identifier), None)
-            if old is not None:
-                if len(text) > len(old['text']):
-                    old['text'] = text
-                continue
-        if messages:
-            last = messages[-1]
-            if last['role'] == role and last['text'] == text and last['turn_id'] == effective_turn and (mirror or last.get('_mirror') or last['created_at'] == at):
-                continue
+        text_key = hashlib.sha256(text.encode()).hexdigest()
         if len(text) > MAX_MESSAGE_CHARACTERS:
             text = '…（前文已截断）\n' + text[-MAX_MESSAGE_CHARACTERS:]; truncated = True
-        messages.append({'role': role, 'text': text, 'created_at': at, 'turn_id': effective_turn,
-                         'id': identifier or hashlib.sha256(json.dumps([role, effective_turn, at, text], ensure_ascii=False).encode()).hexdigest()[:32], '_mirror': mirror})
+        if identifier:
+            old = next((r for r in reversed(messages) if r.get('id') == identifier and r['turn_id'] == effective_turn and r['role'] == role), None)
+            if old is not None:
+                old.update(text=text, phase='user' if role == 'user' else phase,
+                           attachments=attachments, _text_key=text_key)
+                while sum(len(row['text']) for row in messages) > MAX_CHARACTERS:
+                    messages.pop(0); truncated = True
+                continue
+        duplicate = next((row for row in reversed(messages)
+                          if row['role'] == role and row['turn_id'] == effective_turn
+                          and row.get('_text_key') == text_key
+                          and not (attachments and row.get('attachments') and attachments != row['attachments'])
+                          and (mirror or row.get('_mirror') or row['created_at'] == at)), None)
+        if duplicate is not None:
+            if role == 'assistant' and phase == 'final_answer':
+                duplicate['phase'] = phase
+            if not mirror and duplicate.get('_mirror'):
+                duplicate.update(_mirror=False, phase='user' if role == 'user' else phase,
+                                 attachments=attachments)
+                if identifier:
+                    duplicate['id'] = identifier
+            if attachments and not duplicate.get('attachments'):
+                duplicate['attachments'] = attachments
+            continue
+        messages.append({'role': role, 'phase': 'user' if role == 'user' else phase,
+                         'text': text, 'attachments': attachments, 'created_at': at, 'turn_id': effective_turn,
+                         'id': identifier or hashlib.sha256(json.dumps([role, effective_turn, at, text], ensure_ascii=False).encode()).hexdigest()[:32],
+                         '_mirror': mirror, '_text_key': text_key})
         while len(messages) > MAX_MESSAGES or sum(len(row['text']) for row in messages) > MAX_CHARACTERS:
             messages.pop(0); truncated = True
     for row in messages:
         row.pop('_mirror', None)
-    return messages, current_turn, status, last_activity, truncated, malformed
+        row.pop('_text_key', None)
+    result = (messages, current_turn, status, last_activity, truncated, malformed)
+    return result + (activities,) if include_activities else result
 
 
 def read(identifier, codex_home=None, if_fingerprint=None, metadata_only=False):
     info = metadata(identifier, codex_home)
     result = {**info, 'actual_transcript_path': None, 'source_readable': False,
-              'messages': [], 'last_turn_id': '', 'state': 'unknown', 'last_activity': None,
+              'messages': [], 'activities': [], 'last_turn_id': '', 'state': 'unknown', 'last_activity': None,
               'coverage': {'partial': True, 'truncated': False, 'compressed': False, 'malformed_records': 0},
               'message': ''}
     try:
@@ -297,8 +414,8 @@ def read(identifier, codex_home=None, if_fingerprint=None, metadata_only=False):
             if partial and not any(r.get('type') == 'response_item' and isinstance(r.get('payload'), dict) and r['payload'].get('type') == 'message' for r in records):
                 data, size, partial = _plain_tail(source, MAX_TAIL)
         records, malformed, incomplete = _records(data, partial)
-        messages, turn, status, last, truncated, extra_malformed = conversation(records)
-        result.update(source_readable=True, messages=messages, last_turn_id=turn, state=status, last_activity=last)
+        messages, turn, status, last, truncated, extra_malformed, activities = conversation(records, include_activities=True)
+        result.update(source_readable=True, messages=messages, activities=activities, last_turn_id=turn, state=status, last_activity=last)
         result['coverage'].update(partial=bool(partial), truncated=bool(truncated), malformed_records=malformed+extra_malformed,
                                   incomplete_last_record=incomplete, bytes_read=len(data), source_bytes=size)
         if not messages:
