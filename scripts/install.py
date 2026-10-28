@@ -196,7 +196,7 @@ def install(start=True, with_hooks=True, user_home=None):
         private_write(agents / (job['Label'] + '.plist'), plistlib.dumps(job))
     # Preserve config.toml and the existing computer-use notify command verbatim.
     hooks = install_hooks(user_home / '.codex', control, home) if with_hooks else previous.get('hooks')
-    record = {'version': '0.12.0', 'app': str(app), 'home': str(home), 'hooks': hooks,
+    record = {'version': '0.12.1', 'app': str(app), 'home': str(home), 'hooks': hooks,
               'source_dir': str(PROJECT),
               'labels': list(LABELS), 'installed_at': datetime.now(timezone.utc).isoformat()}
     json_write(home / 'install.json', record)

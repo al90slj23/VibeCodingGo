@@ -12,6 +12,7 @@ struct CueRunningTask {
     let recoveryStatus: String
     let interruptedAt: Date?
     let recoveryReason: String
+    private let titleSortKey: String
 
     init?(raw: [String: Any]) {
         guard let threadID = raw["thread_id"] as? String, !threadID.isEmpty, threadID.count <= 160,
@@ -21,6 +22,8 @@ struct CueRunningTask {
               let updatedDate = Self.date(raw["last_activity"]) else { return nil }
         self.threadID = threadID
         self.title = String((raw["title"] as? String ?? "Codex 对话").prefix(180))
+        self.titleSortKey = (self.title.applyingTransform(.toLatin, reverse: false) ?? self.title)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
         self.provider = "codex"; self.startDate = startDate; self.updatedDate = updatedDate
         self.turnID = String((raw["turn_id"] as? String ?? "").prefix(160))
         self.recoveryStatus = ["interrupted", "unconfirmed"].contains(raw["status"] as? String ?? "") ? (raw["status"] as? String ?? "") : "running"
@@ -39,6 +42,13 @@ struct CueRunningTask {
     var recoveryLabel: String { recoveryStatus == "interrupted" ? "中断待续" : "运行待确认" }
     var navigationID: String { "\(needsRecovery ? "interrupted" : "running"):\(threadID)" }
     var ephemeralCueEvent: CueEvent { CueEvent(runningThreadID: threadID, title: title, date: startDate) }
+
+    /// Shared by the popover and shortcut menu. Activity updates never move a
+    /// row; Chinese titles use pinyin and numeric suffixes follow Finder order.
+    static func titleAscending(_ lhs: CueRunningTask, _ rhs: CueRunningTask) -> Bool {
+        let order = lhs.titleSortKey.compare(rhs.titleSortKey, options: [.numeric], locale: Locale(identifier: "en_US_POSIX"))
+        return order == .orderedSame ? lhs.threadID < rhs.threadID : order == .orderedAscending
+    }
 }
 
 /// A derived view only: running tasks never mutate, replace or consume the ledger.
@@ -61,10 +71,7 @@ private struct CueStatusListSnapshot {
             if let previous = latestByThread[task.threadID], previous.updatedDate >= task.updatedDate { continue }
             latestByThread[task.threadID] = task
         }
-        let active = latestByThread.values.sorted {
-            if $0.startDate != $1.startDate { return $0.startDate > $1.startDate }
-            return $0.threadID < $1.threadID
-        }
+        let active = latestByThread.values.sorted(by: CueRunningTask.titleAscending)
         let activeIDs = Set(active.map(\.threadID))
         activeThreadIDs = activeIDs; activeCount = active.count
         pinned = records.filter(\.isPinned)
@@ -757,7 +764,7 @@ final class CueStatusPopoverController: NSViewController {
             snapshot.pinnedFollowups.forEach(followupRow)
         }
         if !snapshot.running.isEmpty {
-            section(batchMode ? "本次运行范围" : "正在运行", id: "running", count: snapshot.running.count, hint: batchMode ? "范围固定 · 状态持续更新" : "实时任务 · 点击打开对话", color: .systemGreen)
+            section(batchMode ? "本次运行范围" : "正在运行", id: "running", count: snapshot.running.count, hint: batchMode ? "范围固定 · 状态持续更新" : "标题 A–Z · 点击查看对话", color: .systemGreen)
             for task in snapshot.running {
                 let row = CueRunningRowButton(task: task, width: document.frame.width - (batchMode ? 28 : 0))
                 row.refresh(task: task, detail: taskDetails[task.threadID])
@@ -910,7 +917,7 @@ final class CueStatusPopoverController: NSViewController {
         let snapshot = CueStatusListSnapshot(records: liveHistory.records, runningTasks: tasks)
         results["running_parse_rejects_invalid_navigation_targets"] = CueRunningTask(raw: ["thread_id": "bad/path", "started_at": 1.0, "last_activity": 2.0]) == nil && CueRunningTask(raw: ["thread_id": "valid", "provider": "other", "started_at": 1.0, "last_activity": 2.0]) == nil && CueRunningTask(raw: ["thread_id": "valid", "started_at": Double.infinity, "last_activity": 2.0]) == nil
         results["running_parse_accepts_iso8601_and_turn_id"] = CueRunningTask(raw: ["thread_id": "iso-task", "started_at": "2026-10-28T00:00:00Z", "last_activity": "2026-10-28T00:01:00.123Z", "turn_id": "turn-iso"])?.turnID == "turn-iso"
-        results["running_deduplicates_threads_using_latest_activity"] = snapshot.activeCount == 3 && snapshot.running.first?.title == "新活动"
+        results["running_deduplicates_threads_using_latest_activity"] = snapshot.activeCount == 3 && snapshot.running.first(where: { $0.threadID == "active-thread" })?.title == "新活动"
         results["running_pinned_chat_uses_badge_without_duplicate_live_row"] = snapshot.pinned.count == 2 && snapshot.activeThreadIDs.contains("shared-pinned") && !snapshot.running.contains(where: { $0.threadID == "shared-pinned" })
         results["running_temporarily_hides_ordinary_alert_without_deleting_ledger"] = snapshot.ordinary.map { $0.event.id } == ["ordinary-finished"] && liveHistory.records.count == 4 && liveHistory.ordinaryCount == 2
         let ledgerBefore = try? Data(contentsOf: liveHistory.file)
@@ -981,9 +988,9 @@ final class CueStatusPopoverController: NSViewController {
         results["batch_background_refresh_never_opens_a_conversation"] = navigationEvents.count == navigationBeforeRefresh
         stable.toggleBatchMode()
         results["batch_exit_rebuilds_latest_running_membership"] = stable.recentDocument?.subviews.compactMap { $0 as? CueRunningRowButton }.map { $0.task.threadID } == ["new-background"] && stable.selectedThreads.isEmpty
-        let orderA = [CueRunningTask(raw: ["thread_id": "a", "started_at": 1000.0, "last_activity": 3000.0])!, CueRunningTask(raw: ["thread_id": "b", "started_at": 1100.0, "last_activity": 2000.0])!]
-        let orderB = [CueRunningTask(raw: ["thread_id": "a", "started_at": 1000.0, "last_activity": 3500.0])!, CueRunningTask(raw: ["thread_id": "b", "started_at": 1100.0, "last_activity": 4000.0])!]
-        results["running_order_uses_stable_start_time_instead_of_heartbeat"] = CueStatusListSnapshot(records: [], runningTasks: orderA).running.map(\.threadID) == CueStatusListSnapshot(records: [], runningTasks: orderB).running.map(\.threadID)
+        let orderA = [running("a", time: 2000, title: "ALV｜UCP"), running("b", time: 1000, title: "ALV｜AOC"), running("c", time: 3000, title: "ALV｜第二代")]
+        let orderB = [running("c", time: 5000, title: "ALV｜第二代"), running("b", time: 4000, title: "ALV｜AOC"), running("a", time: 3000, title: "ALV｜UCP")]
+        results["running_order_is_title_ascending_despite_time_or_input_changes"] = CueStatusListSnapshot(records: [], runningTasks: orderA).running.map(\.threadID) == ["b", "c", "a"] && CueStatusListSnapshot(records: [], runningTasks: orderB).running.map(\.threadID) == ["b", "c", "a"]
         let hoverDetail = CueTaskDetail(raw: ["status": "running", "started_at": 1000.0, "elapsed_status": "partial", "total_tokens": 789, "tokens_status": "partial", "messages": [["role": "assistant", "text": "隔离悬停验收内容"]]])
         stable.update(status: "悬停测试", enabled: true, soundEnabled: true, paused: false, runningTasks: [running("new-background")], taskDetails: ["new-background": hoverDetail])
         let hoverWindow = NSWindow(contentRect: stable.view.bounds, styleMask: .borderless, backing: .buffered, defer: false)

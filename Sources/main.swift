@@ -1236,7 +1236,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             let pinned = recentHistory.records.filter(\.isPinned)
             if !pinned.isEmpty { heading("置顶提醒 · \(pinned.count) 条"); pinned.forEach(reminder) }
             let pinnedThreads = Set(pinned.filter { $0.event.provider == "codex" }.map { $0.event.threadID })
-            let active = runningTasks.filter { !pinnedThreads.contains($0.threadID) }
+            let active = runningTasks.filter { !pinnedThreads.contains($0.threadID) }.sorted(by: CueRunningTask.titleAscending)
             if !active.isEmpty {
                 heading("正在运行 · \(active.count) 项")
                 for task in active {
