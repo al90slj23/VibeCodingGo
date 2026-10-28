@@ -16,6 +16,7 @@ import time
 
 from .codex_control import ControlError, THREAD_ID
 from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable
+from .current_model_settings import ModelSettingsProjection, unavailable_settings
 from .events import emit_event, emit_resolution, event_identifier, input_event_id
 from .providers.approval_bridge import APPROVAL_METHODS, INPUT_METHODS, SETTLE_SECONDS
 
@@ -58,6 +59,7 @@ class AttentionProjection:
         self.owner = owner
         self.revision = None
         self.requests = []
+        self.settings = ModelSettingsProjection(thread, owner)
 
     def apply(self, change):
         if not isinstance(change, dict):
@@ -82,6 +84,7 @@ class AttentionProjection:
                 self._patch(patch)
         else:
             raise ControlError('对话订阅更新类型尚未核对')
+        self.settings.apply(change)
         self.revision = revision
 
     def _patch(self, patch):
@@ -210,6 +213,10 @@ class DesktopAttentionMonitor:
 
 
 class _AttentionChannel(DesktopChannel):
+    # Long conversations can legitimately exceed the sender's 8 MiB limit.
+    # Only this read-only stream has a larger finite budget; each snapshot is
+    # immediately reduced to safe request IDs and model settings, never cached.
+    max_frame_size = 32 * 1024 * 1024
     def __init__(self, *args, on_message, **kwargs):
         super().__init__(*args, **kwargs)
         self.on_message = on_message
@@ -289,6 +296,7 @@ class DesktopAttentionService:
         self.next_discovery = {}
         self.subscribed_at = {}
         self.quarantine_until = {}
+        self.unavailable_reasons = {}
         self._reconnect_stamp = None
         self._reconnect_seen = False
 
@@ -337,6 +345,21 @@ class DesktopAttentionService:
                           quarantined_threads=sum(until > time.monotonic() for until in self.quarantine_until.values()))
             return health
 
+    def current_settings(self):
+        """Export only the settings of each verified owner subscription."""
+        with self._lock:
+            if not self._health['connected']:
+                return {thread: unavailable_settings(reason='Codex 连接暂不可用') for thread in self._threads}
+            result = {}
+            for thread in self._threads:
+                projection = self.projections.get(thread)
+                if projection is not None and projection.revision is not None:
+                    result[thread] = projection.settings.snapshot()
+                else:
+                    reason = self.unavailable_reasons.get(thread) or ('此对话的 Codex 快照暂不可读' if self.quarantine_until.get(thread, 0) > time.monotonic() else '正在读取此对话的 Codex 当前设置')
+                    result[thread] = unavailable_settings(reason=reason)
+            return result
+
     def _on_message(self, message):
         if message.get('type') == 'vibecue-observation-gap':
             # Only one new subscription may await a snapshot. Therefore an
@@ -346,6 +369,7 @@ class DesktopAttentionService:
                 pending = [projection for projection in self.projections.values() if projection.revision is None]
                 if len(pending) == 1:
                     self.quarantine_until[pending[0].thread] = time.monotonic() + 300
+                    self.unavailable_reasons[pending[0].thread] = '此对话的状态快照过大，暂时无法核实当前设置'
             return
         if message.get('type') != 'broadcast':
             return
@@ -373,6 +397,7 @@ class DesktopAttentionService:
                 self.quarantine_until[projection.thread] = time.monotonic() + 30
                 raise
             self.monitor.update(projection)
+            self.unavailable_reasons.pop(projection.thread, None)
             self._health['last_seen'] = time.time()
             self._health['capabilities']['attention'] = True
 
@@ -390,6 +415,8 @@ class DesktopAttentionService:
             if thread not in desired or missing_snapshot:
                 with self._lock:
                     projection = self.projections.pop(thread)
+                    if missing_snapshot:
+                        self.unavailable_reasons[thread] = 'Codex 未返回此对话的当前状态快照'
                 self._follow(thread, projection.owner, False)
                 with self._lock:
                     self.monitor.gap(thread)
@@ -398,7 +425,8 @@ class DesktopAttentionService:
         if any(projection.revision is None for projection in self.projections.values()):
             return
         attempted = 0
-        for thread in desired:
+        candidates = sorted(desired, key=lambda thread: self.next_discovery.get(thread, 0))
+        for thread in candidates:
             if thread in self.projections or time.monotonic() < max(self.next_discovery.get(thread, 0), self.quarantine_until.get(thread, 0)):
                 continue
             attempted += 1
@@ -412,7 +440,9 @@ class DesktopAttentionService:
                 self.subscribed_at[thread] = time.monotonic()
                 self._follow(thread, projection.owner, True)
             except DesktopOwnerUnavailable:
-                pass  # Not open: do not load or claim it just to obtain state.
+                with self._lock:
+                    self.unavailable_reasons[thread] = '此对话未在 Codex 加载，打开后自动读取当前设置'
+                # Not open: do not load or claim it just to obtain state.
             except ControlError as error:
                 if '不支持安全的外部消息输入' not in str(error):
                     # A read deadline may expire while the router is proving
@@ -462,6 +492,11 @@ class DesktopAttentionService:
                             # settle-window alert, including a busy delta queue.
                             if not readable:
                                 self.monitor.flush()
+                            # An unchanged setting remains valid while its
+                            # same-owner subscription continues on this socket.
+                            # Preserve the original setting observation time.
+                            for projection in self.projections.values():
+                                projection.settings.mark_live()
                             self._health['last_seen'] = time.time()
             except (ControlError, OSError, ValueError, TypeError, RecursionError, OverflowError) as error:
                 message = str(error) if isinstance(error, ControlError) else 'Codex 连接暂不可用，正在自动重试'

@@ -17,9 +17,22 @@ struct CueTaskDetail {
     let lastActivity: Date?
     let elapsedSeconds: Double?
     let elapsedStatus: String
-    let model: String
-    let reasoningEffort: String
-    let serviceTier: String
+    private let recordedModel: String
+    private let recordedReasoningEffort: String
+    private let recordedServiceTier: String
+    private let selectedModel: String
+    private let selectedReasoningEffort: String
+    private let selectedServiceTier: String
+    private let selectedSpeedStatus: String
+    let currentSettingsStatus: String
+    let currentSettingsSource: String
+    let currentSettingsObservedAt: Date?
+    private let currentSettingsVerifiedAt: Date?
+    private let currentSettingsExpiresAt: Date?
+    private let currentSettingsMessage: String
+    var model: String { currentSettingsReadable ? selectedModel : recordedModel }
+    var reasoningEffort: String { currentSettingsReadable ? selectedReasoningEffort : recordedReasoningEffort }
+    var serviceTier: String { currentSettingsReadable ? selectedServiceTier : recordedServiceTier }
     let totalTokens: Int64?
     let inputTokens: Int64?
     let outputTokens: Int64?
@@ -40,9 +53,20 @@ struct CueTaskDetail {
         lastActivity = Self.date(raw["last_activity"])
         elapsedSeconds = Self.number(raw["elapsed_seconds"])
         elapsedStatus = Self.label(raw["elapsed_status"], limit: 40, fallback: "unknown")
-        model = Self.label(raw["model"], limit: 180)
-        reasoningEffort = Self.label(raw["reasoning_effort"], limit: 40)
-        serviceTier = Self.label(raw["service_tier"], limit: 40)
+        recordedModel = Self.label(raw["model"], limit: 180)
+        recordedReasoningEffort = Self.label(raw["reasoning_effort"], limit: 40)
+        recordedServiceTier = Self.label(raw["service_tier"], limit: 40)
+        let selected = raw["current_settings"] as? [String: Any] ?? [:]
+        currentSettingsStatus = Self.label(selected["status"], limit: 30)
+        currentSettingsSource = Self.label(selected["source"], limit: 80)
+        currentSettingsObservedAt = Self.date(selected["observed_at"])
+        currentSettingsVerifiedAt = Self.date(selected["verified_at"])
+        currentSettingsExpiresAt = Self.date(selected["expires_at"])
+        currentSettingsMessage = Self.label(selected["message"] ?? selected["reason"], limit: 240)
+        selectedModel = Self.label(selected["model"], limit: 180)
+        selectedReasoningEffort = Self.label(selected["reasoning_effort"], limit: 40)
+        selectedServiceTier = Self.label(selected["service_tier"], limit: 40)
+        selectedSpeedStatus = Self.label(selected["speed_status"], limit: 40)
         totalTokens = Self.integer(raw["total_tokens"])
         inputTokens = Self.integer(raw["input_tokens"])
         outputTokens = Self.integer(raw["output_tokens"])
@@ -115,16 +139,64 @@ struct CueTaskDetail {
         return "\(scope(eventDate: eventDate)) · \(duration) · \(tokenText)"
     }
 
-    var secondaryLine: String {
+    private var currentSettingsReadable: Bool {
+        guard ["current", "partial"].contains(currentSettingsStatus), !currentSettingsSource.isEmpty else { return false }
+        if let expiry = currentSettingsExpiresAt { return expiry >= Date() }
+        if let observed = currentSettingsObservedAt, !(-10...45).contains(Date().timeIntervalSince(observed)) { return false }
+        return true
+    }
+    private static func modelFields(model: String, effort: String, tier: String, speedStatus: String = "", complete: Bool = false) -> [String] {
         var fields: [String] = []
         if !model.isEmpty, model != "unknown" { fields.append(model) }
+        else if complete { fields.append("模型未提供") }
         let effortNames = ["none": "无推理", "minimal": "极低强度", "low": "低强度", "medium": "中等强度", "high": "高强度", "xhigh": "特高强度", "max": "最高强度", "ultra": "Ultra 强度", "default": "默认强度"]
-        if !reasoningEffort.isEmpty, reasoningEffort != "unknown" { fields.append(effortNames[reasoningEffort] ?? reasoningEffort) }
-        if ["fast", "priority"].contains(serviceTier) { fields.append("闪电 Fast") }
-        else if serviceTier == "ultrafast" { fields.append("极速 Ultra Fast") }
-        else if ["default", "standard"].contains(serviceTier) { fields.append("标准速度") }
-        else if !serviceTier.isEmpty, serviceTier != "unknown" { fields.append(serviceTier) }
-        return fields.isEmpty ? "模型设置待同步" : fields.joined(separator: " · ")
+        if !effort.isEmpty, effort != "unknown" { fields.append(effortNames[effort] ?? effort) }
+        else if complete { fields.append("强度未提供") }
+        if ["fast", "priority"].contains(tier) { fields.append("闪电 Fast") }
+        else if tier == "ultrafast" { fields.append("极速 Ultra Fast") }
+        else if ["default", "standard"].contains(tier) { fields.append("标准速度") }
+        else if !tier.isEmpty, tier != "unknown" { fields.append("速度 " + tier) }
+        else if speedStatus == "default" { fields.append("速度跟随默认") }
+        else if complete { fields.append("速度未提供") }
+        return fields
+    }
+    private var recordedSettingsLine: String {
+        // Older log readers used "default" for a null override as well as an
+        // explicit selection. That historical field cannot prove Fast is off.
+        Self.modelFields(model: recordedModel, effort: recordedReasoningEffort,
+                         tier: recordedServiceTier == "default" ? "" : recordedServiceTier,
+                         speedStatus: recordedServiceTier == "default" ? "default" : "").joined(separator: " · ")
+    }
+    var secondaryLine: String {
+        if currentSettingsReadable {
+            return (["当前"] + Self.modelFields(model: selectedModel, effort: selectedReasoningEffort, tier: selectedServiceTier, speedStatus: selectedSpeedStatus, complete: true)).joined(separator: " · ")
+        }
+        let recorded = recordedSettingsLine
+        if !recorded.isEmpty {
+            let label = isActive ? "本轮记录" : "上次记录"
+            return (currentSettingsStatus.isEmpty ? "" : "当前不可读 · ") + label + " · " + recorded
+        }
+        return "当前设置不可读"
+    }
+    var settingsTooltip: String {
+        var lines = [secondaryLine]
+        if currentSettingsReadable {
+            lines.append("来源：Codex 当前对话设置，只读获取；不是日志中的历史设置。")
+            if let observed = currentSettingsObservedAt {
+                let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"
+                lines.append("读取时间：" + formatter.string(from: observed))
+            }
+            if let verified = currentSettingsVerifiedAt {
+                let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"
+                lines.append("连接核对时间：" + formatter.string(from: verified))
+            }
+            if currentSettingsStatus == "partial" { lines.append("Codex 尚未提供的字段保持未知，不用历史值补齐。") }
+            if selectedSpeedStatus == "default", selectedServiceTier.isEmpty { lines.append("没有显式速度覆盖，跟随 Codex 的默认选择；未推断为标准或闪电。") }
+        } else {
+            lines.append("当前选择暂不可核实；记录值仅表示已读到的本轮或上次执行设置。")
+            if !currentSettingsMessage.isEmpty { lines.append(currentSettingsMessage) }
+        }
+        return lines.joined(separator: "\n")
     }
 
     var tokenBreakdown: String {
@@ -261,7 +333,7 @@ final class CueTaskHoverController: NSObject {
         var tips = detail.totalTokens.map { "Tokens：" + CueTaskDetail.exact($0) } ?? "Tokens 尚未记录"
         if detail.tokensStatus == "partial" || detail.elapsedStatus == "partial" { tips += "\n只统计已读取的本轮记录；≥ 表示当前可确认的下限。" }
         summaryField.toolTip = tips
-        modelField.stringValue = detail.secondaryLine; modelField.toolTip = detail.secondaryLine
+        modelField.stringValue = detail.secondaryLine; modelField.toolTip = detail.settingsTooltip
         breakdownField.stringValue = detail.tokenBreakdown
         previewHeading.stringValue = detail.contentTruncated ? "最近对话 · 部分内容" : "最近对话"
         renderMessages(detail.messages)
@@ -434,6 +506,21 @@ final class CueTaskHoverController: NSObject {
         let invalid = CueTaskDetail(raw: ["total_tokens": true, "input_tokens": -1, "output_tokens": 2.5, "elapsed_seconds": Double.infinity])
         let messages = CueTaskDetail(raw: ["messages": [["role": "system", "text": "SYSTEM-NOT-VISIBLE"], ["role": "tool", "text": "TOOL-ARGUMENTS-NOT-VISIBLE"], ["role": "reasoning", "text": "REASONING-NOT-VISIBLE"], ["role": "user", "text": "可见问题"], ["role": "assistant", "text": "可见回复"]]])
         let long = CueTaskDetail(raw: ["messages": (0..<10).map { ["role": "assistant", "text": String(repeating: "内容", count: 3000) + "\($0)"] }])
+        let selection: [String: Any] = ["status": "current", "source": "codex_desktop", "observed_at": Date().timeIntervalSince1970, "model": "current-model", "reasoning_effort": "ultra", "service_tier": "priority"]
+        let selected = CueTaskDetail(raw: ["status": "running", "model": "old-model", "reasoning_effort": "low", "service_tier": "default", "current_settings": selection, "total_tokens": 12345, "tokens_status": "partial"])
+        var inherited = selection; inherited["service_tier"] = NSNull(); inherited["speed_status"] = "default"; inherited["reasoning_effort"] = "default"
+        let inheritedDetail = CueTaskDetail(raw: ["current_settings": inherited])
+        var incomplete = selection; incomplete["status"] = "partial"; incomplete.removeValue(forKey: "reasoning_effort"); incomplete.removeValue(forKey: "service_tier")
+        let incompleteDetail = CueTaskDetail(raw: ["model": "old-model", "reasoning_effort": "low", "service_tier": "fast", "current_settings": incomplete])
+        var expired = selection; expired["observed_at"] = Date().addingTimeInterval(-120).timeIntervalSince1970
+        let expiredDetail = CueTaskDetail(raw: ["status": "complete", "model": "old-model", "reasoning_effort": "low", "service_tier": "fast", "current_settings": expired])
+        var disconnected = selection; disconnected["status"] = "unavailable"
+        let disconnectedDetail = CueTaskDetail(raw: ["current_settings": disconnected])
+        var healthyUnchanged = expired; healthyUnchanged["verified_at"] = Date().timeIntervalSince1970; healthyUnchanged["expires_at"] = Date().addingTimeInterval(30).timeIntervalSince1970
+        let healthyUnchangedDetail = CueTaskDetail(raw: ["current_settings": healthyUnchanged])
+        let historicalDefault = CueTaskDetail(raw: ["model": "old-model", "service_tier": "default"])
+        var explicitDefault = selection; explicitDefault["service_tier"] = "default"
+        let explicitDefaultDetail = CueTaskDetail(raw: ["current_settings": explicitDefault])
         var results = ["task_detail_unknown_never_fabricates_zero_tokens": unknown.totalTokens == nil && unknown.summaryLine(now: now).contains("待同步"),
                        "task_detail_partial_has_explicit_lower_bound": partial.summaryLine(now: now).contains("≥") && partial.summaryLine(now: now).contains("部分"),
                        "task_detail_live_duration_advances": partial.elapsed(now: now.addingTimeInterval(10)) == 135,
@@ -445,6 +532,17 @@ final class CueTaskHoverController: NSObject {
                        "task_detail_old_alert_labels_latest_turn": partial.summaryLine(now: now, eventDate: now.addingTimeInterval(-1000)).hasPrefix("最新轮"),
                        "task_detail_invalid_numbers_remain_unknown": invalid.totalTokens == nil && invalid.inputTokens == nil && invalid.outputTokens == nil && invalid.elapsedSeconds == nil,
                        "task_detail_reliable_model_and_speed_are_visible": partial.secondaryLine.contains("gpt-model") && partial.secondaryLine.contains("高强度") && partial.secondaryLine.contains("Fast"),
+                       "task_detail_current_owner_settings_override_recorded_settings": selected.model == "current-model" && selected.reasoningEffort == "ultra" && selected.serviceTier == "priority" && selected.secondaryLine.hasPrefix("当前 · ") && !selected.secondaryLine.contains("old-model"),
+                       "task_detail_current_settings_do_not_change_numeric_usage": selected.totalTokens == 12345 && selected.tokensStatus == "partial",
+                       "task_detail_current_fast_state_is_explicit": selected.secondaryLine.contains("闪电 Fast") && selected.secondaryLine.contains("Ultra 强度"),
+                       "task_detail_null_speed_override_follows_default_without_guessing": inheritedDetail.secondaryLine.contains("速度跟随默认") && inheritedDetail.secondaryLine.contains("默认强度") && !inheritedDetail.secondaryLine.contains("标准速度") && !inheritedDetail.secondaryLine.contains("闪电"),
+                       "task_detail_historical_null_normalization_never_proves_standard_speed": historicalDefault.secondaryLine.contains("速度跟随默认") && !historicalDefault.secondaryLine.contains("标准速度") && explicitDefaultDetail.secondaryLine.contains("标准速度"),
+                       "task_detail_partial_current_settings_never_mix_historical_values": incompleteDetail.secondaryLine.contains("强度未提供") && incompleteDetail.secondaryLine.contains("速度未提供") && !incompleteDetail.secondaryLine.contains("低强度") && !incompleteDetail.secondaryLine.contains("Fast"),
+                       "task_detail_expired_settings_are_not_presented_as_current": expiredDetail.secondaryLine.hasPrefix("当前不可读 · 上次记录") && !expiredDetail.secondaryLine.contains("current-model"),
+                       "task_detail_healthy_subscription_keeps_unchanged_settings_current": healthyUnchangedDetail.secondaryLine.hasPrefix("当前 · ") && healthyUnchangedDetail.model == "current-model",
+                       "task_detail_unavailable_snapshot_does_not_reuse_current_fields": disconnectedDetail.secondaryLine == "当前设置不可读" && !disconnectedDetail.secondaryLine.contains("current-model"),
+                       "task_detail_record_only_settings_have_visible_provenance": partial.secondaryLine.hasPrefix("本轮记录 · ") && !partial.secondaryLine.contains("当前"),
+                       "task_detail_setting_tooltip_explains_source_and_inheritance": selected.settingsTooltip.contains("只读获取") && selected.settingsTooltip.contains("读取时间") && inheritedDetail.settingsTooltip.contains("未推断"),
                        "task_detail_only_user_and_assistant_are_previewed": messages.messages.map(\.role) == ["user", "assistant"],
                        "task_detail_preview_text_stays_bounded": long.messages.count <= 8 && long.messages.reduce(0) { $0 + $1.text.count } <= 12000 && long.contentTruncated]
         _ = NSApplication.shared

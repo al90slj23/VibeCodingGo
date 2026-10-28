@@ -287,6 +287,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var runningTasks: [CueRunningTask] = []
     var interruptedTasks: [CueRunningTask] = []
     var taskDetails: [String: CueTaskDetail] = [:]
+    private var modelSettingsTargets = Data()
     var batchController: CueCodexBatchController?
     private var runningTaskSnapshot = Data()
     lazy var recentHistory = CueRecentHistory(home: home)
@@ -941,7 +942,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         }
         let path = home.appendingPathComponent("watcher-state.json")
         let savedData = try? Data(contentsOf: path)
-        let state = savedData.flatMap { $0.count <= 2_097_152 ? (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] : nil } ?? [:]
+        var state = savedData.flatMap { $0.count <= 2_097_152 ? (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] : nil } ?? [:]
         var live = false
         if
            state["running"] as? Bool == true,
@@ -954,7 +955,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             manualApprovalStatus = connection.attentionConnected ? "Codex 批准监听已自动连接" : connection.summary
             let count = state["watched_threads"] as? Int ?? 0
             let taskRows = state["running_tasks"] as? [[String: Any]] ?? []
-            let detailRows = state["task_details"] as? [String: [String: Any]] ?? [:]
+            var detailRows = state["task_details"] as? [String: [String: Any]] ?? [:]
+            let selectedSettings = state["current_model_settings"] as? [String: [String: Any]] ?? [:]
+            for (id, settings) in selectedSettings.prefix(256) where CueThreadFollowups.valid(id) {
+                var detail = detailRows[id] ?? ["thread_id": id, "status": "unknown"]
+                detail["current_settings"] = settings
+                detailRows[id] = detail
+            }
+            state["task_details"] = detailRows
             nextTaskDetails = detailRows.mapValues { CueTaskDetail(raw: $0) }
             nextRunningTasks = taskRows.compactMap { CueRunningTask(raw: $0) }
             nextRunningSnapshot = (try? JSONSerialization.data(withJSONObject: ["tasks": taskRows, "details": detailRows], options: [.sortedKeys])) ?? Data()
@@ -967,6 +975,13 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 message = "尚未找到可监控的本机对话"
             } else {
                 message = "本机监控中 · \(count) 个对话"
+            }
+        }
+        if !live, let rows = state["task_details"] as? [String: [String: Any]] {
+            state["task_details"] = rows.mapValues { row in
+                var value = row
+                value["current_settings"] = ["status": "unavailable", "source": "codex_desktop", "reason": "本机监控连接暂不可用"]
+                return value
             }
         }
         let recovery = CueTaskRecoverySnapshot.read(home: home, state: state, live: live)
@@ -1212,6 +1227,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func refreshMenu() {
         guard statusItem != nil else { return }
+        writeModelSettingsTargets()
         let menu = NSMenu()
         let panel = NSMenuItem(title: "打开 VibeCue 面板…", action: #selector(openSettings), keyEquivalent: ",")
         panel.target = self; menu.addItem(panel)
@@ -1303,6 +1319,23 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         shortcutMenu = menu
         refreshStatusItem()
         if statusPopover?.isShown == true { updateStatusPopover() }
+    }
+
+    private func writeModelSettingsTargets() {
+        // IDs only. This tells the existing read-only subscription which
+        // retained list entries need current settings, including older chats.
+        let requested = runningTasks.map(\.threadID) + recentHistory.records.filter(\.isPinned).map { $0.event.threadID }
+            + recentHistory.followups.records.map(\.threadID) + interruptedTasks.map(\.threadID)
+            + recentHistory.records.map { $0.event.threadID }
+        var seen = Set<String>()
+        let ids = Array(requested.filter { CueThreadFollowups.valid($0) && seen.insert($0).inserted }.prefix(256))
+        guard let data = try? JSONSerialization.data(withJSONObject: ["thread_ids": ids], options: [.sortedKeys]), data != modelSettingsTargets else { return }
+        let file = home.appendingPathComponent("model-settings-targets.json")
+        do {
+            try data.write(to: file, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            modelSettingsTargets = data
+        } catch { /* A later menu refresh retries without altering task state. */ }
     }
 
     private var menuWork: CueMenuBarWork {

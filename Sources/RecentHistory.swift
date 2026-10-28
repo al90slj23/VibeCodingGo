@@ -1483,17 +1483,18 @@ final class CueStatusPopoverController: NSViewController {
         row.addSubview(elapsed); row.toolTip = nil
         configureQuickActions(in: row)
         row.setAccessibilityHelp(line + "，" + elapsed.stringValue + "。悬停查看本轮详情与最近对话；点击打开对应对话。")
+        metrics.toolTip = taskDetails[threadID]?.settingsTooltip
     }
     private func refreshDetails(in row: NSButton, threadID: String, eventDate: Date?) {
         let line = rowInformation(threadID: threadID, eventDate: eventDate)
-        if let metrics = row.subviews.first(where: { $0.identifier?.rawValue == "task-metrics:" + threadID }) as? NSTextField { metrics.stringValue = line }
+        if let metrics = row.subviews.first(where: { $0.identifier?.rawValue == "task-metrics:" + threadID }) as? NSTextField { metrics.stringValue = line; metrics.toolTip = taskDetails[threadID]?.settingsTooltip }
         let elapsed = durationLine(threadID: threadID, eventDate: eventDate, now: Date())
         if let field = row.subviews.first(where: { $0.identifier?.rawValue == "task-elapsed:" + threadID }) as? NSTextField { field.stringValue = elapsed }
         row.setAccessibilityHelp(line + "，" + elapsed + "。悬停查看本轮详情与最近对话；点击打开对应对话。")
         configureQuickActions(in: row)
     }
     private func rowInformation(threadID: String, eventDate: Date?) -> String {
-        guard let detail = taskDetails[threadID] else { return "Tokens 待同步 · 模型设置待同步" }
+        guard let detail = taskDetails[threadID] else { return "Tokens 待同步 · 当前设置不可读" }
         return detail.tokenLine(eventDate: eventDate) + " · " + detail.secondaryLine
     }
     private func configureQuickActions(in row: NSButton) {

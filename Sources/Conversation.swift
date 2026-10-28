@@ -261,8 +261,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         if let detail = detailProvider() {
             let state = ["running": "运行中", "waiting": "等待你处理", "complete": "本轮已结束", "aborted": "已中断", "interrupted": "已中断"][detail.status] ?? "待续"
             summary.stringValue = state + " · " + detail.summaryLine() + " · " + detail.secondaryLine
+            summary.toolTip = summary.stringValue + "\n" + detail.settingsTooltip
         } else { summary.stringValue = "待续 · 关闭后继续保留" }
-        summary.toolTip = summary.stringValue
     }
     private func payload(_ values: [String: Any]) -> Data? { try? JSONSerialization.data(withJSONObject: values) }
     private func readConversation() {

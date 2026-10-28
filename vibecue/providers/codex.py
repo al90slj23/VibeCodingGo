@@ -30,6 +30,7 @@ from .approval_status import approval_status
 from .task_details import TaskDetails, bounded_details, bound_status_previews
 from .task_recovery import TaskRecovery, codex_process_snapshot
 from ..desktop_attention import DesktopAttentionService
+from ..current_model_settings import unavailable_settings
 
 MAX_READ = 1_048_576
 MAX_RECORD = 2_097_152
@@ -516,7 +517,27 @@ class Watcher:
         recent = [pair for pair in self.watched.values()
                   if max(pair[1].last_activity, pair[1].metadata.updated_at) >= now - ACTIVITY_TTL]
         prioritized = sorted(recent, key=lambda pair: (pair[1].activity_state == 'running', pair[1].last_activity, pair[1].metadata.updated_at), reverse=True)
-        self.desktop.set_threads([pair[1].metadata.thread_id for pair in prioritized])
+        active = [pair[1].metadata.thread_id for pair in prioritized if pair[1].activity_state == 'running']
+        requested = self._model_settings_targets()
+        self.desktop.set_threads(active + [pair[1].metadata.thread_id for pair in prioritized] + requested)
+
+    def _model_settings_targets(self):
+        # The app requests only navigation metadata for its retained list.
+        # Old recovery records alone never force large desktop snapshots.
+        try:
+            path = self.vibecue_home / 'model-settings-targets.json'
+            with path.open('rb') as stream:
+                raw = stream.read(65_537)
+            if len(raw) > 65_536:
+                return []
+            value = json.loads(raw)
+            rows = value.get('thread_ids') if isinstance(value, dict) else None
+            if not isinstance(rows, list) or len(rows) > 256:
+                return []
+            return list(dict.fromkeys(row for row in rows if isinstance(row, str) and
+                                      re.fullmatch(r'[A-Za-z0-9_-]{1,160}', row)))
+        except (OSError, ValueError, TypeError):
+            return []
 
     def poll_once(self):
         if time.monotonic() - self.last_discovery >= 3:
@@ -542,6 +563,9 @@ class Watcher:
         approvals = approval_status(self.vibecue_home)
         self.desktop.set_stdio_connected(approvals['connected'])
         desktop = self.desktop.snapshot()
+        current_settings = self.desktop.current_settings()
+        if not isinstance(current_settings, dict):
+            current_settings = {}
         if not approvals['connected'] and desktop['connected'] and desktop['capabilities']['attention']:
             approvals = {'connected': True, 'status': 'connected', 'source': 'codex-desktop-owner-stream',
                          'live_sources': 1, 'pending_count': desktop['pending_count'],
@@ -567,6 +591,7 @@ class Watcher:
                                  'transcript_path': str(interpreter.metadata.path)})
             detail = interpreter.detail_snapshot(now)
             if detail:
+                detail['current_settings'] = current_settings.get(tid, unavailable_settings(reason='尚未取得此对话的 Codex 当前设置'))
                 detail['source_readable'] = not bool(tail.read_error) and interpreter.context_readable
                 if tid in waiting_approval:
                     detail['status'] = 'waiting'
@@ -586,8 +611,9 @@ class Watcher:
             'interrupted_tasks': interrupted,
             'task_recovery_error': self.recovery.error,
             'task_details': bounded_details(detail_rows),
+            'current_model_settings': current_settings,
             'source': 'local-transcripts', 'provider': 'codex',
-            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'durable-interrupted-task-recovery', 'per-turn-usage', 'visible-conversation-preview', 'auto-desktop-connection', 'desktop-attention-stream'],
+            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'durable-interrupted-task-recovery', 'per-turn-usage', 'visible-conversation-preview', 'auto-desktop-connection', 'desktop-attention-stream', 'current-model-settings'],
             'permission_status': 'connected' if approvals['connected'] else 'auto-reconnecting',
             'manual_approval': approvals,
             'desktop_connection': desktop,

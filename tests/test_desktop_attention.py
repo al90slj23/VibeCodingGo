@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import socket
+import struct
 import tempfile
 import threading
 import time
@@ -26,8 +27,14 @@ def request(identifier=1, method='item/commandExecution/requestApproval'):
 
 def change(revision=1, requests=None):
     return {'type': 'snapshot', 'revision': revision,
-            'conversationState': {'id': THREAD, 'requests': requests or [],
+            'conversationState': {'id': THREAD, 'resumeState': 'resumed', 'requests': requests or [],
                                   'turns': [{'items': [{'text': 'PRIVATE BODY'}]}]}}
+
+
+def projected_json(projection):
+    values = dict(vars(projection))
+    values['settings'] = projection.settings.snapshot()
+    return json.dumps(values)
 
 
 class ProjectionTests(unittest.TestCase):
@@ -36,7 +43,7 @@ class ProjectionTests(unittest.TestCase):
 
     def test_snapshot_only_keeps_request_identifiers_not_bodies_or_params(self):
         self.projection.apply(change(requests=[request()]))
-        raw = json.dumps(vars(self.projection))
+        raw = projected_json(self.projection)
         self.assertNotIn('PRIVATE', raw)
         self.assertEqual(self.projection.requests[0]['params'], {'threadId': THREAD, 'turnId': 'turn-one', 'itemId': 'call-one'})
 
@@ -46,7 +53,7 @@ class ProjectionTests(unittest.TestCase):
                                'patches': [{'op': 'add', 'path': ['requests', 1], 'value': request(2)},
                                            {'op': 'replace', 'path': ['turnHistory', 'entitiesByKey', 'key', 'items'], 'value': [{'text': 'PRIVATE BODY'}]}]})
         self.assertEqual(len(self.projection.requests), 2)
-        self.assertNotIn('PRIVATE', json.dumps(vars(self.projection)))
+        self.assertNotIn('PRIVATE', projected_json(self.projection))
         self.projection.apply({'type': 'patches', 'baseRevision': 2, 'revision': 3,
                                'patches': [{'op': 'remove', 'path': ['requests', 0]}, {'op': 'replace', 'path': ['requests', 0], 'value': request(3)}]})
         self.assertEqual(self.projection.requests[0]['id'], 3)
@@ -59,7 +66,7 @@ class ProjectionTests(unittest.TestCase):
                                            {'op': 'replace', 'path': ['requests', 0, 'params', 'turnId'], 'value': 'new-turn'}]})
         self.assertTrue(self.projection.requests[0]['completed'])
         self.assertEqual(self.projection.requests[0]['params']['turnId'], 'new-turn')
-        self.assertNotIn('PRIVATE', json.dumps(vars(self.projection)))
+        self.assertNotIn('PRIVATE', projected_json(self.projection))
 
     def test_missing_revision_or_invalid_request_state_cannot_replay(self):
         self.projection.apply(change())
@@ -210,6 +217,35 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(service.monitor.pending, {})
         self.assertIsNone(service.projections[THREAD].revision)
 
+    def test_same_owner_settings_snapshot_and_patches_feed_live_list(self):
+        service = DesktopAttentionService('/fixture')
+        service.channel = type('Channel', (), {'client_id': CLIENT})()
+        service.set_threads([THREAD]); service._health['connected'] = True
+        service.projections[THREAD] = AttentionProjection(THREAD, OWNER)
+        initial = change()
+        initial['conversationState']['latestThreadSettings'] = {'model': 'model-new', 'effort': 'ultra', 'serviceTier': 'priority'}
+        def emit(update, owner=OWNER):
+            service._on_message({'type': 'broadcast', 'method': 'thread-stream-state-changed', 'version': 11,
+                                 'sourceClientId': owner, 'targetClientIds': [CLIENT],
+                                 'params': {'hostId': 'local', 'conversationId': THREAD, 'change': update}})
+        emit(initial)
+        first = service.current_settings()[THREAD]
+        self.assertEqual((first['status'], first['model'], first['reasoning_effort'], first['service_tier']), ('current', 'model-new', 'ultra', 'priority'))
+        update = {'type': 'patches', 'baseRevision': 1, 'revision': 2, 'patches': [
+            {'op': 'replace', 'path': ['latestThreadSettings', 'model'], 'value': 'model-next'},
+            {'op': 'replace', 'path': ['latestThreadSettings', 'effort'], 'value': 'high'},
+            {'op': 'replace', 'path': ['latestThreadSettings', 'serviceTier'], 'value': 'default'}]}
+        emit(update, owner='wrong-owner')
+        self.assertEqual(service.current_settings()[THREAD]['model'], 'model-new')
+        emit(update)
+        current = service.current_settings()[THREAD]
+        self.assertEqual((current['model'], current['reasoning_effort'], current['service_tier']), ('model-next', 'high', 'default'))
+        self.assertNotIn('PRIVATE', json.dumps(current))
+        service._health['connected'] = False
+        unavailable = service.current_settings()[THREAD]
+        self.assertEqual(unavailable['status'], 'unavailable')
+        self.assertNotIn('model', unavailable)
+
     def test_initial_snapshot_is_pending_for_only_one_candidate(self):
         service = DesktopAttentionService('/fixture')
         service.channel = type('Channel', (), {'discover': lambda self: self.fail('unexpected discovery')})()
@@ -217,6 +253,28 @@ class ServiceTests(unittest.TestCase):
         service.subscribed_at[THREAD] = time.monotonic()
         service._discover([THREAD, 'another-thread'])
         self.assertEqual(set(service.projections), {THREAD})
+
+    def test_unqueried_retained_tasks_do_not_starve_behind_retried_missing_owners(self):
+        service = DesktopAttentionService('/fixture')
+        class Channel:
+            owner, client_id = OWNER, CLIENT
+            def discover(self): return {'owner_client_id': OWNER}
+            def _send(self, value): pass
+        service.channel = Channel()
+        service.next_discovery['previous-missing'] = time.monotonic() - 1
+        service._discover(['previous-missing', 'not-yet-queried'])
+        self.assertEqual(set(service.projections), {'not-yet-queried'})
+
+    def test_no_owner_reports_not_loaded_instead_of_indefinite_sync(self):
+        service = DesktopAttentionService('/fixture')
+        class Channel:
+            def discover(self): raise DesktopOwnerUnavailable('no owner')
+        service.channel = Channel(); service.set_threads([THREAD]); service._health['connected'] = True
+        service._discover([THREAD])
+        result = service.current_settings()[THREAD]
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertIn('未在 Codex 加载', result['message'])
+        self.assertNotIn('model', result)
 
     def test_oversized_initial_frame_quarantines_only_pending_candidate(self):
         service = DesktopAttentionService('/fixture')
@@ -267,8 +325,56 @@ class ServiceTests(unittest.TestCase):
         with patch.object(DesktopChannel, 'discover', timeout):
             with self.assertRaises(DesktopOwnerUnavailable): channel.discover()
 
+    def test_long_snapshot_settings_project_without_retaining_conversation_body(self):
+        from vibecue.codex_desktop_ipc import MAX_FRAME
+        update = change()
+        update['conversationState'].update(latestThreadSettings={'model':'long-model','effort':'ultra','serviceTier':'priority'}, turns=[{'text':'PRIVATE BODY ' * 700000}])
+        packet = {'type':'broadcast','method':'thread-stream-state-changed','version':11,
+                  'sourceClientId':OWNER,'targetClientIds':[CLIENT],
+                  'params':{'hostId':'local','conversationId':THREAD,'change':update}}
+        body = json.dumps(packet).encode()
+        self.assertGreater(len(body), MAX_FRAME)
+        self.assertLess(len(body), _AttentionChannel.max_frame_size)
+        projection = AttentionProjection(THREAD, OWNER)
+        channel = _AttentionChannel(THREAD,on_message=lambda message:projection.apply(message['params']['change']))
+        with patch.object(channel,'_read_exact',side_effect=[struct.pack('<I',len(body)),body]):channel._receive(time.monotonic()+2)
+        self.assertEqual(projection.settings.snapshot()['model'],'long-model')
+        self.assertNotIn('PRIVATE',projected_json(projection))
+
 
 class WatcherIntegrationTests(unittest.TestCase):
+    def test_explicit_list_targets_join_recent_without_loading_or_duplication(self):
+        from vibecue.providers import codex
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory); path = home / 'log.jsonl'; path.write_text('')
+            with patch.object(codex, 'DesktopAttentionService') as service:
+                watcher = codex.Watcher(home / 'codex', home / 'cue')
+                (watcher.vibecue_home / 'model-settings-targets.json').write_text(json.dumps({'thread_ids': ['visible-old', 'visible-old', '../invalid']}))
+                recent = codex.ThreadMetadata('current', path, 'current', 'vscode', time.time())
+                interpreter = codex.Interpreter(recent, lambda **kwargs: None)
+                interpreter.activity_state = 'running'; interpreter.last_activity = recent.updated_at
+                watcher.watched = {recent.thread_id: (codex.TailReader(path), interpreter)}
+                with patch.object(watcher, 'metadata', return_value=[recent]): watcher.discover()
+                service.return_value.set_threads.assert_called_with(['current', 'current', 'visible-old'])
+
+    def test_live_model_metadata_is_exported_even_without_log_model_context(self):
+        from vibecue.providers import codex
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory); path = home / 'log.jsonl'; path.write_text('')
+            with patch.object(codex, 'DesktopAttentionService') as service:
+                watcher = codex.Watcher(home / 'codex', home / 'cue')
+                metadata = codex.ThreadMetadata(THREAD, path, 'fixture', 'vscode', time.time())
+                interpreter = codex.Interpreter(metadata, lambda **kwargs: None)
+                interpreter.process({'type':'event_msg', 'timestamp':'2026-10-29T00:00:00Z', 'payload':{'type':'task_started','turn_id':'one'}})
+                watcher.watched = {THREAD: (codex.TailReader(path), interpreter)}
+                live = {'status':'current','source':'codex_desktop','model':'model-live','reasoning_effort':'ultra','service_tier':'priority'}
+                service.return_value.snapshot.return_value = {'connected':False,'capabilities':{'attention':False}}
+                service.return_value.current_settings.return_value = {THREAD: live}
+                watcher.write_status()
+                state = json.loads((watcher.vibecue_home / 'watcher-state.json').read_text())
+                self.assertEqual(state['current_model_settings'][THREAD], live)
+                self.assertEqual(state['task_details'][THREAD]['current_settings']['model'], 'model-live')
+
     def test_old_recovery_navigation_does_not_force_live_full_snapshot(self):
         from vibecue.providers import codex
         with tempfile.TemporaryDirectory() as directory:

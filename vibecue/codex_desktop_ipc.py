@@ -148,6 +148,7 @@ def _snapshot_metadata(state, thread, owner, revision):
 
 class DesktopChannel:
     method_versions = VERSIONS
+    max_frame_size = MAX_FRAME
     def __init__(self, thread_id, codex_home=None, timeout=8):
         if not _identifier(thread_id):
             raise ControlError('对话标识无效')
@@ -213,7 +214,7 @@ class DesktopChannel:
 
     def _receive(self, deadline):
         length = struct.unpack('<I', self._read_exact(4, deadline))[0]
-        if not 0 < length <= MAX_FRAME:
+        if not 0 < length <= self.max_frame_size:
             raise ControlError('Codex 本机连接返回的数据过大或无效')
         try:
             value = json.loads(self._read_exact(length, deadline))
