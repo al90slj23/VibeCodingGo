@@ -76,6 +76,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     var onClosed: (() -> Void)?
     private let client: CueUsageClient
     private let drafts: CueConversationDrafts
+    private let windowGeometry: CueConversationWindowState
+    private var remembersWindowGeometry = false
     private let detailProvider: () -> CueTaskDetail?
     private let onHandled: () -> Void
     private let onCodex: () -> Void
@@ -127,10 +129,17 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
 
     init(home: URL, event: CueEvent, detailProvider: @escaping () -> CueTaskDetail?, onHandled: @escaping () -> Void, onCodex: @escaping () -> Void, onConnect: @escaping () -> Void, onPathAction: @escaping (String) -> Void) {
         self.event = event; client = CueUsageClient(home: home); drafts = CueConversationDrafts(home: home)
+        windowGeometry = CueConversationWindowState.shared(home: home)
         self.detailProvider = detailProvider; self.onHandled = onHandled; self.onCodex = onCodex; self.onConnect = onConnect; self.onPathAction = onPathAction
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 820), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        let window = CueConversationWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 820), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "VibeCue · " + event.title; window.isReleasedWhenClosed = false
-        window.contentMinSize = NSSize(width: 640, height: 580); window.titlebarAppearsTransparent = true; window.backgroundColor = CueConversationColors.background; window.center()
+        window.contentMinSize = NSSize(width: 640, height: 580); window.titlebarAppearsTransparent = true; window.backgroundColor = CueConversationColors.background
+        let minimum = window.frameRect(forContentRect: NSRect(origin: .zero, size: window.contentMinSize)).size
+        if let saved = windowGeometry.restoredFrame(screens: CueConversationWindowState.visibleScreens, minimum: minimum) {
+            let chrome = window.frame.height - window.contentRect(forFrameRect: window.frame).height
+            window.contentMinSize = NSSize(width: min(640, saved.width), height: min(580, max(1, saved.height - chrome)))
+            window.setFrame(saved, display: false)
+        } else { window.center() }
         super.init(window: window); window.delegate = self; window.contentView = root
         titleField.stringValue = event.title; titleField.font = .systemFont(ofSize: 14, weight: .semibold); titleField.lineBreakMode = .byTruncatingTail; titleField.toolTip = event.title
         summary.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular); summary.textColor = .secondaryLabelColor; summary.lineBreakMode = .byTruncatingTail
@@ -143,7 +152,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         noteTitle.font = .systemFont(ofSize: 13, weight: .semibold); noteHint.font = .systemFont(ofSize: 11); noteHint.textColor = .secondaryLabelColor
         for (view, scroll) in [(composer, composeScroll), (note, noteScroll)] {
             scroll.documentView = view; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.borderType = .noBorder; scroll.drawsBackground = false
-            view.isEditable = true; view.isSelectable = true; view.isRichText = false; view.drawsBackground = false; view.textColor = .labelColor
+            view.isEditable = true; view.isSelectable = true; view.isRichText = false; view.allowsUndo = true; view.drawsBackground = false; view.textColor = .labelColor
             view.font = .systemFont(ofSize: 14); view.textContainerInset = NSSize(width: 4, height: 10)
             view.isVerticallyResizable = true; view.isHorizontallyResizable = false
             view.autoresizingMask = [.width]; view.textContainer?.widthTracksTextView = true
@@ -187,8 +196,11 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     deinit { timer?.invalidate(); saveWork?.cancel() }
 
     override func showWindow(_ sender: Any?) {
+        remembersWindowGeometry = false
+        if !fixtureMode, window?.isVisible != true { restoreWindowGeometry() }
         super.showWindow(sender); handled = false; window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         guard !fixtureMode else { return }
+        remembersWindowGeometry = true
         readConversation(); checkConnection(force: true)
         timer?.invalidate(); timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self, self.window?.isVisible == true, self.window?.isMiniaturized != true else { return }
@@ -196,9 +208,25 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
-    func windowWillClose(_ notification: Notification) { timer?.invalidate(); timer = nil; saveDraft(); if !hasInFlightOperation { onClosed?() }; /* Closing never handles a task. */ }
+    func windowWillClose(_ notification: Notification) { remembersWindowGeometry = false; windowGeometry.flush(); timer?.invalidate(); timer = nil; saveDraft(); if !hasInFlightOperation { onClosed?() }; /* Closing never handles a task. */ }
     func windowShouldClose(_ sender: NSWindow) -> Bool { saveDraft() }
-    func stop() { timer?.invalidate(); timer = nil; saveDraft(); client.stop() }
+    func stop() { windowGeometry.flush(); timer?.invalidate(); timer = nil; saveDraft(); client.stop() }
+    func windowDidMove(_ notification: Notification) { rememberWindowGeometry() }
+    func windowDidResize(_ notification: Notification) { rememberWindowGeometry() }
+    func windowDidEndLiveResize(_ notification: Notification) { rememberWindowGeometry(); if !fixtureMode { windowGeometry.flush() } }
+    private func rememberWindowGeometry() {
+        guard remembersWindowGeometry, !fixtureMode, let window, window.isVisible,
+              !window.isMiniaturized, !window.styleMask.contains(.fullScreen) else { return }
+        windowGeometry.record(window.frame)
+    }
+    private func restoreWindowGeometry() {
+        guard let window else { return }
+        let minimum = window.frameRect(forContentRect: NSRect(origin: .zero, size: NSSize(width: 640, height: 580))).size
+        guard let saved = windowGeometry.restoredFrame(screens: CueConversationWindowState.visibleScreens, minimum: minimum) else { return }
+        let chrome = window.frame.height - window.contentRect(forFrameRect: window.frame).height
+        window.contentMinSize = NSSize(width: min(640, saved.width), height: min(580, max(1, saved.height - chrome)))
+        window.setFrame(saved, display: false)
+    }
     private func releaseClosedWindowIfIdle() {
         if window?.isVisible != true && !hasInFlightOperation { onClosed?() }
     }
@@ -512,6 +540,20 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         let canClose = failing.windowShouldClose(failing.window!)
         failing.markHandled()
         results["failed_draft_save_prevents_close_and_handled_action"] = !canClose && handledCalls == 1
+        results.merge(CueConversationWindowState.validationReport()) { _, value in value }
+        let geometryHome = home.appendingPathComponent("shared-geometry")
+        let geometry = CueConversationWindowState.shared(home: geometryHome)
+        geometry.record(NSRect(x: 120, y: 100, width: 1040, height: 800)); geometry.flush()
+        let firstViewer = CueConversationController(home: geometryHome, event: event, detailProvider: { nil }, onHandled: {}, onCodex: {}, onConnect: {}, onPathAction: { _ in })
+        let otherEvent = CueEvent(runningThreadID: "another-conversation", title: "另一对话", date: Date())
+        let otherViewer = CueConversationController(home: geometryHome, event: otherEvent, detailProvider: { nil }, onHandled: {}, onCodex: {}, onConnect: {}, onPathAction: { _ in })
+        let minimum = firstViewer.window!.frameRect(forContentRect: NSRect(origin: .zero, size: NSSize(width: 640, height: 580))).size
+        let expected = geometry.restoredFrame(screens: CueConversationWindowState.visibleScreens, minimum: minimum)
+        results["new_conversation_viewers_restore_one_common_frame"] = firstViewer.window?.frame == otherViewer.window?.frame && firstViewer.window?.frame == expected
+        let previousGeometry = try? Data(contentsOf: geometry.file)
+        firstViewer.fixtureMode = true; firstViewer.remembersWindowGeometry = true
+        firstViewer.window?.setFrameOrigin(NSPoint(x: -10000, y: -10000)); firstViewer.rememberWindowGeometry(); firstViewer.windowGeometry.flush()
+        results["conversation_fixture_offscreen_frame_never_replaces_user_geometry"] = (try? Data(contentsOf: geometry.file)) == previousGeometry
         return results
     }
 

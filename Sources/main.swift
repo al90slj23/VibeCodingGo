@@ -295,6 +295,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var statusPopover: NSPopover?
     var statusPopoverController: CueStatusPopoverController?
     var usageDashboard: CueUsageDashboardController?
+    var accountQuotaMonitor: CueAccountQuotaMonitor?
     private var menuUsage: CueMenuBarUsageMonitor?
     private var recoveryClient: CueUsageClient?
     private var conversationClient: CueUsageClient?
@@ -367,6 +368,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             NSApp.terminate(nil); return
         }
         ownsLock = true
+        CueEditingMenu.install()
         try? FileManager.default.removeItem(at: home.appendingPathComponent("disabled"))
         if let data = try? Data(contentsOf: home.appendingPathComponent("settings.json")),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -403,6 +405,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         usageDashboard?.usageDidChange = { [weak menuUsage] in menuUsage?.refresh() }
         menuUsage.start()
         usageDashboard?.startBackgroundSync()
+        accountQuotaMonitor = CueAccountQuotaMonitor.shared(home: home)
+        _ = accountQuotaMonitor?.observe { [weak self] in self?.writeStatus() }
+        accountQuotaMonitor?.start()
         updateWatcherHealth()
         refreshMenu()
         recoverInflight()
@@ -1233,6 +1238,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         panel.target = self; menu.addItem(panel)
         let usage = NSMenuItem(title: "用量统计与请求日志…", action: #selector(openUsage), keyEquivalent: "u")
         usage.target = self; menu.addItem(usage)
+        let quota = NSMenuItem(title: "Codex 账号额度…", action: #selector(openAccountQuota), keyEquivalent: "")
+        quota.target = self; menu.addItem(quota)
         let subtitle = NSMenuItem(title: "AI Coding Companion · AI 开发提醒助手", action: nil, keyEquivalent: "")
         subtitle.isEnabled = false; menu.addItem(subtitle)
         menu.addItem(.separator())
@@ -1350,6 +1357,12 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         button.setAccessibilityLabel("VibeCue" + usage.title(work: work))
     }
 
+    @objc func openAccountQuota() {
+        statusPopover?.performClose(nil)
+        if usageDashboard == nil { usageDashboard = CueUsageDashboardController(home: home) }
+        usageDashboard?.showAccounts()
+        NSApp.activate(ignoringOtherApps: true)
+    }
     @objc func openUsage() {
         statusPopover?.performClose(nil)
         if usageDashboard == nil { usageDashboard = CueUsageDashboardController(home: home) }
@@ -1482,6 +1495,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard ownsLock else { if lockFD >= 0 { Darwin.close(lockFD) }; return }
         shuttingDown = true
         menuUsage?.stop()
+        accountQuotaMonitor?.stop()
         usageDashboard?.stopBackgroundSync()
         conversationWindows.values.forEach { $0.stop() }; conversationClient?.stop(); recoveryClient?.stop()
         approvalLauncher?.terminate()
@@ -2126,6 +2140,8 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results.merge(CueTaskHoverController.validationReport()) { _, new in new }
     results.merge(CueTaskRecoverySnapshot.validationReport()) { _, new in new }
     results.merge(CueConversationController.validationReport()) { _, new in new }
+    results.merge(CueEditingMenu.validationReport()) { _, new in new }
+    results.merge(CueCCAccountsController.validationReport()) { _, new in new }
     results.merge(CueCodexConnection.validationReport()) { _, new in new }
     func event(_ id: String) -> CueEvent {
         CueEvent(try! JSONSerialization.data(withJSONObject: ["id": id, "kind": "complete", "thread_id": "fixture-chat", "title": "验收样例 · " + id, "created_at": Date().timeIntervalSince1970]))!
@@ -2392,6 +2408,10 @@ if CommandLine.arguments.contains("--conversation-renderer-self-test") {
 if let index = CommandLine.arguments.firstIndex(of: "--capture-recent"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared
     exit(CueStatusPopoverController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")) ? 0 : 1)
+}
+if let index = CommandLine.arguments.firstIndex(of: "--capture-account-quota"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    exit(CueCCAccountsController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")) ? 0 : 1)
 }
 if let index = CommandLine.arguments.firstIndex(of: "--capture-conversation"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared

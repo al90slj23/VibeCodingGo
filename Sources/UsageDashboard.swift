@@ -195,7 +195,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private let syncButton = NSButton(title: "立即同步", target: nil, action: nil)
     private let infoButton = NSButton(title: "数据说明", target: nil, action: nil)
     private let moneyButton = NSButton(title: "费用与汇率…", target: nil, action: nil)
-    private let accountsButton = NSButton(title: "CC Switch 额度…", target: nil, action: nil)
+    private let accountsButton = NSButton(title: "Codex 账号额度…", target: nil, action: nil)
     private let syncLabel = NSTextField(labelWithString: "尚未同步")
     private let status = NSTextField(wrappingLabelWithString: "")
     private let metrics = [CueUsageMetric(title: "Tokens 总量"), CueUsageMetric(title: "新增输入"), CueUsageMetric(title: "输出"), CueUsageMetric(title: "缓存命中"), CueUsageMetric(title: "用量记录"), CueUsageMetric(title: "API 参考费用")]
@@ -450,7 +450,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         }
         preferencesController?.showWindow(nil)
     }
-    @objc private func showAccounts() {
+    @objc func showAccounts() {
         if accountController == nil { accountController = CueCCAccountsController(home: home) }
         accountController?.showWindow(nil)
     }
