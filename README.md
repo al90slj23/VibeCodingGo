@@ -4,6 +4,19 @@
 
 ## 外观与分类
 
+0.6 新增菜单栏提醒收件箱和本机历史用量统计。
+
+- **最近提醒**：左键菜单栏图标打开可滚动面板，保存最近 50 条，每次最多显示 12 条（随屏幕高度调整）。蓝色表示尚未通过 VibeCue 打开，灰色表示已发起对话跳转；状态按每条提醒独立记录并在重启后保留。关闭提示卡、提醒超时或批准请求解除都不会冒充“已打开”。右键仍提供快捷菜单。
+- **历史用量**：菜单栏或主面板的“用量统计”打开独立原生窗口，提供时间、应用、模型、来源筛选，Token 分项、缓存命中率、53 周热力图，以及请求日志／模型／来源汇总。请求日志每页 50 条，可滚动查看。当前实现 Codex 与 Claude Code 本地日志，不声称已接入其他工具或 Claude Desktop 的完整历史。
+- **用量口径**：从日志已有的 usage 数字读取，Codex 优先单次用量、缺失时对累计值做差；缓存与 reasoning 按协议去重。历史没有供应商信息时只标为会话来源，缺少模型保留 unknown；不推测供应商、账单、速度或 HTTP 状态。数据说明会展示不可读、暂缓或跳过的记录。
+- **后台同步**：启动后与后台每 10 分钟扫描，打开用量窗口后可手动同步并查看进度，扫描和查询均在后台执行。缓存只保存数字、模型和会话标识，不保存对话正文或凭据，不修改源日志。明细保留在本机私有 `usage.sqlite3`，不进行 30 天删除。
+
+默认读取 `CODEX_HOME`（未设置时为 `~/.codex`）下的 `sessions`、`archived_sessions` 与 `CLAUDE_CONFIG_DIR`（未设置时为 `~/.claude`）下的 `projects`；识别软链接。Codex 的 `.jsonl.zst` 需要本机已有的 `zstd`，没有解码器时明确提示覆盖缺失。需要额外目录时可在 VibeCue 数据目录建立 `usage-sources.json`，只读取列出的来源：
+
+```json
+{"codex_roots": ["/path/to/codex"], "claude_roots": ["/path/to/claude/projects"]}
+```
+
 0.5 在统一配方上加入光影材质：**路径 → 光体／暗部／高光／散射／反射 → 运动 → 出现／消退包络**。推荐 3 种环屏光影跑马灯：柔光流体、珍珠流光、棱镜流光。原 6 种极简方案和 50 个经典 ID 继续可选，并由同一渲染器绘制。材质截面沿屏幕法线着色，亮头和长尾连续流动；这是二维原生绘制的体积与光影表现，不声称是实时三维光线追踪。
 
 - **提示卡**：3 套精修推荐使用真实 AppKit 标准材质和语义文字色，跟随系统明暗；旧 50 套按玻璃、纸张、经典等分类保留。装饰不再伪装为任务进度或音频仪表。
@@ -96,6 +109,7 @@
 build/VibeCue.app/Contents/MacOS/VibeCue --appearance-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --sound-source-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --preview-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --recent-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --window-preview-self-test  # 短暂显示无声测试窗口
 /usr/bin/python3 scripts/check-lighting.py --output /private/tmp/vibecue-lighting-review
 build/VibeCue.app/Contents/MacOS/VibeCue --resolution-self-test
