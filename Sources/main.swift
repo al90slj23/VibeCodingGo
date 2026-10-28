@@ -285,6 +285,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var pending: [CueEvent] = []
     var recent: [CueEvent] = []
     var runningTasks: [CueRunningTask] = []
+    var interruptedTasks: [CueRunningTask] = []
     var taskDetails: [String: CueTaskDetail] = [:]
     var batchController: CueCodexBatchController?
     private var runningTaskSnapshot = Data()
@@ -293,6 +294,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var statusPopover: NSPopover?
     var statusPopoverController: CueStatusPopoverController?
     var usageDashboard: CueUsageDashboardController?
+    private var recoveryClient: CueUsageClient?
     var openConversationURL: (URL) -> Bool = { NSWorkspace.shared.open($0) }
     var seen: [String] = []
     var resolutions = CueResolutionTracker()
@@ -719,7 +721,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
     @objc func openRunningRecent(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
-              let task = runningTasks.first(where: { $0.threadID == id }) else { return }
+              let task = (runningTasks + interruptedTasks).first(where: { $0.threadID == id }) else { return }
         open(event: task.ephemeralCueEvent)
     }
     @objc func toggleMute() {
@@ -821,6 +823,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         var message = "监控进程未连接"
         let previousManual = manualApprovalConnected
         var nextRunningTasks: [CueRunningTask] = []
+        var nextInterruptedTasks: [CueRunningTask] = []
         var nextTaskDetails: [String: CueTaskDetail] = [:]
         var nextRunningSnapshot = Data()
         manualApprovalConnected = false
@@ -836,11 +839,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             }
         }
         let path = home.appendingPathComponent("watcher-state.json")
-        if let data = try? Data(contentsOf: path), data.count <= 2_097_152,
-           let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let savedData = try? Data(contentsOf: path)
+        let state = savedData.flatMap { $0.count <= 2_097_152 ? (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] : nil } ?? [:]
+        var live = false
+        if
            state["running"] as? Bool == true,
            let heartbeat = state["heartbeat"] as? Double,
            (0...15).contains(Date().timeIntervalSince1970 - heartbeat) {
+            live = true
             if let manual = state["manual_approval"] as? [String: Any] {
                 manualApprovalConnected = manual["connected"] as? Bool == true
                 if manualApprovalConnected { manualApprovalStatus = "人工批准监听已连接" }
@@ -862,8 +868,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 message = "本机监控中 · \(count) 个对话"
             }
         }
+        let recovery = CueTaskRecoverySnapshot.read(home: home, state: state, live: live)
+        if let recoveryError = state["task_recovery_error"] as? String, !recoveryError.isEmpty { message += " · 中断记录保存异常" }
+        nextInterruptedTasks = recovery.tasks.filter { task in !nextRunningTasks.contains { $0.threadID == task.threadID } }
+        for task in nextInterruptedTasks { if let detail = recovery.details[task.threadID] { nextTaskDetails[task.threadID] = detail } }
+        let recoveryRows = nextInterruptedTasks.map { ["thread_id": $0.threadID, "title": $0.title, "status": $0.recoveryStatus, "reason": $0.recoveryReason, "interrupted_at": $0.interruptedAt?.timeIntervalSince1970 ?? 0, "last_activity": $0.updatedDate.timeIntervalSince1970] as [String: Any] }
+        if let recoveryData = try? JSONSerialization.data(withJSONObject: recoveryRows, options: [.sortedKeys]) { nextRunningSnapshot.append(recoveryData) }
         let runningChanged = runningTaskSnapshot != nextRunningSnapshot
-        runningTasks = nextRunningTasks; taskDetails = nextTaskDetails; runningTaskSnapshot = nextRunningSnapshot
+        runningTasks = nextRunningTasks; interruptedTasks = nextInterruptedTasks; taskDetails = nextTaskDetails; runningTaskSnapshot = nextRunningSnapshot
         if watcherHealthText != message || runningChanged {
             watcherHealthText = message
             if statusItem != nil { refreshMenu() }
@@ -1120,7 +1132,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             item.target = self; item.representedObject = kind; item.isEnabled = !muted; audioMenu.addItem(item)
         }
         let audioTests = NSMenuItem(title: "只测试提示音", action: nil, keyEquivalent: ""); audioTests.submenu = audioMenu; menu.addItem(audioTests)
-        if !recent.isEmpty || !runningTasks.isEmpty {
+        if !recent.isEmpty || !runningTasks.isEmpty || !interruptedTasks.isEmpty {
             menu.addItem(.separator())
             func heading(_ title: String) {
                 let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
@@ -1146,7 +1158,15 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                     item.target = self; item.representedObject = task.threadID; menu.addItem(item)
                 }
             }
-            let activeIDs = Set(runningTasks.map(\.threadID))
+            let interrupted = interruptedTasks.filter { !pinnedThreads.contains($0.threadID) }
+            if !interrupted.isEmpty {
+                heading("中断待续 · \(interrupted.count) 项")
+                for task in interrupted {
+                    let item = NSMenuItem(title: "⚠ \(task.title.prefix(52)) · \(task.recoveryLabel)", action: #selector(openRunningRecent(_:)), keyEquivalent: "")
+                    item.target = self; item.representedObject = task.threadID; item.toolTip = task.recoveryReason; menu.addItem(item)
+                }
+            }
+            let activeIDs = Set((runningTasks + interruptedTasks).map(\.threadID))
             let ordinary = recentHistory.records.filter { !$0.isPinned && !($0.event.provider == "codex" && activeIDs.contains($0.event.threadID)) }
             if !ordinary.isEmpty { heading("历史提醒 · \(ordinary.count) 条"); ordinary.forEach(reminder) }
         }
@@ -1155,7 +1175,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         exit.target = self; menu.addItem(exit)
         shortcutMenu = menu
         statusItem.button?.title = recentHistory.unopenedCount > 0 ? " \(recentHistory.unopenedCount)" : ""
-        statusItem.button?.toolTip = "VibeCue · \(recentHistory.unopenedCount) 条未读提醒 · \(runningTasks.count) 个任务正在运行"
+        statusItem.button?.toolTip = "VibeCue · \(recentHistory.unopenedCount) 条未读提醒 · \(runningTasks.count) 个任务正在运行 · \(interruptedTasks.count) 个中断待续"
         if statusPopover?.isShown == true { updateStatusPopover() }
     }
 
@@ -1206,6 +1226,16 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 },
                 connectCodex: { [weak self] in
                     self?.statusPopover?.performClose(nil); self?.connectManualApproval()
+                }, dismissInterrupted: { [weak self] task in
+                    guard let self, let interrupted = task.interruptedAt else { return }
+                    if self.recoveryClient == nil { self.recoveryClient = CueUsageClient(home: self.home) }
+                    self.recoveryClient?.run(["dismiss", "--thread-id", task.threadID, "--turn-id", task.turnID, "--interrupted-at", String(interrupted.timeIntervalSince1970)], module: "vibecue.providers.task_recovery") { [weak self] result in
+                        guard let self else { return }
+                        switch result {
+                        case .success: self.nextHealthCheck = .distantPast; self.updateWatcherHealth()
+                        case .failure(let error): self.watcherLaunchError = error.localizedDescription; self.settingsPanel?.updateHealth()
+                        }
+                    }
                 })
             statusPopoverController = CueStatusPopoverController(history: recentHistory, actions: actions)
             let popover = NSPopover(); popover.behavior = .transient
@@ -1221,7 +1251,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
         let height = min(900, (screen?.visibleFrame.height ?? 900) - 52)
         statusPopoverController?.update(status: watcherHealthText, enabled: settings.enabled,
-                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected)
+                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks, interruptedTasks: interruptedTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected)
         if let controller = statusPopoverController, controller.isViewLoaded { statusPopover?.contentSize = controller.preferredContentSize }
     }
 
@@ -1920,6 +1950,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results.merge(CueStatusPopoverController.validationReport()) { _, new in new }
     results.merge(CueCodexBatchController.validationReport()) { _, new in new }
     results.merge(CueTaskHoverController.validationReport()) { _, new in new }
+    results.merge(CueTaskRecoverySnapshot.validationReport()) { _, new in new }
     func event(_ id: String) -> CueEvent {
         CueEvent(try! JSONSerialization.data(withJSONObject: ["id": id, "kind": "complete", "thread_id": "fixture-chat", "title": "验收样例 · " + id, "created_at": Date().timeIntervalSince1970]))!
     }
@@ -2054,7 +2085,7 @@ if CommandLine.arguments.contains("--preview-self-test") {
     cue.applySettings(updateCurrent: false)
     results["random_selection_stays_stable_during_one_preview"] = cue.resolvedFields == selected && cue.lastPlayedSoundToken == selected["sound"]
     results["random_snapshot_uses_real_catalog_ids"] = CueEffectCatalog.presets.contains { $0.id == selected["effect"] } && CueCardCatalog.presets.contains { $0.id == selected["card_style"] } && CueSoundCatalog.contains(id: selected["sound"] ?? "")
-    results["multi_tag_filter_unions_sources"] = CuePresetCategory.sound.filtered(tags: ["nature", "urban"]).count == 8
+    results["multi_tag_filter_unions_sources"] = Set(CuePresetCategory.sound.filtered(tags: ["nature", "urban"]).map(\.id)) == Set(CueSoundCatalog.presets.filter { !$0.tags.filter { ["nature", "urban"].contains($0) }.isEmpty }.map(\.id))
     results["tag_search_filters_visible_names"] = CuePresetCategory.sound.filtered(tags: ["nature"], search: "雨").map(\.id) == ["nature-rain"]
     results["recommended_filter_excludes_classic"] = CuePresetCategory.effect.filtered(tags: ["recommended"]).count == CueEffectCatalog.recommendedPresets.count && CuePresetCategory.card.filtered(tags: ["native"]).count == 3
     var oldLook = CueSettings(json: ["sound_enabled": false, "sound_volume": 0.3, "event_styles": ["input": ["effect": "random", "sound": "nature-rain", "color": "#123456"]]])
@@ -2174,6 +2205,18 @@ if CommandLine.arguments.contains("--sound-source-self-test") {
     try? FileManager.default.removeItem(at: directory)
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
     exit(results.allSatisfy { $0["started"] as? Bool == true && $0["playing_after_100ms"] as? Bool == true } ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--usage-money-self-test") {
+    _ = NSApplication.shared
+    let results = CueUsagePreferencesController.validationReport()
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-preferences"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do { try CueUsagePreferencesController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
+    catch { print("费用与汇率设置截图失败"); exit(1) }
 }
 
 let app = NSApplication.shared

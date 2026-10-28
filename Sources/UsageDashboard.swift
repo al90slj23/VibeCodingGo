@@ -15,7 +15,7 @@ final class CueUsageClient {
         for process in processes where process.isRunning { process.terminate() }
     }
 
-    func run(_ arguments: [String], completion: @escaping (Result<[String: Any], Error>) -> Void) {
+    func run(_ arguments: [String], module: String = "vibecue.usage", input: Data? = nil, completion: @escaping (Result<[String: Any], Error>) -> Void) {
         let home = self.home
         DispatchQueue.global(qos: .utility).async {
             let id = UUID()
@@ -24,7 +24,7 @@ final class CueUsageClient {
                 let runtime = try Self.runtime(home: home)
                 let process = Process(), output = Pipe(), errors = Pipe()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-                process.arguments = ["-m", "vibecue.usage"] + arguments
+                process.arguments = ["-m", module] + arguments
                 process.currentDirectoryURL = runtime
                 let inherited = ProcessInfo.processInfo.environment
                 // Keep path/locale settings needed to find logs, but do not
@@ -40,10 +40,13 @@ final class CueUsageClient {
                 environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
                 process.environment = environment
                 process.standardOutput = output; process.standardError = errors
+                let inputPipe = Pipe()
+                process.standardInput = input == nil ? FileHandle.nullDevice : inputPipe
                 self.lock.lock()
                 if self.stopped { self.lock.unlock(); throw Self.error("用量采集已停止。") }
                 do { try process.run(); self.active[id] = process; self.lock.unlock() }
                 catch { self.lock.unlock(); throw error }
+                if let input { inputPipe.fileHandleForWriting.write(input); try? inputPipe.fileHandleForWriting.close() }
                 // Drain stderr concurrently: an unread error pipe must never
                 // stall the collector while stdout is being read.
                 let group = DispatchGroup(), stderr = CueUsageByteBuffer(limit: 16_384)
@@ -190,9 +193,11 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private let range = NSPopUpButton(), app = NSPopUpButton(), model = NSPopUpButton(), source = NSPopUpButton()
     private let syncButton = NSButton(title: "立即同步", target: nil, action: nil)
     private let infoButton = NSButton(title: "数据说明", target: nil, action: nil)
+    private let moneyButton = NSButton(title: "费用与汇率…", target: nil, action: nil)
+    private let accountsButton = NSButton(title: "CC Switch 额度…", target: nil, action: nil)
     private let syncLabel = NSTextField(labelWithString: "尚未同步")
     private let status = NSTextField(wrappingLabelWithString: "")
-    private let metrics = [CueUsageMetric(title: "Tokens 总量"), CueUsageMetric(title: "新增输入"), CueUsageMetric(title: "输出"), CueUsageMetric(title: "缓存命中"), CueUsageMetric(title: "用量记录")]
+    private let metrics = [CueUsageMetric(title: "Tokens 总量"), CueUsageMetric(title: "新增输入"), CueUsageMetric(title: "输出"), CueUsageMetric(title: "缓存命中"), CueUsageMetric(title: "用量记录"), CueUsageMetric(title: "API 参考费用")]
     private let heatmapTitle = NSTextField(labelWithString: "最近 53 周")
     private let heatmap = CueUsageHeatmap()
     private let tabs = NSSegmentedControl(labels: ["请求日志", "模型", "来源"], trackingMode: .selectOne, target: nil, action: nil)
@@ -213,6 +218,10 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var syncError = ""
     private var queryError = ""
     private var warnings: [String] = []
+    private var preferencesController: CueUsagePreferencesController?
+    private var exchangeRefreshing = false
+    private var lastExchangeRefresh = Date.distantPast
+    private var accountController: CueCCAccountsController?
     private var currentView: String { ["logs", "models", "sources"][max(0, min(2, tabs.selectedSegment))] }
 
     init(home: URL) {
@@ -228,8 +237,9 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         heatmapTitle.font = .systemFont(ofSize: 12, weight: .medium); heatmapTitle.textColor = .secondaryLabelColor
         pageLabel.font = .systemFont(ofSize: 11); pageLabel.textColor = .secondaryLabelColor
         detail.font = .systemFont(ofSize: 10.5); detail.textColor = .secondaryLabelColor; detail.lineBreakMode = .byTruncatingTail
-        for control in [syncButton, infoButton, previous, next] { control.bezelStyle = .rounded; control.target = self }
+        for control in [syncButton, infoButton, moneyButton, accountsButton, previous, next] { control.bezelStyle = .rounded; control.target = self }
         syncButton.action = #selector(syncNow); infoButton.action = #selector(showInfo)
+        moneyButton.action = #selector(showMoneyPreferences); accountsButton.action = #selector(showAccounts)
         previous.action = #selector(previousPage); next.action = #selector(nextPage)
         syncButton.identifier = NSUserInterfaceItemIdentifier("usage.sync")
         for (control, key) in [(range, "range"), (app, "app"), (model, "model"), (source, "source")] {
@@ -247,7 +257,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         table.setAccessibilityLabel("历史用量请求日志")
         scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true; scroll.borderType = .bezelBorder
-        let views: [NSView] = [titleLabel, subtitle, range, app, model, source, syncButton, infoButton, syncLabel, status, heatmapTitle, heatmap, tabs, scroll, pageLabel, previous, next, detail] + metrics
+        let views: [NSView] = [titleLabel, subtitle, range, app, model, source, syncButton, infoButton, moneyButton, accountsButton, syncLabel, status, heatmapTitle, heatmap, tabs, scroll, pageLabel, previous, next, detail] + metrics
         views.forEach { surface.addSubview($0) }
         surface.onLayout = { [weak self] in self?.layout() }
         surface.onAppearance = { [weak self] in self?.metrics.forEach { $0.needsDisplay = true }; self?.heatmap.needsDisplay = true }
@@ -259,11 +269,13 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender); window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         query()
+        refreshExchange()
         if Date().timeIntervalSince(lastSync) > 60 { synchronize() }
         visibleTimer?.invalidate()
-        visibleTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        visibleTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let self, self.window?.isVisible == true, !self.window!.isMiniaturized else { return }
             self.query()
+            self.refreshExchange()
             if Date().timeIntervalSince(self.lastSync) > 60 { self.synchronize() }
         }
         if let visibleTimer { RunLoop.main.add(visibleTimer, forMode: .common) }
@@ -290,15 +302,17 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
 
     private func layout() {
         let width = surface.bounds.width, height = surface.bounds.height, right = width - 24
-        titleLabel.frame = NSRect(x: 24, y: 23, width: 350, height: 32)
+        titleLabel.frame = NSRect(x: 24, y: 23, width: 260, height: 32)
         subtitle.frame = NSRect(x: 25, y: 62, width: 650, height: 20)
         syncButton.frame = NSRect(x: right - 112, y: 23, width: 112, height: 32)
         infoButton.frame = NSRect(x: right - 214, y: 23, width: 96, height: 32)
+        moneyButton.frame = NSRect(x: right - 348, y: 23, width: 128, height: 32)
+        accountsButton.frame = NSRect(x: right - 505, y: 23, width: 151, height: 32)
         syncLabel.frame = NSRect(x: right - 330, y: 65, width: 330, height: 18)
         let sizes: [CGFloat] = [150, 175, 290, 250], controls = [range, app, model, source]
         var x: CGFloat = 24
         for (index, popup) in controls.enumerated() { popup.frame = NSRect(x: x, y: 100, width: sizes[index], height: 29); x += sizes[index] + 12 }
-        let metricWidth = (width - 48 - 40) / 5
+        let metricWidth = (width - 48 - 50) / 6
         for (index, metric) in metrics.enumerated() { metric.frame = NSRect(x: 24 + CGFloat(index) * (metricWidth + 10), y: 145, width: metricWidth, height: 101) }
         heatmapTitle.frame = NSRect(x: 25, y: 264, width: 800, height: 19)
         heatmap.frame = NSRect(x: 25, y: 292, width: width - 50, height: 155)
@@ -381,6 +395,18 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         let hit = number(summary, "cache_hit_rate")
         metrics[3].detail.stringValue = String(format: "命中率 %.1f%% · 写入 %@", max(0, min(1, hit)) * 100, Self.compact(number(summary, "cache_creation_tokens")))
         metrics[4].detail.stringValue = "已解析的请求用量记录"
+        let money = data["money"] as? [String: Any] ?? [:], prefs = money["prefs"] as? [String: Any] ?? [:]
+        let currency = prefs["currency"] as? String ?? "CNY"
+        metrics[5].value.font = .monospacedDigitSystemFont(ofSize: currency == "both" ? 14 : 21, weight: .semibold)
+        metrics[5].value.stringValue = CueUsageMoney.display(summary, currency: currency, compact: true)
+        let unpriced = Int(number(summary, "unpriced_requests"))
+        metrics[5].detail.stringValue = unpriced > 0 ? "\(Self.integer(Double(unpriced))) 条未定价 · 已定价小计" : "按模型 API 单价估算"
+        let fx = money["fx"] as? [String: Any] ?? [:]
+        metrics[5].value.toolTip = CueUsageMoney.display(summary, currency: "both") + "\nAPI 参考估算，非订阅扣费。\n" + ((fx["rate"] as? NSNumber).map { "1 USD = \($0.stringValue) CNY · \(fx["date"] as? String ?? "")" } ?? "尚无人民币换算汇率")
+        if fx["stale"] as? Bool == true {
+            metrics[5].value.toolTip = (metrics[5].value.toolTip ?? "") + "\n缓存汇率，可能已过期。" + (fx["error"] as? String ?? "")
+            if currency != "USD" { metrics[5].detail.stringValue += " · 缓存汇率" }
+        }
         heatmap.days = data["days"] as? [[String: Any]] ?? []
         heatmapTitle.stringValue = "最近 53 周 · 当前应用、模型和来源"
         rows = data[currentView] as? [[String: Any]] ?? []
@@ -408,13 +434,30 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         if !error.isEmpty { status.stringValue = error; status.textColor = .systemRed; status.toolTip = error }
         else if rebuilding && busy { status.stringValue = "正在按分叉历史去重规则重建 Codex 用量，已导入部分仍可查看。"; status.textColor = .secondaryLabelColor; status.toolTip = syncMetadata["rebuild_reason"] as? String }
         else if !warnings.isEmpty { status.stringValue = "部分记录未导入 · \(warnings.count) 项，请查看数据说明"; status.textColor = .systemOrange; status.toolTip = warnings.joined(separator: "\n") }
-        else { status.stringValue = busy ? "同步在后台进行，已有统计每 5 秒更新。" : "本机用量记录 · 不含账单估算"; status.textColor = .secondaryLabelColor; status.toolTip = nil }
+        else { status.stringValue = busy ? "同步在后台进行，已有统计持续更新。" : "本机用量记录 · 费用为 API 参考估算"; status.textColor = .secondaryLabelColor; status.toolTip = nil }
     }
 
     @objc private func changeFilter(_ sender: NSPopUpButton) { page = 1; query(invalidate: true) }
     @objc private func changeTab() { page = 1; configureColumns(); query(invalidate: true) }
     @objc private func previousPage() { guard page > 1 else { return }; page -= 1; query(invalidate: true) }
     @objc private func nextPage() { guard page < pages else { return }; page += 1; query(invalidate: true) }
+    @objc private func showMoneyPreferences() {
+        if preferencesController == nil {
+            let filters = snapshot["filters"] as? [String: Any] ?? [:]
+            let known = (filters["models"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
+            preferencesController = CueUsagePreferencesController(home: home, knownModels: known) { [weak self] in self?.query(invalidate: true) }
+        }
+        preferencesController?.showWindow(nil)
+    }
+    @objc private func showAccounts() {
+        if accountController == nil { accountController = CueCCAccountsController(home: home) }
+        accountController?.showWindow(nil)
+    }
+    private func refreshExchange() {
+        guard !exchangeRefreshing, Date().timeIntervalSince(lastExchangeRefresh) > 900 else { return }
+        exchangeRefreshing = true; lastExchangeRefresh = Date()
+        client.run(["refresh"], module: "vibecue.usage_money") { [weak self] _ in self?.exchangeRefreshing = false; self?.query() }
+    }
     @objc private func showInfo() {
         let sync = snapshot["sync"] as? [String: Any] ?? [:]
         let coverage = sync["coverage"] as? [[String: Any]] ?? []
@@ -429,6 +472,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             text += "\n\n导入提示：\n" + warnings.prefix(8).joined(separator: "\n")
             text += "\n暂缓文件：\(Int(number(sync, "deferred_files")))；损坏记录：\(Int(number(sync, "malformed_records")))；超过读取上限：\(Int(number(sync, "oversized_records")))。"
         }
+        text += "\n\nAPI 参考费用按当前 CC Switch 或自定义模型单价重新估算：新增输入 × 输入单价 + 输出 × 输出单价 + 缓存读取 × 读取单价 + 缓存创建 × 写入单价。四项单价均为美元／百万 Tokens，不重复计算缓存。未知模型保持未定价，汇总仅包含已定价小计；日志未记录的长上下文、服务档位及协议优惠差价不自动推断。此金额不能换算为订阅每周额度。\n\n人民币可使用自定义汇率或 Frankfurter 公开日参考汇率；自动每 6 小时检查，失败时保留带日期的缓存并标记过期。"
         alert.informativeText = text; alert.addButton(withTitle: "知道了")
         if let window { alert.beginSheetModal(for: window) } else { alert.runModal() }
     }
@@ -439,7 +483,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         if currentView == "logs" { columns = [("timestamp", "时间", 145), ("app", "应用", 95), ("source", "来源", 118), ("model", "模型", 170)] }
         else if currentView == "models" { columns = [("model", "模型", 225), ("requests", "记录数", 95)] }
         else { columns = [("app", "应用", 110), ("source", "来源", 210), ("requests", "记录数", 95)] }
-        columns += [("input_tokens", "新增输入", 91), ("output_tokens", "输出", 86), ("cache_read_tokens", "缓存读取", 96), ("cache_creation_tokens", "缓存写入", 96), ("total_tokens", "总 Tokens", 100)]
+        columns += [("cost", "API 参考费用", 150), ("input_tokens", "新增输入", 91), ("output_tokens", "输出", 86), ("cache_read_tokens", "缓存读取", 96), ("cache_creation_tokens", "缓存写入", 96), ("total_tokens", "总 Tokens", 100)]
         for (key, title, width) in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key)); column.title = title
             column.width = width; column.minWidth = min(70, width); column.resizingMask = .userResizingMask
@@ -460,7 +504,12 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             NSLayoutConstraint.activate([text.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4), text.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4), text.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
         }
         let data = rows[row], field = cell.textField!
-        if key.hasSuffix("tokens") || key == "requests" {
+        if key == "cost" {
+            let money = snapshot["money"] as? [String: Any] ?? [:], prefs = money["prefs"] as? [String: Any] ?? [:]
+            field.stringValue = CueUsageMoney.display(data, currency: prefs["currency"] as? String ?? "CNY")
+            if number(data, "unpriced_requests") > 0, number(data, "priced_requests") > 0 { field.stringValue += " *" }
+            field.alignment = .right; field.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
+        } else if key.hasSuffix("tokens") || key == "requests" {
             field.stringValue = Self.integer(number(data, key)); field.alignment = .right; field.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
         } else {
             field.alignment = .left; field.font = .systemFont(ofSize: 11.5)

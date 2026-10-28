@@ -1,6 +1,6 @@
 """Read-only local usage importers and a private, durable token ledger.
 
-No transcript body, credentials, price estimate or inferred provider is stored.
+No transcript body, credentials or inferred provider is stored in the ledger.
 The cache keeps request detail so moving a source or rescanning old logs cannot
 add an already imported request a second time. Sources are opened read-only.
 """
@@ -862,21 +862,30 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
     page = max(1,int(page));page_size=min(200,max(1,int(page_size)))
     sums = ','.join('COALESCE(SUM('+key+'),0) AS '+key for key in TOKEN_COLUMNS+('total_tokens',))
     with closing(connect(home)) as conn:
-        row = conn.execute('SELECT COUNT(*) AS requests,'+sums+' FROM usage_requests'+where,params).fetchone()
-        summary = dict(row)
+        # A full-history timestamp upper bound matches almost every row. Its
+        # timestamp index would visit the ledger in random order on disk; one
+        # sequential scan is cheaper. Selective filters keep SQLite's planner.
+        aggregate_table = 'usage_requests NOT INDEXED' if start is None and not base_clauses else 'usage_requests'
+        price_groups = [dict(r) for r in conn.execute(
+            'SELECT app,source,model,COUNT(*) AS requests,'+sums+
+            ' FROM '+aggregate_table+where+' GROUP BY app,source,model', params)]
+        total_columns = ('requests',)+TOKEN_COLUMNS+('total_tokens',)
+        summary = {key:sum(row[key] for row in price_groups) for key in total_columns}
         cacheable = summary['input_tokens']+summary['cache_read_tokens']+summary['cache_creation_tokens']
         summary['cache_hit_rate'] = summary['cache_read_tokens']/cacheable if cacheable else 0
-        group_columns = {'models':'model','sources':'source,app'}
-        groups={}
-        for name,columns in group_columns.items():
-            # Only the visible tab needs a grouped scan. Historical ledgers
-            # can contain millions of rows; do not aggregate two hidden tabs
-            # on every request-page refresh.
-            if name != view:
-                groups[name] = []
-                continue
-            groups[name]=[dict(r) for r in conn.execute('SELECT '+columns+',COUNT(*) AS requests,'+sums+
-                         ' FROM usage_requests'+where+' GROUP BY '+columns+' ORDER BY total_tokens DESC,'+columns,params)]
+        # The full filtered model/source aggregate already supplies every
+        # token and count needed by the summary and the visible grouping tab.
+        # Fold these small groups rather than rescanning all requests twice.
+        groups={'models':[],'sources':[]}
+        if view in groups:
+            columns = ('model',) if view=='models' else ('source','app')
+            folded = {}
+            for row in price_groups:
+                key = tuple(row[column] for column in columns)
+                target = folded.setdefault(key, dict(zip(columns,key), **{column:0 for column in total_columns}))
+                for column in total_columns:
+                    target[column] += row[column]
+            groups[view] = sorted(folded.values(),key=lambda row:(-row['total_tokens'],)+tuple(row[column] for column in columns))
         total = summary['requests'] if view=='logs' else len(groups.get(view,[]))
         pages=max(1,(total+page_size-1)//page_size)
         page=min(page,pages)
@@ -885,7 +894,8 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
         heat_start=(end.date()-timedelta(days=370)).isoformat()
         heat_clauses=base_clauses+['date>=?','timestamp<=?']
         heat_params=base_params+[heat_start,now]
-        days=[dict(r) for r in conn.execute('SELECT date,SUM(total_tokens) AS tokens,COUNT(*) AS requests FROM usage_requests WHERE '+
+        heat_table = 'usage_requests NOT INDEXED' if not base_clauses else 'usage_requests'
+        days=[dict(r) for r in conn.execute('SELECT date,SUM(total_tokens) AS tokens,COUNT(*) AS requests FROM '+heat_table+' WHERE '+
                ' AND '.join(heat_clauses)+' GROUP BY date ORDER BY date',heat_params)]
         sources = dict(SOURCES)
         for source_row in conn.execute('SELECT DISTINCT source FROM usage_requests ORDER BY source'):
@@ -912,7 +922,9 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
                 'sources':groups['sources'][(page-1)*page_size:page*page_size] if view=='sources' else groups['sources'][:200],
                 'filters':filters,'pagination':{'total':total,'page':page,'page_size':page_size,'pages':pages},
                 'sync':metadata,'supported_apps':list(APPS),'view':view,'range':period,
-                'coverage_note':'读取仍保留的本机会话 usage；供应商、费用、网络状态和真实首字速度不由日志推测。'}
+                'coverage_note':'读取仍保留的本机会话 usage；费用为 API 单价参考估算，不是订阅账单。'}
+        from . import usage_money
+        usage_money.decorate(home, result, price_groups, now=now)
         return result
 
 

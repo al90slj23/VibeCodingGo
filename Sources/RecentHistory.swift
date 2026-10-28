@@ -9,6 +9,9 @@ struct CueRunningTask {
     let startDate: Date
     let updatedDate: Date
     let turnID: String
+    let recoveryStatus: String
+    let interruptedAt: Date?
+    let recoveryReason: String
 
     init?(raw: [String: Any]) {
         guard let threadID = raw["thread_id"] as? String, !threadID.isEmpty, threadID.count <= 160,
@@ -20,6 +23,9 @@ struct CueRunningTask {
         self.title = String((raw["title"] as? String ?? "Codex 对话").prefix(180))
         self.provider = "codex"; self.startDate = startDate; self.updatedDate = updatedDate
         self.turnID = String((raw["turn_id"] as? String ?? "").prefix(160))
+        self.recoveryStatus = ["interrupted", "unconfirmed"].contains(raw["status"] as? String ?? "") ? (raw["status"] as? String ?? "") : "running"
+        self.interruptedAt = Self.date(raw["interrupted_at"])
+        self.recoveryReason = String((raw["reason_text"] as? String ?? "").prefix(300))
     }
 
     private static func date(_ raw: Any?) -> Date? {
@@ -29,7 +35,9 @@ struct CueRunningTask {
         return formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
     }
 
-    var navigationID: String { "running:\(threadID)" }
+    var needsRecovery: Bool { recoveryStatus != "running" }
+    var recoveryLabel: String { recoveryStatus == "interrupted" ? "中断待续" : "运行待确认" }
+    var navigationID: String { "\(needsRecovery ? "interrupted" : "running"):\(threadID)" }
     var ephemeralCueEvent: CueEvent { CueEvent(runningThreadID: threadID, title: title, date: startDate) }
 }
 
@@ -37,13 +45,15 @@ struct CueRunningTask {
 private struct CueStatusListSnapshot {
     let pinned: [CueRecentRecord]
     let running: [CueRunningTask]
+    let interrupted: [CueRunningTask]
     let ordinary: [CueRecentRecord]
     let activeThreadIDs: Set<String>
     let activeCount: Int
-    var rowCount: Int { pinned.count + running.count + ordinary.count }
-    var sectionCount: Int { [!pinned.isEmpty, !running.isEmpty, !ordinary.isEmpty].filter { $0 }.count }
+    let recoveryByThread: [String: CueRunningTask]
+    var rowCount: Int { pinned.count + running.count + interrupted.count + ordinary.count }
+    var sectionCount: Int { [!pinned.isEmpty, !running.isEmpty, !interrupted.isEmpty, !ordinary.isEmpty].filter { $0 }.count }
 
-    init(records: [CueRecentRecord], runningTasks: [CueRunningTask]) {
+    init(records: [CueRecentRecord], runningTasks: [CueRunningTask], interruptedTasks: [CueRunningTask] = []) {
         var latestByThread: [String: CueRunningTask] = [:]
         for task in runningTasks {
             if let previous = latestByThread[task.threadID], previous.updatedDate >= task.updatedDate { continue }
@@ -58,7 +68,14 @@ private struct CueStatusListSnapshot {
         pinned = records.filter(\.isPinned)
         let pinnedThreadIDs = Set(pinned.filter { $0.event.provider == "codex" }.map { $0.event.threadID })
         running = active.filter { !pinnedThreadIDs.contains($0.threadID) }
-        ordinary = records.filter { !$0.isPinned && !($0.event.provider == "codex" && activeIDs.contains($0.event.threadID)) }
+        var recovery: [String: CueRunningTask] = [:]
+        for task in interruptedTasks where task.needsRecovery && !activeIDs.contains(task.threadID) {
+            if let old = recovery[task.threadID], (old.interruptedAt ?? old.updatedDate) >= (task.interruptedAt ?? task.updatedDate) { continue }
+            recovery[task.threadID] = task
+        }
+        recoveryByThread = recovery
+        interrupted = recovery.values.filter { !pinnedThreadIDs.contains($0.threadID) }.sorted { ($0.interruptedAt ?? $0.updatedDate) > ($1.interruptedAt ?? $1.updatedDate) }
+        ordinary = records.filter { !$0.isPinned && !($0.event.provider == "codex" && (activeIDs.contains($0.event.threadID) || recovery[$0.event.threadID] != nil)) }
     }
 }
 
@@ -274,11 +291,13 @@ struct CueStatusPopoverActions {
     var historyChanged: () -> Void = {}
     var batchConfigure: ([CueBatchTarget]) -> Void = { _ in }
     var connectCodex: () -> Void = {}
+    var dismissInterrupted: (CueRunningTask) -> Void = { _ in }
 }
 
 private final class CueRecentRowButton: NSButton {
     private(set) var record: CueRecentRecord
     private(set) var isRunning: Bool
+    private var recovery: CueRunningTask?
     var selected = false { didSet { needsDisplay = true } }
     var selectRow: (() -> Void)?
     var contextMenu: (() -> NSMenu)?
@@ -316,9 +335,10 @@ private final class CueRecentRowButton: NSButton {
         setAccessibilityLabel("\(isRunning ? "当前正在运行，" : "")\(state)，\(record.isPinned ? "已置顶，" : "")\(kind)，\(record.event.title)，\(date.string(from: record.event.date))")
         setAccessibilityHelp("点击打开对话；右键可标为未读、置顶或从列表删除。")
     }
-    func refresh(record: CueRecentRecord?, isRunning: Bool) {
+    func refresh(record: CueRecentRecord?, isRunning: Bool, recovery: CueRunningTask? = nil) {
         if let record { self.record = record }
         self.isRunning = isRunning
+        self.recovery = isRunning ? nil : recovery
         let record = self.record
         let tint: NSColor = record.isOpened ? .secondaryLabelColor : .systemBlue
         let kind = record.resolved ? (record.event.kind == "permission" ? "人工批准已解除" : "等待已解除") : record.event.label
@@ -328,7 +348,7 @@ private final class CueRecentRowButton: NSButton {
                 switch field.identifier?.rawValue {
                 case "row-title": field.stringValue = record.event.title; field.textColor = record.isOpened ? .secondaryLabelColor : .labelColor
                 case "row-metadata": field.stringValue = "\(isRunning ? "上次提醒：" : "")\(kind) · \(date.string(from: record.event.date))\(record.isPinned ? " · 置顶" : "")"
-                case "row-state": field.stringValue = isRunning ? (record.isOpened ? "运行中 · 已打开" : "运行中 · 未读") : record.isOpened ? (record.manualPinned ? "已打开 · 置顶" : "已打开") : record.canOpen ? "未读 · 置顶" : "不可跳转"; field.textColor = isRunning ? .systemGreen : tint
+                case "row-state": field.stringValue = recovery?.recoveryLabel ?? (isRunning ? (record.isOpened ? "运行中 · 已打开" : "运行中 · 未读") : record.isOpened ? (record.manualPinned ? "已打开 · 置顶" : "已打开") : record.canOpen ? "未读 · 置顶" : "不可跳转"); field.textColor = recovery != nil ? .systemOrange : isRunning ? .systemGreen : tint
                 default: break
                 }
             } else if let icon = view as? NSImageView, icon.identifier?.rawValue == "row-icon" {
@@ -337,6 +357,7 @@ private final class CueRecentRowButton: NSButton {
         }
         let state = record.isOpened ? "已从 VibeCue 打开" : "未读"
         setAccessibilityLabel("\(isRunning ? "当前正在运行，" : "")\(state)，\(record.isPinned ? "已置顶，" : "")\(kind)，\(record.event.title)，\(date.string(from: record.event.date))")
+        if let recovery { toolTip = "\(record.event.title)\n\(recovery.recoveryLabel)：\(recovery.recoveryReason)\n打开对话不会自动清除此标记；继续运行后自动更新。" }
         needsDisplay = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -382,6 +403,7 @@ private final class CueRunningRowButton: NSButton {
     var selected = false { didSet { needsDisplay = true } }
     var selectRow: (() -> Void)?
     var hoverChanged: ((Bool) -> Void)?
+    var contextMenu: (() -> NSMenu)?
     private var hovered = false
     private var tracking: NSTrackingArea?
     init(task: CueRunningTask, width: CGFloat) {
@@ -416,25 +438,27 @@ private final class CueRunningRowButton: NSButton {
     }
     func refresh(task: CueRunningTask?, detail: CueTaskDetail?) {
         if let task { self.task = task }
-        live = task != nil
+        live = task != nil && task?.needsRecovery != true
         var status = detail?.status ?? "unknown"
         if live { status = "running" }
         else if status == "running" { status = "unknown" }
-        let label = ["running": "● 运行中", "waiting": "待处理", "complete": "已完成", "aborted": "已中止"][status] ?? "状态待确认"
-        let tint: NSColor = live ? .systemGreen : status == "waiting" ? .systemOrange : .secondaryLabelColor
+        let recovering = task?.needsRecovery == true
+        let label = recovering ? self.task.recoveryLabel : ["running": "● 运行中", "waiting": "待处理", "complete": "已完成", "aborted": "已中止"][status] ?? "状态待确认"
+        let tint: NSColor = recovering ? .systemOrange : live ? .systemGreen : status == "waiting" ? .systemOrange : .secondaryLabelColor
         let date = DateFormatter(); date.locale = Locale(identifier: "zh_CN"); date.dateFormat = "HH:mm"
         let origin = detail?.elapsedStatus == "complete" ? "开始" : "观测起点"
         for view in subviews {
             if let field = view as? NSTextField {
                 switch field.identifier?.rawValue {
                 case "row-title": field.stringValue = self.task.title
-                case "row-metadata": field.stringValue = "Codex · \(origin) \(date.string(from: self.task.startDate)) · 最近活动 \(date.string(from: task?.updatedDate ?? detail?.lastActivity ?? self.task.updatedDate))"
+                case "row-metadata": field.stringValue = recovering ? "Codex · 最后活动 \(date.string(from: self.task.updatedDate)) · 点击打开后手动继续" : "Codex · \(origin) \(date.string(from: self.task.startDate)) · 最近活动 \(date.string(from: task?.updatedDate ?? detail?.lastActivity ?? self.task.updatedDate))"
                 case "row-state": field.stringValue = label; field.textColor = tint
                 default: break
                 }
-            } else if let icon = view as? NSImageView { icon.contentTintColor = tint }
+            } else if let icon = view as? NSImageView { icon.contentTintColor = tint; icon.image = NSImage(systemSymbolName: recovering ? "exclamationmark.arrow.triangle.2.circlepath" : "bolt.horizontal.circle", accessibilityDescription: nil) }
         }
         setAccessibilityLabel("\(label)，\(self.task.title)，\(origin) \(date.string(from: self.task.startDate))")
+        if recovering { toolTip = "\(self.task.title)\n\(self.task.recoveryLabel)：\(self.task.recoveryReason)\n仅打开对话；手动继续后由真实运行记录更新状态。" }
         needsDisplay = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -444,7 +468,8 @@ private final class CueRunningRowButton: NSButton {
         if event.modifierFlags.contains(.control) { rightMouseDown(with: event); return }
         selectRow?(); super.mouseDown(with: event)
     }
-    override func rightMouseDown(with event: NSEvent) { selectRow?() }
+    override func rightMouseDown(with event: NSEvent) { selectRow?(); if let menu = contextMenu?() { NSMenu.popUpContextMenu(menu, with: event, for: self) } }
+    override func menu(for event: NSEvent) -> NSMenu? { selectRow?(); return contextMenu?() }
     override func updateTrackingAreas() {
         super.updateTrackingAreas(); if let tracking { removeTrackingArea(tracking) }
         let next = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
@@ -453,7 +478,7 @@ private final class CueRunningRowButton: NSButton {
     override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true; hoverChanged?(true) }
     override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true; hoverChanged?(false) }
     override func draw(_ dirtyRect: NSRect) {
-        (live ? NSColor.systemGreen : .secondaryLabelColor).withAlphaComponent(isHighlighted || selected ? 0.16 : hovered ? 0.10 : 0.045).setFill()
+        (task.needsRecovery ? NSColor.systemOrange : live ? NSColor.systemGreen : .secondaryLabelColor).withAlphaComponent(isHighlighted || selected ? 0.16 : hovered ? 0.10 : 0.045).setFill()
         NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 8, yRadius: 8).fill()
         if selected {
             NSColor.controlAccentColor.withAlphaComponent(0.7).setStroke()
@@ -474,6 +499,7 @@ final class CueStatusPopoverController: NSViewController {
     private var recentDocument: CueFlippedView?
     private var selectedID: String?
     private var runningTasks: [CueRunningTask] = []
+    private var interruptedTasks: [CueRunningTask] = []
     private var taskDetails: [String: CueTaskDetail] = [:]
     private var attentionConnected = false
     private let hoverController = CueTaskHoverController()
@@ -495,9 +521,10 @@ final class CueStatusPopoverController: NSViewController {
         root.backgroundColor = .windowBackgroundColor; view = root
         rebuild()
     }
-    func update(status: String, enabled: Bool, soundEnabled: Bool, paused: Bool, maximumHeight: CGFloat = 900, runningTasks: [CueRunningTask] = [], taskDetails: [String: CueTaskDetail] = [:], attentionConnected: Bool = false) {
+    func update(status: String, enabled: Bool, soundEnabled: Bool, paused: Bool, maximumHeight: CGFloat = 900, runningTasks: [CueRunningTask] = [], interruptedTasks: [CueRunningTask] = [], taskDetails: [String: CueTaskDetail] = [:], attentionConnected: Bool = false) {
         self.status = status; self.enabled = enabled; self.soundEnabled = soundEnabled
         self.paused = paused; self.maximumHeight = maximumHeight; self.runningTasks = runningTasks; self.taskDetails = taskDetails
+        self.interruptedTasks = interruptedTasks
         self.attentionConnected = attentionConnected
         hoverController.refresh()
         if isViewLoaded {
@@ -517,7 +544,7 @@ final class CueStatusPopoverController: NSViewController {
     }
     private func rebuild() {
         let origin = scroll.contentView.bounds.origin
-        let snapshot = batchMode ? (frozenBatchSnapshot ?? CueStatusListSnapshot(records: history.records, runningTasks: runningTasks)) : CueStatusListSnapshot(records: history.records, runningTasks: runningTasks)
+        let snapshot = batchMode ? (frozenBatchSnapshot ?? CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks)) : CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks)
         view.subviews.forEach { $0.removeFromSuperview() }
         let fixedHeight: CGFloat = batchMode ? 255 : 219
         let maxHeight = max(390, min(900, maximumHeight))
@@ -541,7 +568,7 @@ final class CueStatusPopoverController: NSViewController {
         sound.identifier = NSUserInterfaceItemIdentifier("setting-sound")
         button(paused ? "恢复提醒" : "暂停 30 分钟", NSRect(x: 351, y: 116, width: 204, height: 30), #selector(pause)).identifier = NSUserInterfaceItemIdentifier("pause-button")
         label("任务与提醒", NSRect(x: 22, y: 163, width: 130, height: 23), size: 13, weight: .semibold)
-        label(batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(snapshot.activeCount) 运行 · 历史 \(history.ordinaryCount)/50", NSRect(x: 155, y: 165, width: 290, height: 20), size: 11, color: history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("task-counts")
+        label(batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(snapshot.activeCount) 运行 · \(snapshot.recoveryByThread.count) 待续 · 历史 \(history.ordinaryCount)/50", NSRect(x: 155, y: 165, width: 290, height: 20), size: 11, color: history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("task-counts")
         button(batchMode ? "退出批量" : "批量模式", NSRect(x: 458, y: 157, width: 98, height: 29), #selector(toggleBatchMode))
         if batchMode {
             let pinnedIDs = Set(frozenPinnedTargets.map(\.threadID))
@@ -581,6 +608,7 @@ final class CueStatusPopoverController: NSViewController {
             let isRunning = record.event.provider == "codex" && snapshot.activeThreadIDs.contains(record.event.threadID)
             let target = batchTarget(record.event)
             let row = CueRecentRowButton(record: record, width: document.frame.width - (batchMode ? 28 : 0), isRunning: isRunning)
+            row.refresh(record: record, isRunning: isRunning, recovery: snapshot.recoveryByThread[record.event.threadID])
             row.frame.origin.y = position
             if batchMode { row.frame.origin.x += 28; batchCheckbox(target, y: position, in: document) }
             position += 60
@@ -614,12 +642,27 @@ final class CueStatusPopoverController: NSViewController {
                 document.addSubview(row)
             }
         }
+        if !snapshot.interrupted.isEmpty {
+            section("中断待续", id: "interrupted", count: snapshot.interrupted.count, hint: "记录保留 · 点击打开后手动继续", color: .systemOrange)
+            for task in snapshot.interrupted {
+                let row = CueRunningRowButton(task: task, width: document.frame.width - (batchMode ? 28 : 0))
+                row.refresh(task: task, detail: taskDetails[task.threadID]); row.frame.origin.y = position
+                if batchMode { row.frame.origin.x += 28; batchCheckbox(CueBatchTarget(threadID: task.threadID, title: task.title), y: position, in: document) }
+                position += 60
+                row.target = self; row.action = #selector(openRunningRow(_:)); row.selected = batchMode ? selectedThreads.contains(task.threadID) : selectedID == task.navigationID
+                row.selectRow = { [weak self] in self?.select(id: task.navigationID) }
+                row.contextMenu = { [weak self] in self?.recoveryContextMenu(task) ?? NSMenu() }
+                addDetails(to: row, threadID: task.threadID, title: task.title, eventDate: nil)
+                row.hoverChanged = { [weak self, weak row] inside in if let row { self?.hover(inside, threadID: task.threadID, title: task.title, row: row) } }
+                document.addSubview(row)
+            }
+        }
         if !snapshot.ordinary.isEmpty {
             section("历史提醒", id: "history", count: snapshot.ordinary.count, hint: "已打开 · 右键可重新标为未读")
             snapshot.ordinary.forEach(reminderRow)
         }
         if snapshot.rowCount == 0 {
-            let empty = NSTextField(wrappingLabelWithString: "正在运行的任务与新的提醒会显示在这里。\n未读提醒自动置顶；右键可重新标为未读、置顶或删除。")
+            let empty = NSTextField(wrappingLabelWithString: "正在运行、被中断的任务与新的提醒会显示在这里。\n中断记录保留到实际续跑或完成，也可右键移除。")
             empty.frame = NSRect(x: 24, y: 41, width: 490, height: 62)
             empty.font = .systemFont(ofSize: 12); empty.textColor = .secondaryLabelColor; document.addSubview(empty)
         }
@@ -634,19 +677,20 @@ final class CueStatusPopoverController: NSViewController {
     /// Preserve controls and row geometry while a person is selecting or reading.
     /// Telemetry is still refreshed; only membership and ordering are deferred.
     private func refreshInPlace() {
-        let latest = CueStatusListSnapshot(records: history.records, runningTasks: runningTasks)
+        let latest = CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks)
         var tasks: [String: CueRunningTask] = [:]
         for task in runningTasks {
             if let previous = tasks[task.threadID], previous.updatedDate >= task.updatedDate { continue }
             tasks[task.threadID] = task
         }
+        for task in interruptedTasks where tasks[task.threadID] == nil { tasks[task.threadID] = task }
         let records = Dictionary(uniqueKeysWithValues: history.records.map { ($0.event.id, $0) })
         for child in view.subviews {
             if let field = child as? NSTextField {
                 switch field.identifier?.rawValue {
                 case "monitor-status": field.stringValue = status
                 case "task-counts":
-                    field.stringValue = batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(latest.activeCount) 运行 · 历史 \(history.ordinaryCount)/50"
+                    field.stringValue = batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(latest.activeCount) 运行 · \(latest.recoveryByThread.count) 待续 · 历史 \(history.ordinaryCount)/50"
                     field.textColor = history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor
                 case "panel-footer":
                     field.stringValue = !history.lastError.isEmpty ? history.lastError : attentionConnected ? "置顶与运行任务不占历史额度；悬停查看本轮详情与最近回复。" : "浏览器批准提醒与批量应用尚未接通。"
@@ -672,7 +716,7 @@ final class CueStatusPopoverController: NSViewController {
         }
         for child in recentDocument?.subviews ?? [] {
             if let row = child as? CueRecentRowButton {
-                row.refresh(record: records[row.record.event.id], isRunning: row.record.event.provider == "codex" && latest.activeThreadIDs.contains(row.record.event.threadID))
+                row.refresh(record: records[row.record.event.id], isRunning: row.record.event.provider == "codex" && latest.activeThreadIDs.contains(row.record.event.threadID), recovery: latest.recoveryByThread[row.record.event.threadID])
                 refreshDetails(in: row, threadID: row.record.event.threadID, eventDate: row.record.event.date)
                 if batchMode { row.selected = selectedThreads.contains(row.record.event.threadID); row.setAccessibilityValue(row.selected ? "已选中" : "") }
             } else if let row = child as? CueRunningRowButton {
@@ -821,6 +865,30 @@ final class CueStatusPopoverController: NSViewController {
         if let hoverRow { hoverRow.refresh(task: running("new-background"), detail: hoverDetail) }
         results["running_partial_time_labels_observation_start"] = observedMetadata?.stringValue.contains("观测起点") == true
         stable.hoverController.hide(); hoverWindow.orderOut(nil)
+        func lost(_ id: String, status: String = "interrupted") -> CueRunningTask {
+            CueRunningTask(raw: ["thread_id": id, "title": "中断样例 " + id, "provider": "codex", "started_at": 1000.0, "last_activity": 1060.0, "interrupted_at": 1070.0, "status": status, "reason_text": "Codex 进程已结束", "turn_id": "old-turn"])!
+        }
+        let lostTasks = [lost("lost-thread"), lost("shared-pinned"), lost("lost-thread", status: "unconfirmed")]
+        let recoverySnapshot = CueStatusListSnapshot(records: liveHistory.records, runningTasks: tasks, interruptedTasks: lostTasks)
+        results["recovery_snapshot_deduplicates_and_running_wins"] = recoverySnapshot.recoveryByThread.count == 1 && recoverySnapshot.interrupted.count == 1 && recoverySnapshot.recoveryByThread["shared-pinned"] == nil
+        var dismissals: [String] = [], recoveryNavigation: [String] = []
+        let recoveryActions = CueStatusPopoverActions(openSettings: {}, openUsage: {}, toggleEnabled: {}, toggleSound: {}, pause: {}, demo: {}, quit: {}, openEvent: { recoveryNavigation.append($0.threadID) }, dismissInterrupted: { dismissals.append($0.threadID) })
+        let recoveryPanel = CueStatusPopoverController(history: liveHistory, actions: recoveryActions)
+        recoveryPanel.update(status: "中断恢复测试", enabled: true, soundEnabled: true, paused: false, runningTasks: [running("active-thread")], interruptedTasks: lostTasks)
+        _ = recoveryPanel.view
+        let recoverySections = recoveryPanel.recentDocument?.subviews.compactMap(\.identifier).map(\.rawValue).filter { $0.hasPrefix("section-") }
+        results["recovery_section_keeps_pinned_running_interrupted_history_order"] = recoverySections == ["section-pinned", "section-running", "section-interrupted", "section-history"]
+        let lossRow = recoveryPanel.recentDocument?.subviews.compactMap { $0 as? CueRunningRowButton }.first { $0.task.threadID == "lost-thread" }
+        if let lossRow { recoveryPanel.openRunningRow(lossRow) }
+        results["opening_recovery_only_navigates_and_keeps_record"] = recoveryNavigation == ["lost-thread"] && recoveryPanel.interruptedTasks.count == 3 && dismissals.isEmpty
+        let recoveryMenu = recoveryPanel.recoveryContextMenu(lost("lost-thread"))
+        if let item = recoveryMenu.items.first(where: { $0.title == "移除此中断记录" }) { recoveryPanel.dismissRecoveryFromMenu(item) }
+        results["recovery_dismissal_targets_selected_turn_only"] = dismissals == ["lost-thread"] && recoveryNavigation.count == 1
+        let pinnedLoss = recoveryPanel.recentDocument?.subviews.compactMap { $0 as? CueRecentRowButton }.first { $0.record.event.threadID == "shared-pinned" }
+        results["pinned_interrupted_task_has_special_state_without_duplicate_row"] = pinnedLoss?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "row-state" }?.stringValue == "中断待续" && recoveryPanel.recentDocument?.subviews.compactMap { $0 as? CueRunningRowButton }.filter { $0.task.threadID == "shared-pinned" }.isEmpty == true
+        let manyLost = (0..<70).map { lost("lost-\($0)") }
+        let retained = CueStatusListSnapshot(records: liveHistory.records, runningTasks: [], interruptedTasks: manyLost)
+        results["interrupted_tasks_do_not_use_ordinary_fifty_record_capacity"] = retained.interrupted.count == 70 && liveHistory.ordinaryCount == 2 && liveHistory.records.count == 4
         return results
     }
 
@@ -852,7 +920,8 @@ final class CueStatusPopoverController: NSViewController {
         let details = Dictionary(uniqueKeysWithValues: tasks.enumerated().map { index, task in
             (task.threadID, CueTaskDetail(raw: ["status":"running", "started_at":task.startDate.timeIntervalSince1970, "last_activity":now.timeIntervalSince1970, "elapsed_status":"complete", "total_tokens":24750 + index * 12300, "input_tokens":2100, "output_tokens":1250, "cache_read_tokens":21400 + index * 12300, "cache_creation_tokens":0, "tokens_status":"complete", "model":"模型示例", "reasoning_effort":"high", "service_tier":"priority", "messages":[["role":"assistant","text":"正在核对本轮变更，完成后会报告验证结果。","created_at":now.timeIntervalSince1970]]]))
         })
-        panel.update(status: "界面样例 · 3 个对话正在运行", enabled: true, soundEnabled: true, paused: false, maximumHeight: 900, runningTasks: tasks, taskDetails: details)
+        let lost = CueRunningTask(raw: ["thread_id": "fixture-interrupted", "title": "ALV｜重启前的任务，等待手动继续", "started_at": now.addingTimeInterval(-1800).timeIntervalSince1970, "last_activity": now.addingTimeInterval(-600).timeIntervalSince1970, "interrupted_at": now.addingTimeInterval(-590).timeIntervalSince1970, "status": "interrupted", "reason_text": "Codex 进程已结束，保留任务记录。", "turn_id": "fixture-old-turn"])!
+        panel.update(status: "界面样例 · 3 个运行 · 1 个中断待续", enabled: true, soundEnabled: true, paused: false, maximumHeight: 900, runningTasks: tasks, interruptedTasks: [lost], taskDetails: details)
         if batchMode { panel.toggleBatchMode(); panel.selectPinned(); panel.selectRunning() }
         let view = panel.view
         let window = NSWindow(contentRect: view.bounds, styleMask: .borderless, backing: .buffered, defer: false)
@@ -868,7 +937,7 @@ final class CueStatusPopoverController: NSViewController {
     }
     private func availableBatchTargets() -> [CueBatchTarget] {
         if batchMode { return frozenAllTargets }
-        return CueBatchTarget.unique(history.records.compactMap { batchTarget($0.event) } + runningTasks.compactMap { CueBatchTarget(threadID: $0.threadID, title: $0.title) })
+        return CueBatchTarget.unique(history.records.compactMap { batchTarget($0.event) } + (runningTasks + interruptedTasks).compactMap { CueBatchTarget(threadID: $0.threadID, title: $0.title) })
     }
     private func batchCheckbox(_ target: CueBatchTarget?, y: CGFloat, in document: NSView) {
         guard let target else { return }
@@ -897,7 +966,7 @@ final class CueStatusPopoverController: NSViewController {
             batchMode = false; selectedThreads.removeAll(); batchTargets.removeAll()
             frozenBatchSnapshot = nil; frozenPinnedTargets = []; frozenRunningTargets = []; frozenAllTargets = []
         } else {
-            frozenBatchSnapshot = CueStatusListSnapshot(records: history.records, runningTasks: runningTasks)
+            frozenBatchSnapshot = CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks)
             frozenPinnedTargets = CueBatchTarget.unique(history.records.filter(\.isPinned).compactMap { batchTarget($0.event) })
             frozenRunningTargets = CueBatchTarget.unique(runningTasks.compactMap { CueBatchTarget(threadID: $0.threadID, title: $0.title) })
             frozenAllTargets = availableBatchTargets()
@@ -923,6 +992,16 @@ final class CueStatusPopoverController: NSViewController {
         hoverController.hide(); actions.batchConfigure(CueBatchTarget.unique(targets))
     }
     @objc private func connectCodex() { hoverController.hide(); actions.connectCodex() }
+    private func recoveryContextMenu(_ task: CueRunningTask) -> NSMenu {
+        let menu = NSMenu()
+        let open = NSMenuItem(title: "打开对话，手动继续", action: #selector(openRecoveryFromMenu(_:)), keyEquivalent: "")
+        open.target = self; open.representedObject = task; menu.addItem(open)
+        let remove = NSMenuItem(title: "移除此中断记录", action: #selector(dismissRecoveryFromMenu(_:)), keyEquivalent: "")
+        remove.target = self; remove.representedObject = task; remove.toolTip = "仅移除 VibeCue 的中断标记，不删除原对话。"; menu.addItem(remove)
+        return menu
+    }
+    @objc private func openRecoveryFromMenu(_ sender: NSMenuItem) { if let task = sender.representedObject as? CueRunningTask { actions.openEvent(task.ephemeralCueEvent) } }
+    @objc private func dismissRecoveryFromMenu(_ sender: NSMenuItem) { if let task = sender.representedObject as? CueRunningTask { actions.dismissInterrupted(task) } }
     private func addDetails(to row: NSButton, threadID: String, title: String, eventDate: Date?) {
         let line = taskDetails[threadID]?.summaryLine(now: Date(), eventDate: eventDate) ?? "本轮用量暂不可用"
         let metrics = NSTextField(labelWithString: line)
@@ -968,6 +1047,10 @@ final class CueStatusPopoverController: NSViewController {
             let hint = NSMenuItem(title: "未读已自动置顶；手动置顶可在打开后继续保留", action: nil, keyEquivalent: "")
             hint.isEnabled = false; menu.addItem(hint)
         }
+        if let task = interruptedTasks.first(where: { $0.threadID == record.event.threadID }) {
+            let removeRecovery = NSMenuItem(title: "移除此对话的中断标记", action: #selector(dismissRecoveryFromMenu(_:)), keyEquivalent: "")
+            removeRecovery.target = self; removeRecovery.representedObject = task; menu.addItem(removeRecovery)
+        }
         menu.addItem(.separator())
         let remove = NSMenuItem(title: "删除", action: #selector(deleteRow(_:)), keyEquivalent: "")
         remove.target = self; remove.representedObject = id
@@ -976,7 +1059,7 @@ final class CueStatusPopoverController: NSViewController {
         return menu
     }
     private func historyDidChange() {
-        if !history.records.contains(where: { $0.event.id == selectedID }) && !runningTasks.contains(where: { $0.navigationID == selectedID }) { selectedID = nil }
+        if !history.records.contains(where: { $0.event.id == selectedID }) && !(runningTasks + interruptedTasks).contains(where: { $0.navigationID == selectedID }) { selectedID = nil }
         rebuild(); actions.historyChanged()
     }
     @objc private func markUnread(_ sender: NSMenuItem) {

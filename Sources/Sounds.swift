@@ -53,10 +53,10 @@ struct CueSoundPreset {
         duration = Double(score.reduce(0) { $0 + Int($1.duration * Double(CueChime.sampleRate)) + Int($1.gap * Double(CueChime.sampleRate)) }) / Double(CueChime.sampleRate)
     }
 
-    fileprivate init(recording id: String, _ name: String, tag: String, description: String,
+    fileprivate init(recording id: String, _ name: String, tag: String, additionalTags: [String] = [], description: String,
                      duration: Double, file: String, author: String, sourceURL: String) {
         self.id = id; self.name = name; family = tag == "nature" ? "自然实录" : "城市与生活实录"
-        self.description = description; self.duration = duration; tags = [tag]
+        self.description = description; self.duration = duration; tags = [tag] + additionalTags.filter { $0 != tag }
         sourceType = "recording"; sourceDescription = "实录 · \(author) · CC0"
         self.sourceURL = sourceURL; license = "CC0 1.0"; assetName = file; systemURL = nil
         voice = .soft; score = []; legacy = false
@@ -76,7 +76,12 @@ enum CueSoundCatalog {
     static let tags: [CueSoundTag] = [
         .init(id: "all", name: "全部", description: "所有可用音源，来源类型分别标注。"),
         .init(id: "synthesized", name: "合成提示音", description: "50 段 VibeCue 原创合成乐句，玻璃、木琴等为音色描述。"),
-        .init(id: "nature", name: "自然", description: "雨、海浪、鸟鸣和风的 CC0 实录短片段。"),
+        .init(id: "nature", name: "自然", description: "青蛙、鸟鸣、虫鸣、森林、溪流、雨和风的 CC0 实录短片段。"),
+        .init(id: "forest", name: "森林氛围", description: "林冠风声和林间溪流，保留真实环境声层次。"),
+        .init(id: "animals", name: "动物", description: "青蛙、鸟类和昆虫的真实声音，可与其他标签组合筛选。"),
+        .init(id: "birds", name: "鸟鸣", description: "知更鸟、乌鸫、林鸮、夜莺、林莺和晨暮鸟群。"),
+        .init(id: "insects", name: "虫鸣", description: "蟋蟀、蝉和夜间昆虫的户外录音；未确定的物种会明确标注。"),
+        .init(id: "water", name: "水声", description: "山溪、林溪、海浪和雨声。"),
         .init(id: "urban", name: "城市与生活", description: "键盘、门铃、车流和脚步的 CC0 实录短片段。"),
         .init(id: "system", name: "系统音效", description: "动态读取本机 macOS 系统声音，不复制或分发 Apple 音频。")
     ]
@@ -199,11 +204,11 @@ enum CueSoundCatalog {
     ]
 
     static let recordedPresets: [CueSoundPreset] = [
-        .init(recording: "nature-rain", "雨落片刻", tag: "nature", description: "户外雨声实录，截取原录音前段；淡入淡出，无循环。", duration: 2.4,
+        .init(recording: "nature-rain", "雨落片刻", tag: "nature", additionalTags: ["water"], description: "户外雨声实录，截取原录音前段；淡入淡出，无循环。", duration: 2.4,
               file: "nature-rain.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/rain-and-storm-s0124.html"),
-        .init(recording: "nature-waves", "海浪轻涌", tag: "nature", description: "海边浪花实录短片段；保留原环境声。", duration: 2.6,
+        .init(recording: "nature-waves", "海浪轻涌", tag: "nature", additionalTags: ["water"], description: "海边浪花实录短片段；保留原环境声。", duration: 2.6,
               file: "nature-waves.wav", author: "DenisChardonnet", sourceURL: "https://bigsoundbank.com/sea-waves-s0266.html"),
-        .init(recording: "nature-birds", "林间鸟鸣", tag: "nature", description: "森林鸟鸣实录短片段，背景含自然环境声及微弱远处车流。", duration: 2.4,
+        .init(recording: "nature-birds", "林间鸟鸣", tag: "nature", additionalTags: ["forest", "animals", "birds"], description: "森林鸟鸣实录短片段，背景含自然环境声及微弱远处车流。", duration: 2.4,
               file: "nature-birds.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/forest-s0100.html"),
         .init(recording: "nature-wind", "草间微风", tag: "nature", description: "风吹草丛实录短片段；淡入淡出，无循环。", duration: 2.4,
               file: "nature-wind.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/wind-in-tall-grass-s0908.html"),
@@ -214,7 +219,39 @@ enum CueSoundCatalog {
         .init(recording: "urban-traffic", "远处车流", tag: "urban", description: "道路旁约 50 米处的车辆实录短片段。", duration: 2.6,
               file: "urban-traffic.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/highway-s0122.html"),
         .init(recording: "urban-footsteps", "路面脚步", tag: "urban", description: "鞋底踏过混凝土地面的实录短片段。", duration: 1.8,
-              file: "urban-footsteps.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/fast-steps-on-concrete-s1318.html")
+              file: "urban-footsteps.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/fast-steps-on-concrete-s1318.html"),
+        .init(recording: "nature-frog-solo", "夜蛙独唱", tag: "nature", additionalTags: ["animals"], description: "夜间池边单只青蛙实录，保留一小段自然鸣叫。", duration: 2.8,
+              file: "nature-frog-solo.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/one-frog-s0819.html"),
+        .init(recording: "nature-frog-chorus", "池畔蛙群", tag: "nature", additionalTags: ["animals", "water"], description: "池塘蛙群实录，背景含流水声；原场地在市区。", duration: 3.6,
+              file: "nature-frog-chorus.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/frogs-2-s0998.html"),
+        .init(recording: "nature-cricket", "田间蟋蟀", tag: "nature", additionalTags: ["animals", "insects"], description: "田野蟋蟀的真实鸣声，截取连续短片段。", duration: 3.0,
+              file: "nature-cricket.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/field-cricket-s1020.html"),
+        .init(recording: "nature-grass-insect", "草丛虫鸣", tag: "nature", additionalTags: ["animals", "insects"], description: "夜间植被中的昆虫实录；原作者推测为绿螽斯，物种未完全确定。", duration: 2.8,
+              file: "nature-grass-insect.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/insect-song-4-s3187.html"),
+        .init(recording: "nature-night-insect", "夜虫轻鸣", tag: "nature", additionalTags: ["animals", "insects"], description: "未确定物种的夜间昆虫实录，不将其标为蟋蟀或蝉。", duration: 3.2,
+              file: "nature-night-insect.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/song-of-nocturnal-insect-1-s0424.html"),
+        .init(recording: "nature-cicadas", "夏日蝉鸣", tag: "nature", additionalTags: ["animals", "insects"], description: "自然环境中多只蝉的真实鸣声，保留原有环境底声。", duration: 3.0,
+              file: "nature-cicadas.wav", author: "Clarisse", sourceURL: "https://bigsoundbank.com/cicadas-s3002.html"),
+        .init(recording: "nature-robin", "知更鸟小调", tag: "nature", additionalTags: ["animals", "birds"], description: "知更鸟站在树上鸣唱的实录短句。", duration: 2.7,
+              file: "nature-robin.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/robin-4-s1670.html"),
+        .init(recording: "nature-blackbird", "乌鸫清唱", tag: "nature", additionalTags: ["animals", "birds"], description: "欧乌鸫的真实歌声，一段清晰短句。", duration: 3.0,
+              file: "nature-blackbird.wav", author: "Le tiroir du fond", sourceURL: "https://bigsoundbank.com/common-blackbird-30-s3503.html"),
+        .init(recording: "nature-tawny-owl", "林鸮夜语", tag: "nature", additionalTags: ["animals", "birds"], description: "灰林鸮的真实鸣叫；截取短段并柔和收尾。", duration: 3.6,
+              file: "nature-tawny-owl.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/tawny-owl-2-s1764.html"),
+        .init(recording: "nature-nightingale", "夜莺啼鸣", tag: "nature", additionalTags: ["animals", "birds"], description: "夜莺的真实歌声，保留鸣声起伏。", duration: 3.1,
+              file: "nature-nightingale.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/common-nightingale-2-s3087.html"),
+        .init(recording: "nature-blackcap", "林莺轻唱", tag: "nature", additionalTags: ["animals", "birds"], description: "黑顶林莺的真实歌声，保留原录音的停顿。", duration: 3.6,
+              file: "nature-blackcap.wav", author: "Le tiroir du fond", sourceURL: "https://bigsoundbank.com/eurasian-blackcap-1-s3466.html"),
+        .init(recording: "nature-forest-brook", "林间溪语", tag: "nature", additionalTags: ["forest", "water", "birds"], description: "林间小溪与自然环境实录，原环境含乌鸫、其他鸟类和飞虫。", duration: 3.8,
+              file: "nature-forest-brook.wav", author: "Pierre SIBANARCO", sourceURL: "https://bigsoundbank.com/forest-and-stream-1-s2713.html"),
+        .init(recording: "nature-mountain-stream", "山溪潺潺", tag: "nature", additionalTags: ["water"], description: "山间小溪实录；连续流水以淡入淡出收尾，不循环。", duration: 3.4,
+              file: "nature-mountain-stream.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/small-stream-4-s1354.html"),
+        .init(recording: "nature-forest-canopy", "林冠微响", tag: "nature", additionalTags: ["forest", "birds"], description: "森林中的鸟声与风声实录，保留环境层次。", duration: 3.8,
+              file: "nature-forest-canopy.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/foret-4-s2749.html"),
+        .init(recording: "nature-dawn-birds", "晨鸟苏醒", tag: "nature", additionalTags: ["animals", "birds"], description: "法国乡间黎明鸟群实录；原录于早晨六点半。", duration: 3.6,
+              file: "nature-dawn-birds.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/wake-birds-3-s0999.html"),
+        .init(recording: "nature-evening-birds", "暮鸟归林", tag: "nature", additionalTags: ["animals", "birds"], description: "乡间入夜前最后一阵鸟鸣实录，原录于傍晚九点。", duration: 3.4,
+              file: "nature-evening-birds.wav", author: "Joseph SARDIN", sourceURL: "https://bigsoundbank.com/evening-birds-s1859.html")
     ]
 
     /// Inventory is built from the local OS, so unavailable system sounds never
@@ -322,9 +359,10 @@ enum CueSoundCatalog {
                 "short_notification_durations": validDuration,
                 "deterministic_local_synthesis": stableData,
                 "legacy_ids_preserved": ["complete", "input", "permission", "error"].allSatisfy { preset(id: $0)?.legacy == true },
-                "eight_cc0_recordings": recordedPresets.count == 8 && recordedPresets.allSatisfy { $0.sourceType == "recording" && $0.license == "CC0 1.0" && $0.sourceURL != nil },
+                "at_least_24_cc0_recordings": recordedPresets.count >= 24 && recordedPresets.allSatisfy { $0.sourceType == "recording" && $0.license == "CC0 1.0" && $0.sourceURL != nil },
                 "recordings_decodable_non_silent_and_unclipped": recordingsValid,
-                "four_nature_four_urban_recordings": self.presets(tagID: "nature").count == 4 && self.presets(tagID: "urban").count == 4,
+                "expanded_nature_and_preserved_urban_recordings": self.presets(tagID: "nature").count >= 20 && self.presets(tagID: "urban").count == 4,
+                "forest_animal_bird_insect_water_filters_have_recordings": ["forest", "animals", "birds", "insects", "water"].allSatisfy { !self.presets(tagID: $0).isEmpty && self.presets(tagID: $0).allSatisfy { $0.sourceType == "recording" } },
                 "source_tags_are_explicit": presets.allSatisfy { !$0.tags.isEmpty && $0.tags.allSatisfy { tag(id: $0) != nil } && !$0.sourceDescription.isEmpty },
                 "system_files_read_from_os_only": systemReadable,
                 "silent_is_separate": !contains(id: "silent")]

@@ -27,6 +27,7 @@ from ..events import (vibecue_directory, codex_directory, emit_event, clean_text
                      completion_event_id, input_event_id, state_databases)
 from .approval_status import approval_status
 from .task_details import TaskDetails, bounded_details, bound_status_previews
+from .task_recovery import TaskRecovery, codex_process_snapshot
 
 MAX_READ = 1_048_576
 MAX_RECORD = 2_097_152
@@ -161,6 +162,8 @@ class Interpreter:
         self.last_activity = 0.0
         self.activity_watermark = 0.0
         self.activity_terminal_at = 0.0
+        self.activity_terminal_kind = ''
+        self.activity_work_at = 0.0
         self.blocking_calls = set()
         self.context_readable = True
         self.details = TaskDetails()
@@ -176,6 +179,8 @@ class Interpreter:
         self.activity_turn_id = ''
         self.activity_started_at = self.last_activity = 0.0
         self.activity_watermark = self.activity_terminal_at = 0.0
+        self.activity_terminal_kind = ''
+        self.activity_work_at = 0.0
         self.blocking_calls.clear()
         self.context_readable = False
         self.details.reset()
@@ -236,6 +241,7 @@ class Interpreter:
                 return
             self.activity_state = 'idle'
             self.activity_watermark = self.activity_terminal_at = timestamp
+            self.activity_terminal_kind = event_type if ends else 'final_answer'
             self.blocking_calls.clear()
             return
         if starts:
@@ -244,6 +250,7 @@ class Interpreter:
             self.activity_turn_id = turn or self.activity_turn_id or self.turn_id
             self.activity_state = 'running'
             self.last_activity = self.activity_watermark = timestamp
+            self.activity_work_at = timestamp
             self.blocking_calls.clear()
             return
         if category != 'response_item':
@@ -261,6 +268,7 @@ class Interpreter:
                 if not self.blocking_calls:
                     self.activity_state = 'running'
                     self.last_activity = timestamp
+                    self.activity_work_at = timestamp
             return
         calling = event_type in ('function_call', 'custom_tool_call')
         commentary = event_type == 'message' and payload.get('role') == 'assistant' and payload.get('phase') == 'commentary'
@@ -275,6 +283,7 @@ class Interpreter:
             self.activity_started_at = timestamp
         self.activity_turn_id = turn or self.activity_turn_id or self.turn_id
         self.activity_watermark = self.last_activity = timestamp
+        self.activity_work_at = timestamp
         if blocking:
             self.activity_state = 'waiting'
             if call_id:
@@ -403,6 +412,7 @@ class Watcher:
         self._emit = emit or (lambda **kwargs: emit_event(**kwargs, vibecue_home=self.vibecue_home))
         self.last_discovery = 0.0
         self.last_status = 0.0
+        self.recovery = TaskRecovery(self.vibecue_home, self.started_at)
 
     def metadata(self):
         for db in state_databases(self.codex_home):
@@ -440,7 +450,15 @@ class Watcher:
         return result
 
     def discover(self, initial=False):
+        self.recovery.apply_remembered()
         discovered = self.metadata()
+        # Recovery candidates remain observable after leaving Codex's recent
+        # metadata window. Read only the already-known transcript path.
+        present = {metadata.thread_id for metadata in discovered}
+        for saved in self.recovery.retained_metadata():
+            if saved['thread_id'] not in present:
+                discovered.append(ThreadMetadata(saved['thread_id'], Path(saved['transcript_path']),
+                                                 saved['title'], 'cli' if saved['source_kind'] == 'cli' else 'vscode'))
         discovered_ids = {metadata.thread_id for metadata in discovered}
         # Archived/moved rollouts can disappear after they leave the metadata
         # window. Drop only proven-missing paths; absent metadata alone is not
@@ -516,24 +534,44 @@ class Watcher:
         now = time.time()
         tasks = []
         detail_rows = []
+        observations = []
         for tid, (tail, interpreter) in self.watched.items():
             task = interpreter.running_task(now)
             if task and not tail.read_error and tid not in waiting_approval:
-                tasks.append(task)
+                task['last_work_at'] = interpreter.activity_work_at
+            else:
+                task = None
+            observations.append({'thread_id': tid, 'task': task,
+                                 'state': interpreter.activity_state,
+                                 'watermark': interpreter.activity_watermark,
+                                 'terminal_at': interpreter.activity_terminal_at,
+                                 'terminal_kind': interpreter.activity_terminal_kind,
+                                 'source_readable': not bool(tail.read_error) and interpreter.context_readable,
+                                 'source_kind': 'cli' if interpreter.metadata.source in ('cli', 'exec') else 'desktop',
+                                 'transcript_path': str(interpreter.metadata.path)})
             detail = interpreter.detail_snapshot(now)
             if detail:
                 detail['source_readable'] = not bool(tail.read_error) and interpreter.context_readable
                 if tid in waiting_approval:
                     detail['status'] = 'waiting'
                 detail_rows.append(detail)
-        tasks.sort(key=lambda task: (-task['last_activity'], task['thread_id']))
+        tasks, interrupted = self.recovery.reconcile(observations, codex_process_snapshot(now), now,
+                                                     waiting=waiting_approval)
+        details_by_id = {row['thread_id']: row for row in detail_rows}
+        for row in interrupted:
+            detail = details_by_id.get(row['thread_id'])
+            if detail:
+                detail.update(status=row['status'], finished_at=row['finished_at'],
+                              elapsed_seconds=row.get('elapsed_seconds', 0))
         state = {
             'pid': os.getpid(), 'heartbeat': now, 'running': self.running,
             'started_at': self.started_at, 'watched_threads': len(self.watched),
             'running_tasks': tasks if self.running else [],
+            'interrupted_tasks': interrupted,
+            'task_recovery_error': self.recovery.error,
             'task_details': bounded_details(detail_rows),
             'source': 'local-transcripts', 'provider': 'codex',
-            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'per-turn-usage', 'visible-conversation-preview'],
+            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'durable-interrupted-task-recovery', 'per-turn-usage', 'visible-conversation-preview'],
             'permission_status': 'connected' if approvals['connected'] else 'requires-codex-bridge-launch',
             'manual_approval': approvals,
             'pending_deliveries': sum(len(i.pending) for _, i in self.watched.values()),
