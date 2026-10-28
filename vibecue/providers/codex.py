@@ -26,6 +26,7 @@ from ..events import (vibecue_directory, codex_directory, emit_event, clean_text
                      resolve_title, is_main_source, classify_final_message,
                      completion_event_id, input_event_id, state_databases)
 from .approval_status import approval_status
+from .task_details import TaskDetails, bounded_details, bound_status_previews
 
 MAX_READ = 1_048_576
 MAX_RECORD = 2_097_152
@@ -162,6 +163,7 @@ class Interpreter:
         self.activity_terminal_at = 0.0
         self.blocking_calls = set()
         self.context_readable = True
+        self.details = TaskDetails()
 
     def prime_context(self):
         """Recover bounded tail state without replaying historical alerts.
@@ -176,10 +178,12 @@ class Interpreter:
         self.activity_watermark = self.activity_terminal_at = 0.0
         self.blocking_calls.clear()
         self.context_readable = False
+        self.details.reset()
         try:
             with self.metadata.path.open('rb') as stream:
                 size = os.fstat(stream.fileno()).st_size
                 start = max(0, size - MAX_PRIME)
+                self.details.reset(window_truncated=start > 0)
                 stream.seek(start)
                 data = stream.read(MAX_PRIME)
                 lines = data.split(b'\n')[:-1]
@@ -194,6 +198,8 @@ class Interpreter:
                         if not isinstance(payload, dict):
                             continue
                         self._observe_activity(item)
+                        if self.main and is_main_source(self.metadata.source):
+                            self.details.observe(item, record_time(item))
                         if record_time(item) is not None:
                             turn_id = payload.get('turn_id') or payload.get('root_turn_id')
                             if turn_id:
@@ -282,9 +288,19 @@ class Interpreter:
         if (self.activity_state != 'running' or not self.main or not self.context_readable or
                 not is_main_source(self.metadata.source) or not -60 <= now - self.last_activity <= ACTIVITY_TTL):
             return None
-        return {'thread_id': self.metadata.thread_id, 'title': self.metadata.title,
+        task = {'thread_id': self.metadata.thread_id, 'title': self.metadata.title,
                 'provider': 'codex', 'turn_id': self.activity_turn_id,
                 'started_at': self.activity_started_at, 'last_activity': self.last_activity}
+        detail = self.detail_snapshot(now)
+        if detail:
+            task.update({key: value for key, value in detail.items() if key not in ('started_at', 'turn_id', 'last_activity', 'messages', 'last_message')})
+        return task
+
+    def detail_snapshot(self, now=None):
+        if not self.main or not is_main_source(self.metadata.source):
+            return None
+        return self.details.snapshot(self.metadata.thread_id, self.metadata.title, self.activity_state,
+                                     time.time() if now is None else now)
 
     def _discard_pending(self, dropped=False):
         _, event = self.pending.popleft()
@@ -335,6 +351,8 @@ class Interpreter:
         category = item.get('type')
         event_type = payload.get('type')
         self._observe_activity(item)
+        if self.main and is_main_source(self.metadata.source):
+            self.details.observe(item, timestamp)
         if category == 'session_meta':
             return
         if not self.main:
@@ -497,17 +515,25 @@ class Watcher:
         waiting_approval = set(approvals.get('pending_thread_ids', []))
         now = time.time()
         tasks = []
+        detail_rows = []
         for tid, (tail, interpreter) in self.watched.items():
             task = interpreter.running_task(now)
             if task and not tail.read_error and tid not in waiting_approval:
                 tasks.append(task)
+            detail = interpreter.detail_snapshot(now)
+            if detail:
+                detail['source_readable'] = not bool(tail.read_error) and interpreter.context_readable
+                if tid in waiting_approval:
+                    detail['status'] = 'waiting'
+                detail_rows.append(detail)
         tasks.sort(key=lambda task: (-task['last_activity'], task['thread_id']))
         state = {
             'pid': os.getpid(), 'heartbeat': now, 'running': self.running,
             'started_at': self.started_at, 'watched_threads': len(self.watched),
             'running_tasks': tasks if self.running else [],
+            'task_details': bounded_details(detail_rows),
             'source': 'local-transcripts', 'provider': 'codex',
-            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle'],
+            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'per-turn-usage', 'visible-conversation-preview'],
             'permission_status': 'connected' if approvals['connected'] else 'requires-codex-bridge-launch',
             'manual_approval': approvals,
             'pending_deliveries': sum(len(i.pending) for _, i in self.watched.values()),
@@ -522,7 +548,7 @@ class Watcher:
         temporary = self.vibecue_home / '.watcher-state.tmp'
         try:
             with temporary.open('w', encoding='utf-8') as stream:
-                json.dump(state, stream)
+                json.dump(bound_status_previews(state), stream)
             temporary.chmod(0o600)
             os.replace(temporary, self.vibecue_home / 'watcher-state.json')
         except OSError:

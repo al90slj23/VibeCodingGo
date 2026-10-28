@@ -285,6 +285,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var pending: [CueEvent] = []
     var recent: [CueEvent] = []
     var runningTasks: [CueRunningTask] = []
+    var taskDetails: [String: CueTaskDetail] = [:]
+    var batchController: CueCodexBatchController?
     private var runningTaskSnapshot = Data()
     lazy var recentHistory = CueRecentHistory(home: home)
     var shortcutMenu: NSMenu?
@@ -474,10 +476,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func applyResolution(_ resolution: CueResolution, resume: Bool = true) {
         resolutions.insert(resolution.targetID)
-        pending.removeAll { $0.kind == "permission" && $0.id == resolution.targetID }
+        pending.removeAll { ["permission", "input"].contains($0.kind) && $0.id == resolution.targetID }
         _ = recentHistory.resolve(id: resolution.targetID)
         recent = recentHistory.events
-        if let current, current.kind == "permission", current.id == resolution.targetID {
+        if let current, ["permission", "input"].contains(current.kind), current.id == resolution.targetID {
             audioPlayer?.stop(); hideWindows(); self.current = nil
         }
         refreshMenu(); writeStatus()
@@ -819,6 +821,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         var message = "监控进程未连接"
         let previousManual = manualApprovalConnected
         var nextRunningTasks: [CueRunningTask] = []
+        var nextTaskDetails: [String: CueTaskDetail] = [:]
         var nextRunningSnapshot = Data()
         manualApprovalConnected = false
         manualApprovalStatus = approvalLauncher?.isRunning == true ? "等待 Codex 退出后接通" : "人工批准监听未连接"
@@ -844,8 +847,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             }
             let count = state["watched_threads"] as? Int ?? 0
             let taskRows = state["running_tasks"] as? [[String: Any]] ?? []
+            let detailRows = state["task_details"] as? [String: [String: Any]] ?? [:]
+            nextTaskDetails = detailRows.mapValues { CueTaskDetail(raw: $0) }
             nextRunningTasks = taskRows.compactMap { CueRunningTask(raw: $0) }
-            nextRunningSnapshot = (try? JSONSerialization.data(withJSONObject: taskRows, options: [.sortedKeys])) ?? Data()
+            nextRunningSnapshot = (try? JSONSerialization.data(withJSONObject: ["tasks": taskRows, "details": detailRows], options: [.sortedKeys])) ?? Data()
             let errors = state["read_error_count"] as? Int ?? 0
             if errors > 0 {
                 let cursors = state["cursors"] as? [String: [String: Any]] ?? [:]
@@ -858,12 +863,12 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             }
         }
         let runningChanged = runningTaskSnapshot != nextRunningSnapshot
-        runningTasks = nextRunningTasks; runningTaskSnapshot = nextRunningSnapshot
+        runningTasks = nextRunningTasks; taskDetails = nextTaskDetails; runningTaskSnapshot = nextRunningSnapshot
         if watcherHealthText != message || runningChanged {
             watcherHealthText = message
             if statusItem != nil { refreshMenu() }
         }
-        if previousManual != manualApprovalConnected { settingsPanel?.rebuild() }
+        if previousManual != manualApprovalConnected { settingsPanel?.rebuild(); batchController?.refreshConnection() }
         settingsPanel?.updateHealth()
     }
 
@@ -997,8 +1002,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     @objc func connectManualApproval() {
         guard approvalLauncher?.isRunning != true else { return }
         let alert = NSAlert()
-        alert.messageText = "接通人工批准监听"
-        alert.informativeText = "首次连接需要退出并重新打开 Codex 一次。请先完成或保存当前工作，再自行退出；VibeCue 会等待退出后启动带只读监听的 Codex。不会替你批准动作、改变权限策略或强制结束 Codex。"
+        alert.messageText = "接通 Codex 提醒与批量设置"
+        alert.informativeText = "首次连接需要你主动退出并重新打开 Codex。请先完成或保存当前工作；VibeCue 会等你退出后重新打开，并连接待确认提醒与模型控制。模型设置只在你点击“应用”后修改。"
         alert.addButton(withTitle: "准备连接，等待我退出")
         alert.addButton(withTitle: "稍后")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -1191,6 +1196,16 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                     guard let self else { return }
                     self.recent = self.recentHistory.events
                     self.refreshMenu(); self.settingsPanel?.updateHealth(); self.writeStatus()
+                },
+                batchConfigure: { [weak self] targets in
+                    guard let self else { return }
+                    self.statusPopover?.performClose(nil)
+                    self.batchController = CueCodexBatchController(home: self.home, targets: targets, connect: { [weak self] in self?.connectManualApproval() }, completion: { [weak self] in self?.updateWatcherHealth() })
+                    self.batchController?.showWindow(nil); self.batchController?.window?.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                },
+                connectCodex: { [weak self] in
+                    self?.statusPopover?.performClose(nil); self?.connectManualApproval()
                 })
             statusPopoverController = CueStatusPopoverController(history: recentHistory, actions: actions)
             let popover = NSPopover(); popover.behavior = .transient
@@ -1206,7 +1221,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
         let height = min(900, (screen?.visibleFrame.height ?? 900) - 52)
         statusPopoverController?.update(status: watcherHealthText, enabled: settings.enabled,
-                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks)
+                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected)
         if let controller = statusPopoverController, controller.isViewLoaded { statusPopover?.contentSize = controller.preferredContentSize }
     }
 
@@ -1903,6 +1918,8 @@ if CommandLine.arguments.contains("--recent-self-test") {
     let cue = CueController(); cue.presentsWindows = false; cue.settings.enabled = false
     var results = CueRecentHistory.validationReport()
     results.merge(CueStatusPopoverController.validationReport()) { _, new in new }
+    results.merge(CueCodexBatchController.validationReport()) { _, new in new }
+    results.merge(CueTaskHoverController.validationReport()) { _, new in new }
     func event(_ id: String) -> CueEvent {
         CueEvent(try! JSONSerialization.data(withJSONObject: ["id": id, "kind": "complete", "thread_id": "fixture-chat", "title": "验收样例 · " + id, "created_at": Date().timeIntervalSince1970]))!
     }
@@ -1911,8 +1928,20 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results["rejected_url_handoff_stays_unopened"] = !cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 2
     cue.openConversationURL = { _ in true }
     results["successful_handoff_marks_only_its_event"] = cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 1 && cue.recentHistory.records.first(where: { $0.event.id == "second" })?.isOpened == false
+    let inputRaw: [String: Any] = ["id":"mcp-input-fixture", "kind":"input", "thread_id":"fixture-chat", "title":"浏览器确认样例", "source":"codex client approval stream", "created_at":Date().timeIntervalSince1970]
+    let inputEvent = CueEvent(try! JSONSerialization.data(withJSONObject: inputRaw))!
+    cue.current = inputEvent; cue.pending = [inputEvent]; cue.recentHistory.append(inputEvent)
+    let inputResolution = CueResolution(try! JSONSerialization.data(withJSONObject: ["action":"resolve", "target_id":inputEvent.id, "source":"codex client approval stream", "created_at":Date().timeIntervalSince1970]))!
+    cue.applyResolution(inputResolution, resume: false)
+    results["resolved_mcp_input_dismisses_visible_and_queued_card"] = cue.current == nil && cue.pending.isEmpty && cue.recentHistory.records.first(where: { $0.event.id == inputEvent.id })?.resolved == true && cue.recentHistory.records.first(where: { $0.event.id == inputEvent.id })?.isOpened == false
     if let index = CommandLine.arguments.firstIndex(of: "--capture-status-panel"), CommandLine.arguments.indices.contains(index + 1) {
         results["status_panel_three_layer_fixture"] = CueStatusPopoverController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
+    }
+    if let index = CommandLine.arguments.firstIndex(of: "--capture-batch-panel"), CommandLine.arguments.indices.contains(index + 1) {
+        results["batch_panel_fixture"] = CueStatusPopoverController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), batchMode: true)
+    }
+    if let index = CommandLine.arguments.firstIndex(of: "--capture-batch-dialog"), CommandLine.arguments.indices.contains(index + 1) {
+        results["batch_dialog_fixture"] = CueCodexBatchController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
     }
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
     exit(results.values.allSatisfy { $0 } ? 0 : 1)

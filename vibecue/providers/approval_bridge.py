@@ -1,9 +1,11 @@
-"""Observe a desktop-owned Codex stdio stream without participating in it.
+"""Observe a desktop-owned Codex stdio stream without making approval decisions.
 
 The wire is copied before a bounded, separate observer sees each chunk. This
-module never creates protocol messages or sends approval decisions. Only the
-client-facing approval request is positive evidence; hooks and auto reviews are
-not. No command, prompt, response body, or raw protocol line is persisted.
+approval observer never sends decisions. An independently allowlisted local
+control service may change explicitly selected thread settings on this owner
+connection; it cannot send input, resume threads, or approve requests. Only the
+client-facing request is positive attention evidence. No command, prompt,
+response body, or raw protocol line is persisted.
 """
 from __future__ import annotations
 
@@ -36,6 +38,13 @@ APPROVAL_METHODS = frozenset((
     'execCommandApproval',
     'applyPatchApproval',
 ))
+INPUT_METHODS = frozenset((
+    'mcpServer/elicitation/request',
+    'item/tool/requestUserInput',
+    'tool/requestUserInput',
+    'item/tool/requestOptionPicker',
+))
+ATTENTION_METHODS = APPROVAL_METHODS | INPUT_METHODS
 
 
 def _id_token(value):
@@ -57,6 +66,16 @@ def _emit_permission(thread_id, turn_id, raw_key, home):
         'permission', thread_id, turn_id,
         message='Codex 正在等待你手动批准', event_id=raw_key, source=SOURCE,
         requires_user_action=True, vibecue_home=home,
+    )
+
+
+def _emit_input(thread_id, turn_id, raw_key, home):
+    from ..events import emit_event
+    return emit_event(
+        'input', thread_id, turn_id,
+        message='Codex 正在等待你回答或确认',
+        event_id=raw_key, source=SOURCE, requires_user_action=True,
+        vibecue_home=home,
     )
 
 
@@ -82,6 +101,7 @@ class _Pending:
     wire_at: float
     target_id: str = ''
     emitted: bool = False
+    alert_kind: str = 'permission'
 
 
 class ApprovalStreamMonitor:
@@ -95,10 +115,11 @@ class ApprovalStreamMonitor:
 
     def __init__(self, home=None, session_id=None, emit=None, resolve=None,
                  identifier=None, clock=time.monotonic, wall_clock=time.time,
-                 can_emit=None):
+                 can_emit=None, emit_input=None):
         self.home = home
         self.session_id = session_id or str(uuid.uuid4())
         self.emit = emit or _emit_permission
+        self.emit_input = emit_input or _emit_input
         self.resolve = resolve or _emit_resolution
         self.identifier = identifier or _event_identifier
         self.clock = clock
@@ -194,7 +215,7 @@ class ApprovalStreamMonitor:
         if method == 'thread/closed':
             self._clear_turn(params)
             return
-        if not isinstance(method, str) or method not in APPROVAL_METHODS or token is None:
+        if not isinstance(method, str) or method not in ATTENTION_METHODS or token is None:
             return
         thread_id = _identifier(params.get('threadId') or params.get('conversationId'))
         if not thread_id:
@@ -213,7 +234,17 @@ class ApprovalStreamMonitor:
             [self.session_id, token[0], token[1], thread_id],
             ensure_ascii=True, separators=(',', ':'),
         )
-        self.pending[token] = _Pending(token, thread_id, turn_id, method, raw_key, now, order)
+        correlated_input = method in ('item/tool/requestUserInput', 'tool/requestUserInput') and _identifier(params.get('itemId'))
+        if correlated_input:
+            # The transcript tool call uses the same item/call ID. One question
+            # must not alert twice just because its client request is also seen.
+            from ..events import input_event_id
+            raw_key = input_event_id(thread_id, turn_id, correlated_input)
+        self.pending[token] = _Pending(
+            token, thread_id, turn_id, method, raw_key, now, order,
+            target_id=self.identifier(raw_key) if correlated_input else '',
+            alert_kind='input' if method in INPUT_METHODS else 'permission',
+        )
 
     def flush(self, now=None):
         if self.closed or not self.can_emit():
@@ -225,7 +256,8 @@ class ApprovalStreamMonitor:
                 continue
             try:
                 pending.target_id = self.identifier(pending.raw_key)
-                self.emit(pending.thread_id, pending.turn_id, pending.raw_key, self.home)
+                emitter = self.emit_input if pending.alert_kind == 'input' else self.emit
+                emitter(pending.thread_id, pending.turn_id, pending.raw_key, self.home)
                 pending.emitted = True
             except Exception:
                 # An atomic emitter may have succeeded before reporting an
@@ -443,6 +475,16 @@ def run_bridge(real_cli, args, home=None):
     except Exception:
         # Observability is optional. The official process still owns execution.
         pass
+    control = None
+    try:
+        from ..codex_control_relay import ControlHub, atomic_pipe_write
+        control = ControlHub(lambda chunk: _write_all(process.stdin.fileno(), chunk), process.pid, home=home,
+                             write_control=lambda chunk, deadline: atomic_pipe_write(process.stdin.fileno(), chunk, deadline))
+        control.start()
+    except Exception:
+        if control is not None:
+            control.close()
+        control = None
     wire_closed = threading.Event()
     wire_failed = threading.Event()
     stdout_done = threading.Event()
@@ -457,11 +499,17 @@ def run_bridge(real_cli, args, home=None):
                 if not chunk or wire_closed.is_set():
                     break
                 wire_at = time.monotonic()
-                _write_all(destination, chunk)
+                if direction == 'client' and control is not None:
+                    control.forward_client(chunk)
+                    forwarded = chunk
+                else:
+                    forwarded = control.server_chunk(chunk) if control is not None else chunk
+                    if forwarded:
+                        _write_all(destination, forwarded)
                 forwarded_at = time.monotonic()
-                if observer is not None:
+                if observer is not None and forwarded:
                     try:
-                        observer.offer(direction, chunk, wire_at, forwarded_at)
+                        observer.offer(direction, forwarded, wire_at, forwarded_at)
                     except Exception:
                         # Monitoring is never allowed to stop a relay.
                         observer.close()
@@ -471,9 +519,15 @@ def run_bridge(real_cli, args, home=None):
         finally:
             if observer is not None:
                 observer.close()
+            if control is not None:
+                control.close()
             if direction == 'client':
                 try:
-                    process.stdin.close()
+                    if control is not None:
+                        with control.wire_lock:
+                            process.stdin.close()
+                    else:
+                        process.stdin.close()
                 except (OSError, ValueError):
                     pass
             else:
@@ -520,6 +574,8 @@ def run_bridge(real_cli, args, home=None):
         return _status(process.wait())
     finally:
         wire_closed.set()
+        if control is not None:
+            control.close()
         if observer is not None:
             observer.close()
             observer.join()

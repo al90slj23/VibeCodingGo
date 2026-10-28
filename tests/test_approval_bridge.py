@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from vibecue.providers.approval_bridge import (
-    APPROVAL_METHODS, ApprovalStreamMonitor, MAX_LINE_BYTES, _LineReader,
+    APPROVAL_METHODS, INPUT_METHODS, ApprovalStreamMonitor, MAX_LINE_BYTES, _LineReader,
     _Observer, _is_stdio_app_server, main,
 )
 
@@ -30,11 +30,13 @@ class ApprovalMonitorTests(unittest.TestCase):
     def setUp(self):
         self.now = 100.0
         self.emitted = []
+        self.input_emitted = []
         self.resolved = []
         self.monitor = ApprovalStreamMonitor(
             home='private-home', session_id='test-session', clock=lambda: self.now,
             wall_clock=lambda: 1_700_000_000 + self.now,
             emit=lambda *args: self.emitted.append(args),
+            emit_input=lambda *args: self.input_emitted.append(args),
             resolve=lambda *args: self.resolved.append(args),
             identifier=lambda raw: hashlib.sha256(('codex:' + raw).encode()).hexdigest(),
         )
@@ -204,6 +206,65 @@ class ApprovalMonitorTests(unittest.TestCase):
         self.settle()
         self.assertEqual(self.monitor.pending_count, 0)
         self.assertEqual(len(self.resolved), 1)
+
+    def test_browser_mcp_confirmation_and_form_requests_alert_as_user_input(self):
+        for index, mode in enumerate(('form', 'openai/form', 'url', 'openai/userVerification')):
+            message = request(30 + index, method='mcpServer/elicitation/request')
+            message['params'].update({'mode': mode, 'message': 'PRIVATE FORM BODY',
+                                      'requestedSchema': {'type': 'object'}})
+            self.send(message)
+        self.settle()
+        self.assertEqual(len(self.input_emitted), 4)
+        self.assertEqual(self.emitted, [])
+        for pending in self.monitor.pending.values():
+            self.assertEqual(pending.alert_kind, 'input')
+            self.assertNotIn('PRIVATE FORM BODY', repr(pending))
+        self.send({'id': 30, 'result': {'action': 'accept', 'content': {}}}, 'client')
+        self.assertEqual(self.monitor.pending_count, 3)
+        self.assertEqual(len(self.resolved), 1)
+
+    def test_fast_automatically_answered_browser_request_does_not_alert(self):
+        self.send(request(33, method='mcpServer/elicitation/request'))
+        self.now += 0.1
+        self.send({'id': 33, 'result': {'action': 'accept', 'content': {}}}, 'client')
+        self.settle()
+        self.assertEqual(self.input_emitted, [])
+        self.assertEqual(self.emitted, [])
+        self.assertEqual(self.monitor.pending_count, 0)
+
+    def test_browser_request_resolved_before_observed_request_never_alerts(self):
+        self.send({'method': 'serverRequest/resolved',
+                   'params': {'requestId': 'browser', 'threadId': 'thread'}}, at=100.2)
+        self.send(request('browser', method='mcpServer/elicitation/request'), at=100.0)
+        self.settle()
+        self.assertEqual(self.input_emitted, [])
+
+    def test_client_facing_question_requests_are_covered_without_transcript_guess(self):
+        for index, method in enumerate(INPUT_METHODS - {'mcpServer/elicitation/request'}):
+            self.send(request(40 + index, method=method))
+        self.settle()
+        self.assertEqual(len(self.input_emitted), 3)
+        self.assertEqual(self.emitted, [])
+        self.send({'method': 'turn/completed', 'params': {'threadId': 'thread', 'turnId': 'turn'}})
+        self.assertEqual(self.monitor.pending_count, 0)
+        self.assertEqual(len(self.resolved), 3)
+
+    def test_native_question_uses_transcript_identity_and_fast_answer_clears_it(self):
+        from vibecue.events import input_event_id
+        self.send(request(50, method='item/tool/requestUserInput'))
+        self.settle()
+        self.assertEqual(self.input_emitted[0][2], input_event_id('thread', 'turn', 'item'))
+        self.send({'id': 50, 'result': {'answers': {}}}, 'client')
+        expected = hashlib.sha256(('codex:' + input_event_id('thread', 'turn', 'item')).encode()).hexdigest()
+        self.assertEqual(self.resolved[0][0], expected)
+        # A transcript alert may predate the protocol request. Clear that exact
+        # alert even when the client answers before the protocol settle delay.
+        self.send(request(51, method='item/tool/requestUserInput'))
+        self.now += 0.1
+        self.send({'id': 51, 'result': {'answers': {}}}, 'client')
+        self.settle()
+        self.assertEqual(len(self.input_emitted), 1)
+        self.assertEqual(self.resolved[-1][0], expected)
 
 
 class BridgeInvocationTests(unittest.TestCase):
