@@ -81,25 +81,38 @@ struct CueTaskDetail {
     var startDate: Date? { startedAt }
     var finishedDate: Date? { finishedAt }
 
-    func elapsed(now: Date) -> TimeInterval? {
+    func elapsed(now: Date, running: Bool? = nil, stoppedAt: Date? = nil) -> TimeInterval? {
         if let start = startedAt {
-            if isActive { return max(0, now.timeIntervalSince(start)) }
+            if running ?? (status == "running") { return max(0, now.timeIntervalSince(start)) }
+            if let end = stoppedAt, end >= start { return end.timeIntervalSince(start) }
             if let end = finishedAt, end >= start { return end.timeIntervalSince(start) }
+            // Waiting and interrupted rows freeze at the last observed work;
+            // a newly generated telemetry snapshot is not new execution time.
+            if let end = lastActivity, end >= start { return end.timeIntervalSince(start) }
         }
         return elapsedSeconds
     }
 
-    func summaryLine(now: Date = Date(), eventDate: Date? = nil) -> String {
-        let scope: String
-        if let eventDate {
-            scope = startedAt.map { eventDate < $0.addingTimeInterval(-1) } ?? true ? "最新轮" : "本轮"
-        } else { scope = isActive ? "本轮" : "最新轮" }
-        let duration = elapsed(now: now).map { (elapsedStatus == "partial" ? "≥" : "") + Self.duration($0) } ?? "耗时待确认"
-        let tokens: String
+    private func scope(eventDate: Date?) -> String {
+        if let eventDate { return startedAt.map { eventDate < $0.addingTimeInterval(-1) } ?? true ? "最新轮" : "本轮" }
+        return isActive ? "本轮" : "最新轮"
+    }
+    func durationLine(now: Date = Date(), eventDate: Date? = nil, running: Bool? = nil, stoppedAt: Date? = nil) -> String {
+        let duration = elapsed(now: now, running: running, stoppedAt: stoppedAt).map { (elapsedStatus == "partial" ? "≥" : "") + Self.duration($0) } ?? "耗时待确认"
+        return "\(scope(eventDate: eventDate)) \(duration)"
+    }
+    private var tokenText: String {
         if let total = totalTokens, tokensStatus != "unknown" {
-            tokens = (tokensStatus == "partial" ? "≥" : "") + Self.compact(total) + " Tokens" + (tokensStatus == "partial" ? "（部分）" : "")
-        } else { tokens = "Tokens 待同步" }
-        return "\(scope) · \(duration) · \(tokens)"
+            return (tokensStatus == "partial" ? "≥" : "") + Self.compact(total) + " Tokens" + (tokensStatus == "partial" ? "（部分）" : "")
+        }
+        return "Tokens 待同步"
+    }
+    func tokenLine(eventDate: Date? = nil) -> String {
+        "\(scope(eventDate: eventDate)) · \(tokenText)"
+    }
+    func summaryLine(now: Date = Date(), eventDate: Date? = nil) -> String {
+        let duration = elapsed(now: now).map { (elapsedStatus == "partial" ? "≥" : "") + Self.duration($0) } ?? "耗时待确认"
+        return "\(scope(eventDate: eventDate)) · \(duration) · \(tokenText)"
     }
 
     var secondaryLine: String {
@@ -130,9 +143,9 @@ struct CueTaskDetail {
         }
         return exact(value)
     }
-    private static func duration(_ seconds: TimeInterval) -> String {
+    static func duration(_ seconds: TimeInterval) -> String {
         let total = Int(min(315_360_000, max(0, seconds)))
-        if total >= 3600 { return "\(total / 3600)时\((total % 3600) / 60)分" }
+        if total >= 3600 { return "\(total / 3600)时\((total % 3600) / 60)分\(total % 60)秒" }
         if total >= 60 { return "\(total / 60)分\(total % 60)秒" }
         return "\(total)秒"
     }
@@ -417,6 +430,7 @@ final class CueTaskHoverController: NSObject {
         let unknown = CueTaskDetail(raw: [:])
         let partial = CueTaskDetail(raw: ["status": "running", "started_at": now.addingTimeInterval(-125).timeIntervalSince1970, "elapsed_status": "partial", "total_tokens": 12345, "tokens_status": "partial", "model": "gpt-model", "reasoning_effort": "high", "service_tier": "fast"])
         let complete = CueTaskDetail(raw: ["status": "complete", "started_at": now.addingTimeInterval(-120).timeIntervalSince1970, "finished_at": now.addingTimeInterval(-60).timeIntervalSince1970, "total_tokens": 0, "tokens_status": "complete"])
+        let waiting = CueTaskDetail(raw: ["status": "waiting", "started_at": now.addingTimeInterval(-120).timeIntervalSince1970, "last_activity": now.addingTimeInterval(-60).timeIntervalSince1970, "elapsed_seconds": 120])
         let invalid = CueTaskDetail(raw: ["total_tokens": true, "input_tokens": -1, "output_tokens": 2.5, "elapsed_seconds": Double.infinity])
         let messages = CueTaskDetail(raw: ["messages": [["role": "system", "text": "SYSTEM-NOT-VISIBLE"], ["role": "tool", "text": "TOOL-ARGUMENTS-NOT-VISIBLE"], ["role": "reasoning", "text": "REASONING-NOT-VISIBLE"], ["role": "user", "text": "可见问题"], ["role": "assistant", "text": "可见回复"]]])
         let long = CueTaskDetail(raw: ["messages": (0..<10).map { ["role": "assistant", "text": String(repeating: "内容", count: 3000) + "\($0)"] }])
@@ -424,6 +438,9 @@ final class CueTaskHoverController: NSObject {
                        "task_detail_partial_has_explicit_lower_bound": partial.summaryLine(now: now).contains("≥") && partial.summaryLine(now: now).contains("部分"),
                        "task_detail_live_duration_advances": partial.elapsed(now: now.addingTimeInterval(10)) == 135,
                        "task_detail_completed_duration_stays_fixed": complete.elapsed(now: now.addingTimeInterval(10)) == 60,
+                       "task_detail_waiting_duration_freezes_at_last_work": waiting.elapsed(now: now) == 60 && waiting.elapsed(now: now.addingTimeInterval(10)) == 60,
+                       "task_detail_hour_duration_keeps_seconds": CueTaskDetail.duration(3725) == "1时2分5秒",
+                       "task_detail_row_tokens_exclude_separate_duration": partial.tokenLine().contains("Tokens") && !partial.tokenLine().contains("秒"),
                        "task_detail_explicit_zero_is_retained": complete.summaryLine(now: now).contains("0 Tokens"),
                        "task_detail_old_alert_labels_latest_turn": partial.summaryLine(now: now, eventDate: now.addingTimeInterval(-1000)).hasPrefix("最新轮"),
                        "task_detail_invalid_numbers_remain_unknown": invalid.totalTokens == nil && invalid.inputTokens == nil && invalid.outputTokens == nil && invalid.elapsedSeconds == nil,

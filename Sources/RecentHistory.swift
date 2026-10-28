@@ -368,7 +368,7 @@ private final class CueRecentRowButton: NSButton {
         icon.contentTintColor = tint; addSubview(icon)
         let heading = NSTextField(labelWithString: record.event.title)
         heading.identifier = NSUserInterfaceItemIdentifier("row-title")
-        heading.frame = NSRect(x: 42, y: 6, width: frame.width - 168, height: 21)
+        heading.frame = NSRect(x: 42, y: 6, width: frame.width - 212, height: 21)
         heading.font = .systemFont(ofSize: 13, weight: record.isOpened ? .regular : .semibold)
         heading.textColor = record.isOpened ? .secondaryLabelColor : .labelColor
         heading.lineBreakMode = .byTruncatingTail; addSubview(heading)
@@ -377,11 +377,11 @@ private final class CueRecentRowButton: NSButton {
         let date = DateFormatter(); date.locale = Locale(identifier: "zh_CN"); date.dateFormat = Calendar.current.isDateInToday(record.event.date) ? "HH:mm" : "MM-dd HH:mm"
         let metadata = NSTextField(labelWithString: "\(isRunning ? "上次提醒：" : "")\(kind) · \(date.string(from: record.event.date))\(record.isPinned ? " · 置顶" : "")")
         metadata.identifier = NSUserInterfaceItemIdentifier("row-metadata")
-        metadata.frame = NSRect(x: 42, y: 25, width: frame.width - 56, height: 15)
+        metadata.frame = NSRect(x: 42, y: 25, width: frame.width - 218, height: 15)
         metadata.font = .systemFont(ofSize: 10.5); metadata.textColor = .secondaryLabelColor; metadata.lineBreakMode = .byTruncatingTail; addSubview(metadata)
         let stateLabel = NSTextField(labelWithString: isRunning ? (record.isOpened ? "运行中 · 已打开" : "运行中 · 未读") : record.isOpened ? (record.manualPinned ? "已打开 · 置顶" : "已打开") : record.canOpen ? "未读 · 置顶" : "不可跳转")
         stateLabel.identifier = NSUserInterfaceItemIdentifier("row-state")
-        stateLabel.frame = NSRect(x: frame.width - 104, y: 8, width: 89, height: 18)
+        stateLabel.frame = NSRect(x: frame.width - 160, y: 8, width: 145, height: 18)
         stateLabel.alignment = .right; stateLabel.font = .systemFont(ofSize: 10.5, weight: .medium); stateLabel.textColor = isRunning ? .systemGreen : tint; addSubview(stateLabel)
         toolTip = "\(record.event.title)\n\(kind) · \(state)\(isRunning ? " · 当前正在运行" : "")"
         setAccessibilityLabel("\(isRunning ? "当前正在运行，" : "")\(state)，\(record.isPinned ? "已置顶，" : "")\(kind)，\(record.event.title)，\(date.string(from: record.event.date))")
@@ -471,7 +471,7 @@ private final class CueRunningRowButton: NSButton {
         icon.contentTintColor = .systemGreen; addSubview(icon)
         let heading = NSTextField(labelWithString: task.title)
         heading.identifier = NSUserInterfaceItemIdentifier("row-title")
-        heading.frame = NSRect(x: 42, y: 6, width: frame.width - 140, height: 21)
+        heading.frame = NSRect(x: 42, y: 6, width: frame.width - 212, height: 21)
         heading.font = .systemFont(ofSize: 13, weight: .medium); heading.lineBreakMode = .byTruncatingTail; addSubview(heading)
         let date = DateFormatter(); date.locale = Locale(identifier: "zh_CN")
         date.dateFormat = Calendar.current.isDateInToday(task.startDate) ? "HH:mm" : "MM-dd HH:mm"
@@ -479,12 +479,12 @@ private final class CueRunningRowButton: NSButton {
         date.dateFormat = "HH:mm"
         let metadata = NSTextField(labelWithString: "Codex · 开始 \(start) · 最近活动 \(date.string(from: task.updatedDate))")
         metadata.identifier = NSUserInterfaceItemIdentifier("row-metadata")
-        metadata.frame = NSRect(x: 42, y: 25, width: frame.width - 56, height: 15)
+        metadata.frame = NSRect(x: 42, y: 25, width: frame.width - 218, height: 15)
         metadata.font = .systemFont(ofSize: 10.5); metadata.textColor = .secondaryLabelColor
         metadata.lineBreakMode = .byTruncatingTail; addSubview(metadata)
         let state = NSTextField(labelWithString: "● 运行中")
         state.identifier = NSUserInterfaceItemIdentifier("row-state")
-        state.frame = NSRect(x: frame.width - 86, y: 8, width: 71, height: 18)
+        state.frame = NSRect(x: frame.width - 160, y: 8, width: 145, height: 18)
         state.alignment = .right; state.font = .systemFont(ofSize: 10.5, weight: .medium); state.textColor = .systemGreen; addSubview(state)
         identifier = NSUserInterfaceItemIdentifier(task.navigationID)
         toolTip = "\(task.title)\n正在运行 · 点击打开 Codex 对话"
@@ -590,6 +590,7 @@ final class CueStatusPopoverController: NSViewController {
     private var frozenRunningTargets: [CueBatchTarget] = []
     private var frozenAllTargets: [CueBatchTarget] = []
     private var pointerTimer: Timer?
+    private var elapsedTimer: Timer?
     private weak var pointerAnchor: NSView?
     // Nil is used only by isolated event-handler fixtures. Production always
     // reads the global pointer, even when another application remains active.
@@ -617,13 +618,19 @@ final class CueStatusPopoverController: NSViewController {
         }
     }
     override func viewDidAppear() {
-        super.viewDidAppear(); pointerTimer?.invalidate()
+        super.viewDidAppear(); pointerTimer?.invalidate(); elapsedTimer?.invalidate()
         let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in self?.reconcilePointerHover() }
         RunLoop.main.add(timer, forMode: .common); pointerTimer = timer
+        let elapsed = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, self.isViewLoaded, self.view.window?.isVisible == true else { return }
+            self.refreshElapsedLabels(now: Date())
+        }
+        RunLoop.main.add(elapsed, forMode: .common); elapsedTimer = elapsed
+        refreshElapsedLabels(now: Date())
         DispatchQueue.main.async { [weak self] in self?.reconcilePointerHover() }
     }
-    override func viewDidDisappear() { super.viewDidDisappear(); pointerTimer?.invalidate(); pointerTimer = nil; pointerAnchor = nil; hoverController.hide() }
-    deinit { pointerTimer?.invalidate() }
+    override func viewDidDisappear() { super.viewDidDisappear(); pointerTimer?.invalidate(); pointerTimer = nil; elapsedTimer?.invalidate(); elapsedTimer = nil; pointerAnchor = nil; hoverController.hide() }
+    deinit { pointerTimer?.invalidate(); elapsedTimer?.invalidate() }
 
     /// Status-item popovers can be visible while Codex remains the active app.
     /// Tracking is activeAlways, and this geometry check also handles a pointer
@@ -967,7 +974,7 @@ final class CueStatusPopoverController: NSViewController {
         let updatedCheckbox = stable.recentDocument?.subviews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "active-thread" }
         let updatedMetrics = stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-metrics:active-thread" }
         results["batch_background_refresh_preserves_checkbox_identity_and_frame"] = stableCheckbox != nil && stableCheckbox === updatedCheckbox && stableCheckbox?.frame == checkboxFrame
-        results["batch_background_refresh_preserves_metrics_identity_and_updates_value"] = stableMetrics != nil && stableMetrics === updatedMetrics && stableMetrics?.stringValue == completed.summaryLine(now: Date())
+        results["batch_background_refresh_preserves_metrics_identity_and_updates_value"] = stableMetrics != nil && stableMetrics === updatedMetrics && stableMetrics?.stringValue == completed.tokenLine()
         results["batch_completed_task_keeps_selection_and_shows_completion_in_place"] = stable.selectedThreads == selectedBeforeRefresh && stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "row-state" }?.stringValue == "已完成"
         stable.clearBatchSelection(); stable.selectRunning()
         results["batch_selection_scope_stays_frozen_until_exit"] = stable.selectedThreads == selectedBeforeRefresh && !stable.selectedThreads.contains("new-background") && stableCheckbox === updatedCheckbox
@@ -1068,6 +1075,50 @@ final class CueStatusPopoverController: NSViewController {
         geometry.pointerLocation = { NSPoint(x: 100000, y: 100000) }; geometry.reconcilePointerHover()
         results["nonkey_pointer_exit_releases_pending_hover"] = geometry.pointerAnchor == nil && !geometry.hoverController.isEngaged
         geometry.hoverController.hide(); geometryWindow.orderOut(nil); geometry.pointerTimer?.invalidate(); geometry.pointerTimer = nil
+        let clockHistory = CueRecentHistory(home: home.appendingPathComponent("live-second-clock"))
+        let clockNow = Date()
+        for id in ["clock-pin", "clock-done", "clock-wait"] {
+            let raw: [String: Any] = ["id": id, "kind": "complete", "title": id, "thread_id": id, "created_at": clockNow.addingTimeInterval(-70).timeIntervalSince1970]
+            clockHistory.append(CueEvent(try! JSONSerialization.data(withJSONObject: raw))!)
+            if id != "clock-pin" { clockHistory.markOpened(id: id, didOpen: true) }
+        }
+        clockHistory.followups.retain(threadID: "clock-follow", title: "待续运行", now: clockNow)
+        clockHistory.followups.setPinned(threadID: "clock-follow", pinned: true)
+        let clockTasks = ["clock-pin", "clock-follow", "clock-run"].map { id in
+            CueRunningTask(raw: ["thread_id": id, "title": id, "started_at": clockNow.addingTimeInterval(-65).timeIntervalSince1970, "last_activity": clockNow.timeIntervalSince1970])!
+        }
+        let clockDetail = CueTaskDetail(raw: ["status": "running", "started_at": clockNow.addingTimeInterval(-65).timeIntervalSince1970, "last_activity": clockNow.timeIntervalSince1970, "elapsed_status": "complete", "total_tokens": 1024, "tokens_status": "complete"])
+        let clockDone = CueTaskDetail(raw: ["status": "complete", "started_at": clockNow.addingTimeInterval(-65).timeIntervalSince1970, "finished_at": clockNow.addingTimeInterval(-5).timeIntervalSince1970, "elapsed_status": "complete"])
+        let clockWait = CueTaskDetail(raw: ["status": "waiting", "started_at": clockNow.addingTimeInterval(-65).timeIntervalSince1970, "last_activity": clockNow.addingTimeInterval(-5).timeIntervalSince1970, "elapsed_seconds": 65, "elapsed_status": "complete"])
+        let clockLost = CueRunningTask(raw: ["thread_id": "clock-lost", "started_at": clockNow.addingTimeInterval(-65).timeIntervalSince1970, "last_activity": clockNow.addingTimeInterval(-5).timeIntervalSince1970, "status": "interrupted"])!
+        let clock = CueStatusPopoverController(history: clockHistory, actions: liveActions)
+        clock.pointerLocation = { nil }
+        clock.update(status: "秒级时钟验收", enabled: true, soundEnabled: true, paused: false, runningTasks: clockTasks, interruptedTasks: [clockLost], taskDetails: ["clock-pin": clockDetail, "clock-follow": clockDetail, "clock-done": clockDone, "clock-wait": clockWait])
+        _ = clock.view
+        func clockField(_ id: String) -> NSTextField? {
+            clock.recentDocument?.subviews.flatMap(\.subviews).compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-elapsed:" + id }
+        }
+        let clockDocument = clock.recentDocument
+        let pinTime = clockField("clock-pin"), runTime = clockField("clock-run"), followTime = clockField("clock-follow")
+        let pinBefore = pinTime?.stringValue, runBefore = runTime?.stringValue, followBefore = followTime?.stringValue
+        let doneBefore = clockField("clock-done")?.stringValue, waitBefore = clockField("clock-wait")?.stringValue, lostBefore = clockField("clock-lost")?.stringValue
+        clock.select(id: "clock-pin")
+        let clockWindow = NSPanel(contentRect: NSRect(x: -10000, y: -10000, width: clock.view.bounds.width, height: clock.view.bounds.height), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        clockWindow.isReleasedWhenClosed = false; clockWindow.contentView = clock.view; clockWindow.orderFrontRegardless()
+        clock.viewDidAppear()
+        let originBeforeClock = clock.scroll.contentView.bounds.origin
+        RunLoop.current.run(until: Date().addingTimeInterval(1.15))
+        results["visible_clock_ticks_each_second_for_pinned_running_and_followup_rows"] = pinBefore != pinTime?.stringValue && runBefore != runTime?.stringValue && followBefore != followTime?.stringValue
+        results["second_clock_keeps_waiting_completed_and_interrupted_times_fixed"] = doneBefore == clockField("clock-done")?.stringValue && waitBefore == clockField("clock-wait")?.stringValue && lostBefore == clockField("clock-lost")?.stringValue
+        results["second_clock_preserves_document_row_identity_selection_and_scroll"] = clock.recentDocument === clockDocument && pinTime === clockField("clock-pin") && runTime === clockField("clock-run") && followTime === clockField("clock-follow") && clock.selectedID == "clock-pin" && clock.scroll.contentView.bounds.origin == originBeforeClock
+        let stateFrame = pinTime?.superview?.subviews.first(where: { $0.identifier?.rawValue == "row-state" })?.frame ?? .zero
+        results["row_elapsed_is_right_aligned_directly_below_state"] = pinTime?.alignment == .right && pinTime?.frame.maxX == stateFrame.maxX && (pinTime?.frame.minY ?? 0) >= stateFrame.maxY && (pinTime?.frame.minX ?? 0) > 300
+        results["list_clock_uses_common_runloop_timer_only_while_visible"] = clock.elapsedTimer?.isValid == true && clock.elapsedTimer?.timeInterval == 1
+        let staleComplete = CueTaskDetail(raw: ["status": "complete", "started_at": clockNow.addingTimeInterval(-1000).timeIntervalSince1970, "finished_at": clockNow.addingTimeInterval(-500).timeIntervalSince1970])
+        clock.taskDetails["clock-run"] = staleComplete
+        results["new_turn_clock_ignores_previous_turn_completed_details"] = clock.durationLine(threadID: "clock-run", eventDate: nil, now: clockNow) == "本轮 ≥1分5秒"
+        clock.viewDidDisappear(); clockWindow.orderOut(nil)
+        results["hidden_list_invalidates_second_clock"] = clock.elapsedTimer == nil
         return results
     }
 
@@ -1180,7 +1231,7 @@ final class CueStatusPopoverController: NSViewController {
     }
     private func navigationContextMenu(_ event: CueEvent, followup: CueThreadFollowup? = nil, includePin: Bool = true) -> NSMenu {
         let menu = NSMenu(); menu.autoenablesItems = false
-        func item(_ title: String, _ action: Selector, value: Any? = nil) -> NSMenuItem {
+        @discardableResult func item(_ title: String, _ action: Selector, value: Any? = nil) -> NSMenuItem {
             let next = NSMenuItem(title: title, action: action, keyEquivalent: ""); next.target = self
             next.representedObject = value ?? event; menu.addItem(next); return next
         }
@@ -1249,18 +1300,52 @@ final class CueStatusPopoverController: NSViewController {
     @objc private func openRecoveryFromMenu(_ sender: NSMenuItem) { if let task = sender.representedObject as? CueRunningTask { actions.openEvent(task.ephemeralCueEvent) } }
     @objc private func dismissRecoveryFromMenu(_ sender: NSMenuItem) { if let task = sender.representedObject as? CueRunningTask { actions.dismissInterrupted(task) } }
     private func addDetails(to row: NSButton, threadID: String, title: String, eventDate: Date?) {
-        let line = taskDetails[threadID]?.summaryLine(now: Date(), eventDate: eventDate) ?? "本轮用量暂不可用"
+        let line = taskDetails[threadID]?.tokenLine(eventDate: eventDate) ?? "本轮用量暂不可用"
         let metrics = NSTextField(labelWithString: line)
-        metrics.frame = NSRect(x: 42, y: 42, width: row.frame.width - 56, height: 14)
+        metrics.frame = NSRect(x: 42, y: 42, width: row.frame.width - 218, height: 14)
         metrics.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular); metrics.textColor = .secondaryLabelColor
         metrics.lineBreakMode = .byTruncatingTail; metrics.identifier = NSUserInterfaceItemIdentifier("task-metrics:" + threadID)
-        row.addSubview(metrics); row.toolTip = nil
-        row.setAccessibilityHelp(line + "。悬停查看本轮详情与最近对话；点击打开对应对话。")
+        row.addSubview(metrics)
+        let elapsed = NSTextField(labelWithString: durationLine(threadID: threadID, eventDate: eventDate, now: Date()))
+        elapsed.frame = NSRect(x: row.frame.width - 160, y: 27, width: 145, height: 15)
+        elapsed.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular); elapsed.textColor = .secondaryLabelColor
+        elapsed.alignment = .right; elapsed.lineBreakMode = .byTruncatingHead
+        elapsed.identifier = NSUserInterfaceItemIdentifier("task-elapsed:" + threadID)
+        row.addSubview(elapsed); row.toolTip = nil
+        row.setAccessibilityHelp(line + "，" + elapsed.stringValue + "。悬停查看本轮详情与最近对话；点击打开对应对话。")
     }
     private func refreshDetails(in row: NSButton, threadID: String, eventDate: Date?) {
-        let line = taskDetails[threadID]?.summaryLine(now: Date(), eventDate: eventDate) ?? "本轮用量暂不可用"
+        let line = taskDetails[threadID]?.tokenLine(eventDate: eventDate) ?? "本轮用量暂不可用"
         if let metrics = row.subviews.first(where: { $0.identifier?.rawValue == "task-metrics:" + threadID }) as? NSTextField { metrics.stringValue = line }
-        row.setAccessibilityHelp(line + "。悬停查看本轮详情与最近对话；点击打开对应对话。")
+        let elapsed = durationLine(threadID: threadID, eventDate: eventDate, now: Date())
+        if let field = row.subviews.first(where: { $0.identifier?.rawValue == "task-elapsed:" + threadID }) as? NSTextField { field.stringValue = elapsed }
+        row.setAccessibilityHelp(line + "，" + elapsed + "。悬停查看本轮详情与最近对话；点击打开对应对话。")
+    }
+    private func durationLine(threadID: String, eventDate: Date?, now: Date) -> String {
+        let active = runningTasks.filter { $0.threadID == threadID && !$0.needsRecovery }.max { $0.updatedDate < $1.updatedDate }
+        let recovery = active == nil ? interruptedTasks.filter { $0.threadID == threadID }.max { $0.updatedDate < $1.updatedDate } : nil
+        if let detail = taskDetails[threadID] {
+            let sameTurn = active == nil || active?.turnID.isEmpty == true || detail.turnID.isEmpty || active?.turnID == detail.turnID
+            let oldCompletion = active.map { task in detail.finishedAt.map { $0 < task.startDate.addingTimeInterval(-1) } ?? false } ?? false
+            if sameTurn && !oldCompletion {
+                return detail.durationLine(now: now, eventDate: eventDate, running: active != nil, stoppedAt: recovery?.updatedDate)
+            }
+        }
+        if let active { return "本轮 ≥" + CueTaskDetail.duration(max(0, now.timeIntervalSince(active.startDate))) }
+        if let recovery { return "已记录 ≥" + CueTaskDetail.duration(max(0, recovery.updatedDate.timeIntervalSince(recovery.startDate))) }
+        return "耗时待同步"
+    }
+    /// Update text only: no list rebuild, row reorder, hover or selection changes.
+    private func refreshElapsedLabels(now: Date) {
+        for child in recentDocument?.subviews ?? [] {
+            let threadID: String, eventDate: Date?
+            if let row = child as? CueRecentRowButton { threadID = row.record.event.threadID; eventDate = row.record.event.date }
+            else if let row = child as? CueRunningRowButton { threadID = row.task.threadID; eventDate = nil }
+            else { continue }
+            guard let field = child.subviews.first(where: { $0.identifier?.rawValue == "task-elapsed:" + threadID }) as? NSTextField else { continue }
+            let value = durationLine(threadID: threadID, eventDate: eventDate, now: now)
+            if field.stringValue != value { field.stringValue = value }
+        }
     }
     private func hover(_ inside: Bool, threadID: String, title: String, row: NSView) {
         if inside {

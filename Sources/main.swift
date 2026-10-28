@@ -294,6 +294,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var statusPopover: NSPopover?
     var statusPopoverController: CueStatusPopoverController?
     var usageDashboard: CueUsageDashboardController?
+    private var menuUsage: CueMenuBarUsageMonitor?
     private var recoveryClient: CueUsageClient?
     private var conversationClient: CueUsageClient?
     private var conversationWindows: [String: CueConversationController] = [:]
@@ -393,6 +394,11 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         startWatcher()
         usageDashboard = CueUsageDashboardController(home: home)
+        let menuUsage = CueMenuBarUsageMonitor(home: home)
+        menuUsage.onChange = { [weak self] in self?.refreshStatusItem(); self?.writeStatus() }
+        self.menuUsage = menuUsage
+        usageDashboard?.usageDidChange = { [weak menuUsage] in menuUsage?.refresh() }
+        menuUsage.start()
         usageDashboard?.startBackgroundSync()
         updateWatcherHealth()
         refreshMenu()
@@ -1263,9 +1269,20 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let exit = NSMenuItem(title: "结束 VibeCue", action: #selector(quit), keyEquivalent: "q")
         exit.target = self; menu.addItem(exit)
         shortcutMenu = menu
-        statusItem.button?.title = recentHistory.unopenedCount > 0 ? " \(recentHistory.unopenedCount)" : ""
-        statusItem.button?.toolTip = "VibeCue · \(recentHistory.unopenedCount) 条未读提醒 · \(runningTasks.count) 个任务正在运行 · \(interruptedTasks.count) 个中断待续"
+        refreshStatusItem()
         if statusPopover?.isShown == true { updateStatusPopover() }
+    }
+
+    private var menuWork: CueMenuBarWork {
+        CueMenuBarWork(records: recentHistory.records, running: runningTasks, interrupted: interruptedTasks, followups: recentHistory.followups.records)
+    }
+    private func refreshStatusItem() {
+        guard let button = statusItem?.button else { return }
+        let usage = menuUsage?.snapshot ?? CueMenuBarUsage(), work = menuWork
+        button.imagePosition = .imageLeading
+        button.attributedTitle = NSAttributedString(string: usage.title(work: work), attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)])
+        button.toolTip = usage.tooltip(work: work, health: watcherHealthText)
+        button.setAccessibilityLabel("VibeCue" + usage.title(work: work))
     }
 
     @objc func openUsage() {
@@ -1370,6 +1387,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "watcher_launch_error": watcherLaunchError, "watcher_restart_delay": watcherRestartDelay,
             "history_scope_active": historyScopeActive, "history_selected_path": historyURL?.path ?? "",
             "provider": current?.provider ?? "codex", "supported_providers": ["codex"],
+            "menu_bar_title": statusItem?.button?.title ?? "", "menu_running_chats": menuWork.running, "menu_pending_chats": menuWork.pending,
+            "menu_usage_available": menuUsage?.snapshot.isCurrent(now: Date()) ?? false,
+            "menu_usage_date": menuUsage?.snapshot.raw["date"] as? String ?? "",
+            "menu_usage_summary": menuUsage?.snapshot.summary ?? [:],
             "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
             "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
@@ -1393,6 +1414,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     func applicationWillTerminate(_ notification: Notification) {
         guard ownsLock else { if lockFD >= 0 { Darwin.close(lockFD) }; return }
         shuttingDown = true
+        menuUsage?.stop()
         usageDashboard?.stopBackgroundSync()
         conversationWindows.values.forEach { $0.stop() }; conversationClient?.stop(); recoveryClient?.stop()
         approvalLauncher?.terminate()
@@ -2298,6 +2320,12 @@ if let index = CommandLine.arguments.firstIndex(of: "--capture-conversation"), C
     _ = NSApplication.shared
     do { try CueConversationController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
     catch { print("对话详情窗口截图失败"); exit(1) }
+}
+if CommandLine.arguments.contains("--menu-bar-self-test") {
+    _ = NSApplication.shared
+    let results = CueMenuBarUsage.validationReport()
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
 }
 if CommandLine.arguments.contains("--usage-money-self-test") {
     _ = NSApplication.shared

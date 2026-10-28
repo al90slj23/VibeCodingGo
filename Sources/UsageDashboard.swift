@@ -186,6 +186,7 @@ private final class CueUsageHeatmap: NSView {
 
 final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     let home: URL
+    var usageDidChange: (() -> Void)?
     private let client: CueUsageClient
     private let surface = CueUsageSurface()
     private let titleLabel = NSTextField(labelWithString: "用量统计")
@@ -338,7 +339,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
                 self.lastSync = Date(); self.readSync(data)
             case .failure(let error): self.syncError = error.localizedDescription
             }
-            self.updateStatus(); self.query()
+            self.updateStatus(); self.query(); self.usageDidChange?()
         }
     }
     private func query(invalidate: Bool = false) {
@@ -445,7 +446,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         if preferencesController == nil {
             let filters = snapshot["filters"] as? [String: Any] ?? [:]
             let known = (filters["models"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
-            preferencesController = CueUsagePreferencesController(home: home, knownModels: known) { [weak self] in self?.query(invalidate: true) }
+            preferencesController = CueUsagePreferencesController(home: home, knownModels: known) { [weak self] in self?.query(invalidate: true); self?.usageDidChange?() }
         }
         preferencesController?.showWindow(nil)
     }
@@ -456,7 +457,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private func refreshExchange() {
         guard !exchangeRefreshing, Date().timeIntervalSince(lastExchangeRefresh) > 900 else { return }
         exchangeRefreshing = true; lastExchangeRefresh = Date()
-        client.run(["refresh"], module: "vibecue.usage_money") { [weak self] _ in self?.exchangeRefreshing = false; self?.query() }
+        client.run(["refresh"], module: "vibecue.usage_money") { [weak self] _ in self?.exchangeRefreshing = false; self?.query(); self?.usageDidChange?() }
     }
     @objc private func showInfo() {
         let sync = snapshot["sync"] as? [String: Any] ?? [:]

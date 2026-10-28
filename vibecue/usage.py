@@ -928,9 +928,104 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
         return result
 
 
+def today_summary(home=None, now=None, cc_path=None):
+    """Small, read-only menu-bar snapshot of the current local calendar day.
+
+    Unlike query(), this never initializes a database, scans source histories,
+    fetches an exchange rate, or reads request bodies/list rows. A successful
+    initial sync is required before an empty ledger can mean zero usage.
+    """
+    home = vibecue_directory(home)
+    now = time.time() if now is None else float(now)
+    if not math.isfinite(now):
+        raise ValueError('invalid summary timestamp')
+    local = datetime.fromtimestamp(now)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    result = {
+        'schema_version': SCHEMA_VERSION, 'available': False,
+        'date': local.date().isoformat(), 'timezone': local.astimezone().tzname(),
+        'utc_offset_seconds': int(local.astimezone().utcoffset().total_seconds()),
+        'day_start': midnight.timestamp(),
+        'day_end': (midnight + timedelta(days=1)).timestamp(),
+        'generated_at': now, 'summary': {},
+        'sync': {'last_synced_at': None, 'running': False, 'errors': [],
+                 'warnings': [], 'coverage': []},
+        'message': '尚未同步本机用量，今日数字暂不可用。',
+    }
+    groups = []
+    path = home / 'usage.sqlite3'
+    if path.is_file():
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.5)) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute('PRAGMA query_only=ON')
+                conn.execute('BEGIN')
+                raw = get_meta(conn, 'sync', {})
+                if not isinstance(raw, dict):
+                    raise ValueError('invalid sync metadata')
+                synced = raw.get('last_synced_at')
+                if isinstance(synced, bool) or not isinstance(synced, (int, float)) or not math.isfinite(synced) or not 0 < synced <= now + 60:
+                    synced = None
+                metadata = result['sync']
+                metadata['last_synced_at'] = synced
+                metadata['running'] = raw.get('running') is True
+                for key in ('errors', 'warnings'):
+                    metadata[key] = [label(item, 300) for item in raw.get(key, [])[:20]] if isinstance(raw.get(key), list) else []
+                if isinstance(raw.get('coverage'), list):
+                    metadata['coverage'] = [
+                        {'app': label(row.get('app'), 40), 'available': row.get('available') is True,
+                         'files': number(row.get('files')) or 0}
+                        for row in raw['coverage'][:20] if isinstance(row, dict)]
+                for key in ('historical_gaps', 'rebuild'):
+                    metadata[key] = raw.get(key) is True
+                # Only inspect an existing lock. Opening with 'a' would create
+                # files as a side effect of a read-only status query.
+                if metadata['running']:
+                    try:
+                        with (home / 'usage-sync.lock').open('rb') as check:
+                            try:
+                                fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                metadata['running'] = False
+                                metadata['warnings'].append('上次同步被中断；已有统计可能未更新')
+                            except BlockingIOError:
+                                pass
+                    except OSError:
+                        metadata['running'] = False
+                        metadata['warnings'].append('无法确认同步进程；已有统计可能未更新')
+                if synced is not None:
+                    sums = ','.join('COALESCE(SUM(' + key + '),0) AS ' + key
+                                    for key in TOKEN_COLUMNS + ('total_tokens',))
+                    groups = [dict(row) for row in conn.execute(
+                        'SELECT model,COUNT(*) AS requests,' + sums +
+                        ' FROM usage_requests WHERE timestamp>=? AND timestamp<=? GROUP BY model',
+                        (result['day_start'], now))]
+                    result['summary'] = {key: sum(row[key] for row in groups)
+                                         for key in ('requests',) + TOKEN_COLUMNS + ('total_tokens',)}
+                    result['available'] = True
+                    result['message'] = ('已有统计正在后台更新。' if metadata['running'] else
+                                         '部分来源记录未完整导入。' if metadata['errors'] or metadata['warnings'] else
+                                         '今日全部应用的本机用量；费用按 API 参考单价估算。')
+        except (OSError, sqlite3.Error, ValueError, TypeError, OverflowError):
+            result['available'] = False
+            result['summary'] = {}
+            result['message'] = '本机用量缓存暂不可读，今日数字暂不可用。'
+    from . import usage_money
+    if result['available']:
+        usage_money.decorate(home, result, groups, cc_path=cc_path, now=now)
+    else:
+        snapshot = usage_money.settings(home, cc_path=cc_path, now=now)
+        snapshot.pop('pricing', None)
+        result['money'] = snapshot
+    # The menu needs the selected display currency/rate, not the entire custom
+    # model-price editor payload on every refresh.
+    prefs = result['money'].get('prefs', {})
+    result['money']['prefs'] = {key: prefs[key] for key in ('currency', 'fx_mode', 'manual_rate') if key in prefs}
+    return result
+
+
 def main(argv=None):
     parser=argparse.ArgumentParser(description='VibeCue 本机历史 Token 用量')
-    parser.add_argument('command',choices=('sync','query'))
+    parser.add_argument('command',choices=('sync','query','today-summary'))
     parser.add_argument('--range',dest='period',choices=('today','7d','30d','all'),default='all')
     parser.add_argument('--app',default='all')
     parser.add_argument('--model',default='all')
@@ -943,6 +1038,8 @@ def main(argv=None):
     try:
         if args.command=='sync':
             result=sync()
+        elif args.command=='today-summary':
+            result=today_summary()
         else:
             result=query(period=args.period,app=args.app,model=args.model,source=args.source,
                          page=args.page,page_size=args.page_size,view=args.view)
