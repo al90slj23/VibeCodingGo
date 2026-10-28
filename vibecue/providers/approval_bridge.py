@@ -314,6 +314,10 @@ class _Observer:
             'transport': 'stdio', 'last_seen': time.time(),
             'last_protocol_at': self.monitor.last_protocol_at,
             'pending_human_requests': self.monitor.pending_count if healthy else 0,
+            # Only settled, actually emitted human waits affect the running
+            # task list. Fast automatic approvals never enter this set.
+            'pending_thread_ids': sorted({pending.thread_id for pending in self.monitor.pending.values()
+                                          if pending.emitted}) if healthy else [],
         }
         fd, temporary = tempfile.mkstemp(prefix='.bridge-', dir=directory)
         try:

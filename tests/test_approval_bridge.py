@@ -207,6 +207,40 @@ class ApprovalMonitorTests(unittest.TestCase):
 
 
 class BridgeInvocationTests(unittest.TestCase):
+    def test_running_task_filter_exposes_only_settled_manual_wait_thread_ids(self):
+        import threading
+        from vibecue.providers.approval_status import approval_status
+        with tempfile.TemporaryDirectory() as directory:
+            now = [100.0]
+            # Exercise health serialization without a worker thread or backend.
+            observer = object.__new__(_Observer)
+            observer.home = directory
+            observer.backend_pid = 12345
+            observer.session_id = 'fixture-running-waits'
+            observer.invalidated = threading.Event()
+            observer.finished = threading.Event()
+            observer.monitor = ApprovalStreamMonitor(home=directory, session_id=observer.session_id,
+                clock=lambda: now[0], emit=lambda *args: None, resolve=lambda *args: None)
+            monitor = observer.monitor
+            monitor.handle_message('server', request(), 100)
+            observer._health()
+            self.assertEqual(approval_status(directory)['pending_thread_ids'], [])
+            monitor.handle_message('client', {'id': 7, 'result': {'decision': 'accept'}}, 100.1)
+            now[0] = 100.5
+            monitor.flush()
+            observer._health()
+            self.assertEqual(approval_status(directory)['pending_thread_ids'], [])
+            monitor.handle_message('server', request(identifier=8, thread='manual-thread'), 100.5)
+            now[0] = 101
+            monitor.flush()
+            observer._health()
+            self.assertEqual(approval_status(directory)['pending_thread_ids'], ['manual-thread'])
+            payload = next((Path(directory) / 'bridges').glob('*.json')).read_text()
+            self.assertNotIn('PRIVATE', payload)
+            monitor.handle_message('client', {'id': 8, 'result': {'decision': 'accept'}}, 101.1)
+            observer._health()
+            self.assertEqual(approval_status(directory)['pending_thread_ids'], [])
+
     def test_only_real_stdio_server_invocations_are_observed(self):
         self.assertTrue(_is_stdio_app_server(['-c', 'features.code_mode_host=true',
                                               'app-server', '--analytics-default-enabled']))

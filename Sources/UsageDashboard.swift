@@ -30,7 +30,7 @@ final class CueUsageClient {
                 // Keep path/locale settings needed to find logs, but do not
                 // propagate unrelated API keys or authorization variables.
                 var environment: [String: String] = [:]
-                for key in ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
+                for key in ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "OPENCODE_DB"] {
                     if let value = inherited[key] { environment[key] = value }
                 }
                 environment["VIBECUE_HOME"] = home.path
@@ -186,7 +186,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private let client: CueUsageClient
     private let surface = CueUsageSurface()
     private let titleLabel = NSTextField(labelWithString: "用量统计")
-    private let subtitle = NSTextField(labelWithString: "本机历史记录 · Codex 与 Claude Code")
+    private let subtitle = NSTextField(labelWithString: "本机历史记录 · Codex、Claude Code 与 OpenCode")
     private let range = NSPopUpButton(), app = NSPopUpButton(), model = NSPopUpButton(), source = NSPopUpButton()
     private let syncButton = NSButton(title: "立即同步", target: nil, action: nil)
     private let infoButton = NSButton(title: "数据说明", target: nil, action: nil)
@@ -424,7 +424,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             return "\(name)：\(available ? "可读取" : "未找到记录或无法读取") · \(Int(number(row, "files"))) 个文件"
         }
         let alert = NSAlert(); alert.messageText = "本机历史用量来源"
-        var text = "读取 Codex 与 Claude Code 已保留的本地用量记录，不修改原日志。不同模型按日志字段区分；没有模型信息时保留 unknown。\n\nTokens 总量 = 新增输入 + 输出 + 缓存读取 + 缓存创建。原日志未记录供应商时，来源显示为会话日志；这不是供应商账单或订阅扣费。删除的日志、没有 usage 的记录无法还原。\n\n" + details.joined(separator: "\n")
+        var text = "读取 Codex、Claude Code 与 OpenCode 已保留的本地用量记录，不修改源数据。OpenCode 支持本机 SQLite 与历史消息文件，只读取用量和模型字段。不同模型按日志字段区分；没有模型信息时保留 unknown。\n\nTokens 总量 = 新增输入 + 输出 + 缓存读取 + 缓存创建；OpenCode 单独记录的 reasoning 归入输出。OpenCode 来源显示日志中的 provider ID，其他未记录供应商时显示会话日志；这不是供应商账单或订阅扣费。删除的日志、没有 usage 的记录无法还原。\n\n" + details.joined(separator: "\n")
         if !warnings.isEmpty {
             text += "\n\n导入提示：\n" + warnings.prefix(8).joined(separator: "\n")
             text += "\n暂缓文件：\(Int(number(sync, "deferred_files")))；损坏记录：\(Int(number(sync, "malformed_records")))；超过读取上限：\(Int(number(sync, "oversized_records")))。"
@@ -502,8 +502,11 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         if let item = popup.itemArray.first(where: { $0.representedObject as? String == selected }) { popup.select(item) } else { popup.selectItem(at: 0) }
     }
     private func number(_ row: [String: Any], _ key: String) -> Double { (row[key] as? NSNumber)?.doubleValue ?? 0 }
-    private func appName(_ id: String) -> String { id == "codex" ? "Codex" : id == "claude" ? "Claude Code" : id }
-    private func sourceName(_ id: String) -> String { ["codex_session": "Codex 会话日志", "claude_session": "Claude 会话日志"][id] ?? id }
+    private func appName(_ id: String) -> String { ["codex": "Codex", "claude": "Claude Code", "opencode": "OpenCode"][id] ?? id }
+    private func sourceName(_ id: String) -> String {
+        if id.hasPrefix("opencode_provider:") { return "OpenCode · " + String(id.dropFirst("opencode_provider:".count)) }
+        return ["codex_session": "Codex 会话日志", "claude_session": "Claude 会话日志", "opencode_session": "OpenCode 会话日志"][id] ?? id
+    }
     static func integer(_ value: Double) -> String {
         let formatter = NumberFormatter(); formatter.numberStyle = .decimal; formatter.maximumFractionDigits = 0
         return formatter.string(from: NSNumber(value: value)) ?? "0"

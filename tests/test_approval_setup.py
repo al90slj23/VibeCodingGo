@@ -12,6 +12,19 @@ from vibecue.providers.approval_status import approval_status
 
 
 class ApprovalStatusTests(unittest.TestCase):
+    def test_pending_threads_require_healthy_source_and_safe_identifiers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / 'bridges'
+            folder.mkdir()
+            now = time.time()
+            live = {'pid': os.getpid(), 'transport': 'stdio', 'connected': True,
+                    'last_seen': now, 'pending_human_requests': 1,
+                    'pending_thread_ids': ['main-thread', 'bad/path', 42]}
+            (folder / 'live.json').write_text(json.dumps(live))
+            (folder / 'stale.json').write_text(json.dumps(dict(live, last_seen=now - 20,
+                                                              pending_thread_ids=['stale-thread'])))
+            self.assertEqual(approval_status(directory, now)['pending_thread_ids'], ['main-thread'])
+
     def test_live_stdio_source_and_stale_dead_invalid_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             home=Path(directory);folder=home/'bridges';folder.mkdir()

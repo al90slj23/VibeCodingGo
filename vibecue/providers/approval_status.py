@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 from ..events import vibecue_directory
@@ -26,10 +27,14 @@ def approval_status(home=None, now=None):
                 continue
             os.kill(pid, 0)
             data['pending_human_requests'] = max(0, min(512, int(data.get('pending_human_requests', 0))))
+            pending = data.get('pending_thread_ids', [])
+            data['pending_thread_ids'] = [tid for tid in pending[:512]
+                                          if isinstance(tid, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,200}', tid)] if isinstance(pending, list) else []
             sources.append(data)
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return {'connected': bool(sources), 'status': 'connected' if sources else 'disconnected',
             'source': 'codex-client-approval-stream', 'live_sources': len(sources),
             'pending_count': sum(s['pending_human_requests'] for s in sources),
+            'pending_thread_ids': sorted({tid for source in sources for tid in source['pending_thread_ids']}),
             'last_seen': max((float(s['last_seen']) for s in sources), default=0)}

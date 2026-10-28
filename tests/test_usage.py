@@ -48,7 +48,7 @@ class UsageTests(unittest.TestCase):
         self.home=self.base/'home';self.home.mkdir()
         self.codex=self.base/'codex';self.codex.mkdir()
         self.claude=self.base/'claude';self.claude.mkdir()
-        (self.home/'usage-sources.json').write_text(json.dumps(dict(codex_roots=[str(self.codex)],claude_roots=[str(self.claude)])))
+        (self.home/'usage-sources.json').write_text(json.dumps(dict(codex_roots=[str(self.codex)],claude_roots=[str(self.claude)],opencode_roots=[])))
 
     def write(self,name,records,app='codex',partial=b''):
         path=(self.codex if app=='codex' else self.claude)/name
@@ -58,6 +58,30 @@ class UsageTests(unittest.TestCase):
 
     def result(self,**kw):
         return query(self.home,**kw)
+
+    def test_opencode_sync_discovery_provider_filter_and_duplicate_roots(self):
+        import sqlite3
+        root=self.base/'opencode';root.mkdir()
+        path=root/'opencode.db'
+        with sqlite3.connect(path) as source:
+            source.execute('CREATE TABLE message (id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT)')
+            value={'role':'assistant','modelID':'model-open','providerID':'provider-open',
+                   'tokens':{'input':10,'output':3,'reasoning':2,'cache':{'read':8,'write':1}}}
+            source.execute('INSERT INTO message VALUES (?,?,?,?,?)',('msg-one','session-one',1790816400000,1790816400000,json.dumps(value)))
+        config=self.home/'usage-sources.json'
+        roots=json.loads(config.read_text());roots['opencode_roots']=[str(root),str(path)]
+        config.write_text(json.dumps(roots))
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],1)
+        self.assertEqual(data['summary']['total_tokens'],24)
+        self.assertEqual(self.result(app='opencode')['summary']['requests'],1)
+        self.assertEqual(self.result(source='opencode_provider:provider-open')['summary']['total_tokens'],24)
+        self.assertIn({'id':'opencode_provider:provider-open','name':'OpenCode · provider-open'},data['filters']['sources'])
+        self.assertIn('opencode',data['supported_apps'])
+        coverage=next(row for row in data['sync']['coverage'] if row['app']=='opencode')
+        self.assertEqual(coverage['files'],1)
+        self.assertTrue(coverage['available'])
+        self.assertEqual(sync(self.home)['sync']['imported'],0)
 
     def test_coverage_warning_survives_unchanged_incremental_scan(self):
         self.write('bad.jsonl', [meta(), token(last=counts(10,1))], partial=b'not-json\n')
@@ -244,6 +268,54 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(data['summary']['total_tokens'],250)
         self.assertEqual(data['sync']['deferred_files'],0)
 
+    def test_zero_status_before_sparse_ancestor_replay_does_not_end_prefix(self):
+        original=token(counts(100,10),counts(100,10))
+        self.write('ancestor.jsonl',[meta('ancestor'),original])
+        # The immediate parent retained only its own suffix. Its ancestor is
+        # the evidence for the child's first copied nonzero snapshot.
+        self.write('parent.jsonl',[meta('parent','ancestor','2026-10-01T01:30:00Z'),
+                   token(counts(150,20),counts(50,10),timestamp='2026-10-01T02:00:00Z')])
+        zero=counts(0);zero['total_tokens']=93522
+        copied=json.loads(json.dumps(original));copied['timestamp']='2026-10-01T02:30:01Z'
+        self.write('child.jsonl',[meta('child','parent','2026-10-01T02:30:00Z'),
+                   token(counts(90,9),zero,timestamp='2026-10-01T02:30:01Z'),copied,
+                   token(counts(220,30),counts(70,10),timestamp='2026-10-01T03:00:00Z')])
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],3)
+        self.assertEqual(data['summary']['total_tokens'],250)
+        self.assertEqual(sum(x['total_tokens'] for x in data['logs'] if x['thread_id']=='child'),80)
+        self.assertEqual(data['sync']['deferred_files'],0)
+        self.assertEqual(sync(self.home)['summary']['total_tokens'],250)
+
+    def test_ancestor_matches_remain_ordered_and_stop_at_first_new_request(self):
+        first=token(counts(100,10),counts(100,10))
+        second=token(counts(150,20),counts(50,10),timestamp='2026-10-01T01:10:00Z')
+        self.write('ancestor.jsonl',[meta('ancestor'),first,second])
+        self.write('parent.jsonl',[meta('parent','ancestor','2026-10-01T01:30:00Z'),
+                   token(counts(220,30),counts(70,10),timestamp='2026-10-01T02:00:00Z')])
+        replay=json.loads(json.dumps([second,first,second]))
+        for event in replay:event['timestamp']='2026-10-01T02:30:01Z'
+        self.write('child.jsonl',[meta('child','parent','2026-10-01T02:30:00Z'),*replay])
+        data=sync(self.home)
+        # After the inherited second event, the earlier first event cannot
+        # move the replay cursor backwards. It and the later equal request
+        # remain billable once the prefix has ended.
+        self.assertEqual(data['summary']['requests'],5)
+        self.assertEqual(data['summary']['total_tokens'],420)
+        self.assertEqual(sum(x['total_tokens'] for x in data['logs'] if x['thread_id']=='child'),170)
+
+    def test_ancestor_work_after_parent_fork_is_not_inherited_by_child(self):
+        later=token(counts(150,20),counts(50,10),timestamp='2026-10-01T02:00:00Z')
+        self.write('ancestor.jsonl',[meta('ancestor'),token(counts(100,10),counts(100,10)),later])
+        self.write('parent.jsonl',[meta('parent','ancestor','2026-10-01T01:30:00Z'),
+                   token(counts(220,30),counts(70,10),timestamp='2026-10-01T02:15:00Z')])
+        same_counts=json.loads(json.dumps(later));same_counts['timestamp']='2026-10-01T03:00:01Z'
+        self.write('child.jsonl',[meta('child','parent','2026-10-01T03:00:00Z'),same_counts])
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],4)
+        self.assertEqual(data['summary']['total_tokens'],310)
+        self.assertEqual(sum(x['total_tokens'] for x in data['logs'] if x['thread_id']=='child'),60)
+
     def test_import_upgrade_backs_up_and_rebuilds_only_codex(self):
         self.write('parent.jsonl',[meta('parent'),token(counts(100,10),counts(100,10))])
         self.write('claude.jsonl',[claude('stable-claude')],app='claude')
@@ -257,7 +329,7 @@ class UsageTests(unittest.TestCase):
         self.assertTrue(rebuilt['sync']['rebuild'])
         self.assertEqual(rebuilt['summary']['total_tokens'],first['summary']['total_tokens'])
         self.assertEqual(reminder.read_text(),'reminder fixture')
-        backups=list((self.home/'backups').glob('usage-before-codex-replay-v3-*.sqlite3'))
+        backups=list((self.home/'backups').glob('usage-before-codex-replay-v4-*.sqlite3'))
         self.assertEqual(len(backups),1)
         self.assertEqual(backups[0].stat().st_mode&0o777,0o600)
         import sqlite3

@@ -24,13 +24,15 @@ import time
 import uuid
 
 from .events import vibecue_directory, codex_directory
+from . import usage_opencode
 
 SCHEMA_VERSION = 1
-CODEX_IMPORT_VERSION = 3
+CODEX_IMPORT_VERSION = 4
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 TOKEN_COLUMNS = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens')
-APPS = {'codex': 'Codex', 'claude': 'Claude Code'}
-SOURCES = {'codex_session': 'Codex · 本地会话', 'claude_session': 'Claude Code · 本地会话'}
+APPS = {'codex': 'Codex', 'claude': 'Claude Code', 'opencode': 'OpenCode'}
+SOURCES = {'codex_session': 'Codex · 本地会话', 'claude_session': 'Claude Code · 本地会话',
+           'opencode_session': 'OpenCode · 本地会话'}
 
 
 def stamp(value):
@@ -90,8 +92,10 @@ def fresh_counts(counts):
 def default_roots():
     codex = codex_directory()
     claude = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude').expanduser()
+    opencode = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'opencode'
     return {'codex_roots': [str(codex / 'sessions'), str(codex / 'archived_sessions')],
-            'claude_roots': [str(claude / 'projects')]}
+            'claude_roots': [str(claude / 'projects')],
+            'opencode_roots': [os.environ.get('OPENCODE_DB') or str(opencode)]}
 
 
 def source_roots(home):
@@ -181,7 +185,7 @@ def get_meta(conn, key, fallback=None):
     return json.loads(row[0]) if row else fallback
 
 
-def write_request(conn, request_id, timestamp, app, model, thread_id, counts):
+def write_request(conn, request_id, timestamp, app, model, thread_id, counts, source=None):
     if timestamp is None or not any(counts):
         return 'skipped'
     model = label(model, 180) or 'unknown'
@@ -197,7 +201,7 @@ def write_request(conn, request_id, timestamp, app, model, thread_id, counts):
     conn.execute('''INSERT OR REPLACE INTO usage_requests
       (id,timestamp,app,source,model,thread_id,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,total_tokens,date)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-      (request_id, timestamp, app, app + '_session', model, label(thread_id, 200), *counts, sum(counts), day))
+      (request_id, timestamp, app, source or app + '_session', model, label(thread_id, 200), *counts, sum(counts), day))
     return 'updated' if row is not None else 'imported'
 
 
@@ -283,22 +287,48 @@ def record_codex_timeline(conn, state, timestamp, signature):
         (event_id,state['session'],timestamp,signature))
 
 
-def inherited_codex_snapshot(conn, state, key, timestamp, totals=None, signature=None):
+def inherited_codex_snapshot(conn, state, key, timestamp, totals=None, signature=None, zero_usage=False):
     session = state['session']
     conn.execute('INSERT OR IGNORE INTO usage_codex_snapshots VALUES (?,?,?,?)',
                  (session,key,timestamp,json.dumps(totals) if totals else None))
     parent=state.get('parent')
     if not parent or not state.get('prefix'):
         return False
+    if state.get('created') is None:
+        raise Deferred('子会话缺少可靠创建时间，已暂缓继承用量对齐')
+    if zero_usage:
+        # A fork can prepend a status snapshot whose last fields were cleared.
+        # It describes no request and cannot end or advance the replay prefix.
+        if totals:
+            state['highwater']=totals
+        return True
     index = state.get('_runtime_parent_index')
     if index is None:
-        if state.get('created') is None:
-            raise Deferred('子会话缺少可靠创建时间，已暂缓继承用量对齐')
+        # An immediate parent can retain only a sparse suffix. Its own fork
+        # ancestry supplies the earlier history, bounded at each descendant's
+        # creation time so another branch's later work is never inherited.
+        lineage=[]
+        ancestor,cutoff=parent,state['created']
+        seen={session}
+        while ancestor:
+            if ancestor in seen or len(lineage)>=64:
+                raise Deferred('父会话继承链无法可靠对齐，已暂缓子会话用量')
+            seen.add(ancestor)
+            metadata=conn.execute('SELECT parent,created,complete FROM usage_codex_sessions WHERE id=?',(ancestor,)).fetchone()
+            if not metadata or not metadata['complete']:
+                raise Deferred('祖先会话尚未可读，已暂缓子会话以防继承历史重复计数')
+            lineage.append((ancestor,cutoff))
+            ancestor,cutoff=metadata['parent'],metadata['created']
+            if ancestor and cutoff is None:
+                raise Deferred('祖先会话缺少可靠创建时间，已暂缓继承用量对齐')
         index = {}
-        for ordinal, row in enumerate(conn.execute('''SELECT signature
-            FROM usage_codex_timeline WHERE session_id=? AND timestamp<=?
-            ORDER BY timestamp,position''', (parent,state['created']))):
-            index.setdefault(row['signature'], []).append(ordinal)
+        ordinal=0
+        for ancestor,cutoff in reversed(lineage):
+            for row in conn.execute('''SELECT signature
+                FROM usage_codex_timeline WHERE session_id=? AND timestamp<=?
+                ORDER BY timestamp,position''', (ancestor,cutoff)):
+                index.setdefault(row['signature'], []).append(ordinal)
+                ordinal+=1
         state['_runtime_parent_index'] = index
     positions = index.get(signature, ())
     offset = bisect.bisect_left(positions, int(state.get('parent_replay_cursor', 0)))
@@ -451,7 +481,8 @@ def parse_codex(conn, item, state, report):
     key = digest(timestamp, raw_total, raw_last)
     replay_signature = codex_numeric_signature('token',info.get('total_token_usage'),info.get('last_token_usage'))
     record_codex_timeline(conn,state,timestamp,replay_signature)
-    if inherited_codex_snapshot(conn,state,key,timestamp,raw_total,replay_signature):
+    zero_usage=(raw_last is not None and not any(raw_last[:4])) or (raw_last is None and raw_total is not None and not any(raw_total[:4]))
+    if inherited_codex_snapshot(conn,state,key,timestamp,raw_total,replay_signature,zero_usage):
         state['last_signature']=signature
         return
     if raw_total is not None:
@@ -690,9 +721,22 @@ def sync(home=None):
                 set_meta(conn,'sync',report);conn.commit()
                 roots = source_roots(home)
                 files = []
+                opencode_kinds = {}
                 seen_paths = set()
                 app_available = {app:False for app in APPS}
                 for app, root in roots:
+                    if app == 'opencode':
+                        if root.is_dir() or root.is_file():
+                            app_available[app] = True
+                        try:
+                            for kind, path in usage_opencode.discover(root):
+                                resolved = path.resolve()
+                                if (app, str(resolved)) not in seen_paths:
+                                    files.append((app, resolved)); seen_paths.add((app, str(resolved)))
+                                    opencode_kinds[str(resolved)] = kind
+                        except OSError:
+                            report['errors'].append('OpenCode：部分用量来源无法读取')
+                        continue
                     if not root.is_dir():
                         continue
                     app_available[app] = True
@@ -745,7 +789,10 @@ def sync(home=None):
                     before = dict(report)
                     try:
                         with conn:
-                            scan_file(conn,app,path,report)
+                            if app == 'opencode':
+                                usage_opencode.scan(conn,path,report,write_request,kind=opencode_kinds[str(path)])
+                            else:
+                                scan_file(conn,app,path,report)
                     except Deferred as error:
                         for key in ('imported','updated','duplicates','bytes_read'):
                             report[key] = before[key]
@@ -840,9 +887,13 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
         heat_params=base_params+[heat_start,now]
         days=[dict(r) for r in conn.execute('SELECT date,SUM(total_tokens) AS tokens,COUNT(*) AS requests FROM usage_requests WHERE '+
                ' AND '.join(heat_clauses)+' GROUP BY date ORDER BY date',heat_params)]
+        sources = dict(SOURCES)
+        for source_row in conn.execute('SELECT DISTINCT source FROM usage_requests ORDER BY source'):
+            source_id = source_row[0]
+            sources.setdefault(source_id, 'OpenCode · ' + source_id[len('opencode_provider:'):] if source_id.startswith('opencode_provider:') else source_id)
         filters={'apps':[{'id':k,'name':v} for k,v in APPS.items()],
                  'models':[{'id':r[0],'name':r[0]} for r in conn.execute('SELECT DISTINCT model FROM usage_requests ORDER BY model')],
-                 'sources':[{'id':k,'name':v} for k,v in SOURCES.items()]}
+                 'sources':[{'id':k,'name':v} for k,v in sources.items()]}
         metadata=get_meta(conn,'sync',{'running':False,'last_synced_at':None,'errors':[],'warnings':[],'coverage':[]})
         # A terminated scanner must not leave the UI saying "同步中" forever.
         if metadata.get('running'):

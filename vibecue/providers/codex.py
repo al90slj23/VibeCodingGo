@@ -13,6 +13,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -28,6 +29,8 @@ from .approval_status import approval_status
 
 MAX_READ = 1_048_576
 MAX_RECORD = 2_097_152
+MAX_PRIME = 2_097_152
+ACTIVITY_TTL = 24 * 60 * 60
 MAX_PENDING_DELIVERIES = 512
 DELIVERY_TTL = 120
 
@@ -35,9 +38,13 @@ DELIVERY_TTL = 120
 def record_time(item):
     value = item.get('timestamp')
     try:
+        if isinstance(value, bool):
+            return None
         if isinstance(value, (int, float)):
-            return float(value) / 1000 if value > 10_000_000_000 else float(value)
-        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+            result = float(value) / 1000 if value > 10_000_000_000 else float(value)
+        else:
+            result = datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+        return result if math.isfinite(result) else None
     except (ValueError, TypeError, OverflowError):
         return None
 
@@ -131,6 +138,7 @@ def strip_js_literals(code):
 
 
 _JS_INPUT = re.compile(r'\bawait\s+tools\.(?:functions__)?request_user_input(?:_async)?\s*\(')
+_JS_BLOCKING_INPUT = re.compile(r'\bawait\s+tools\.(?:functions__)?request_user_input\s*\(')
 _INPUT_NAMES = frozenset(('request_user_input', 'request_user_input_async'))
 
 
@@ -146,30 +154,137 @@ class Interpreter:
         self.pending_ids = set()
         self.next_retry = 0.0
         self.dropped_deliveries = 0
+        self.activity_state = 'idle'
+        self.activity_turn_id = ''
+        self.activity_started_at = 0.0
+        self.last_activity = 0.0
+        self.activity_watermark = 0.0
+        self.activity_terminal_at = 0.0
+        self.blocking_calls = set()
+        self.context_readable = True
 
     def prime_context(self):
-        """Recover a live turn's ID without replaying any historical alerts."""
+        """Recover bounded tail state without replaying historical alerts.
+
+        No terminal/start marker in the window means unknown/idle unless a
+        definite commentary or tool call establishes current work. Token/status
+        refreshes alone cannot invent a task or restart a completed turn.
+        """
+        self.activity_state = 'idle'
+        self.activity_turn_id = ''
+        self.activity_started_at = self.last_activity = 0.0
+        self.activity_watermark = self.activity_terminal_at = 0.0
+        self.blocking_calls.clear()
+        self.context_readable = False
         try:
             with self.metadata.path.open('rb') as stream:
-                size = self.metadata.path.stat().st_size
-                stream.seek(max(0, size - 131072))
-                if size > 131072:
-                    stream.readline()
-                for line in stream:
+                size = os.fstat(stream.fileno()).st_size
+                start = max(0, size - MAX_PRIME)
+                stream.seek(start)
+                data = stream.read(MAX_PRIME)
+                lines = data.split(b'\n')[:-1]
+                if start and lines:
+                    lines.pop(0)
+                for line in lines:
                     try:
                         item = json.loads(line)
+                        if not isinstance(item, dict):
+                            continue
                         payload = item.get('payload', {})
                         if not isinstance(payload, dict):
                             continue
-                        if item.get('type') == 'session_meta':
-                            self.main = is_main_source(payload.get('source', self.metadata.source))
-                        turn_id = payload.get('turn_id') or payload.get('root_turn_id')
-                        if turn_id:
-                            self.turn_id = str(turn_id)
+                        self._observe_activity(item)
+                        if record_time(item) is not None:
+                            turn_id = payload.get('turn_id') or payload.get('root_turn_id')
+                            if turn_id:
+                                self.turn_id = str(turn_id)
                     except (ValueError, TypeError):
                         continue
+            self.context_readable = True
         except OSError:
             pass
+
+    def _observe_activity(self, item):
+        payload = item.get('payload')
+        if not isinstance(payload, dict):
+            return
+        category, event_type = item.get('type'), payload.get('type')
+        if category == 'session_meta':
+            if not payload.get('id') or str(payload['id']) == self.metadata.thread_id:
+                self.main = is_main_source(payload.get('source', self.metadata.source))
+                if not self.main:
+                    self.activity_state = 'idle'
+                    self.blocking_calls.clear()
+            return
+        if not self.main or not is_main_source(self.metadata.source):
+            return
+        timestamp = record_time(item)
+        if timestamp is None or timestamp < self.activity_watermark:
+            return
+        turn = str(payload.get('turn_id') or payload.get('root_turn_id') or '')
+        starts = category == 'turn_context' or (category == 'event_msg' and event_type == 'task_started')
+        ends = category == 'event_msg' and event_type in ('task_complete', 'task_completed', 'turn_aborted', 'task_aborted')
+        final = category == 'response_item' and event_type == 'message' and payload.get('role') == 'assistant' and payload.get('phase') == 'final_answer'
+        if ends or final:
+            if turn and self.activity_turn_id and turn != self.activity_turn_id:
+                return
+            self.activity_state = 'idle'
+            self.activity_watermark = self.activity_terminal_at = timestamp
+            self.blocking_calls.clear()
+            return
+        if starts:
+            if self.activity_state == 'idle' or (turn and turn != self.activity_turn_id):
+                self.activity_started_at = timestamp
+            self.activity_turn_id = turn or self.activity_turn_id or self.turn_id
+            self.activity_state = 'running'
+            self.last_activity = self.activity_watermark = timestamp
+            self.blocking_calls.clear()
+            return
+        if category != 'response_item':
+            # These are activity only inside an already-established live turn.
+            if self.activity_state == 'running' and category == 'event_msg' and event_type in ('token_count', 'agent_reasoning'):
+                self.last_activity = self.activity_watermark = timestamp
+            return
+        name = str(payload.get('name', '')).split('.')[-1].removeprefix('functions__')
+        call_id = str(payload.get('call_id') or payload.get('tool_call_id') or payload.get('id') or '')
+        output = event_type in ('function_call_output', 'custom_tool_call_output', 'tool_result')
+        if output:
+            if self.activity_state == 'waiting' and call_id and call_id in self.blocking_calls:
+                self.blocking_calls.remove(call_id)
+                self.activity_watermark = timestamp
+                if not self.blocking_calls:
+                    self.activity_state = 'running'
+                    self.last_activity = timestamp
+            return
+        calling = event_type in ('function_call', 'custom_tool_call')
+        commentary = event_type == 'message' and payload.get('role') == 'assistant' and payload.get('phase') == 'commentary'
+        if not calling and not commentary:
+            return
+        if timestamp <= self.activity_terminal_at:
+            return
+        blocking = ((event_type == 'function_call' and name == 'request_user_input') or
+                    (event_type == 'custom_tool_call' and name == 'exec' and
+                     _JS_BLOCKING_INPUT.search(strip_js_literals(payload.get('input', '')))))
+        if self.activity_state == 'idle':
+            self.activity_started_at = timestamp
+        self.activity_turn_id = turn or self.activity_turn_id or self.turn_id
+        self.activity_watermark = self.last_activity = timestamp
+        if blocking:
+            self.activity_state = 'waiting'
+            if call_id:
+                self.blocking_calls.add(call_id)
+        else:
+            self.activity_state = 'running'
+            self.blocking_calls.clear()
+
+    def running_task(self, now=None):
+        now = time.time() if now is None else now
+        if (self.activity_state != 'running' or not self.main or not self.context_readable or
+                not is_main_source(self.metadata.source) or not -60 <= now - self.last_activity <= ACTIVITY_TTL):
+            return None
+        return {'thread_id': self.metadata.thread_id, 'title': self.metadata.title,
+                'provider': 'codex', 'turn_id': self.activity_turn_id,
+                'started_at': self.activity_started_at, 'last_activity': self.last_activity}
 
     def _discard_pending(self, dropped=False):
         _, event = self.pending.popleft()
@@ -219,8 +334,8 @@ class Interpreter:
             return
         category = item.get('type')
         event_type = payload.get('type')
+        self._observe_activity(item)
         if category == 'session_meta':
-            self.main = is_main_source(payload.get('source', self.metadata.source))
             return
         if not self.main:
             return
@@ -316,6 +431,8 @@ class Watcher:
                 if tail.path != metadata.path:
                     tail.path = metadata.path
                     tail.inode = 0
+                    interpreter.metadata.path = metadata.path
+                    interpreter.context_readable = False
                 continue
             tail = TailReader(metadata.path)
             try:
@@ -348,7 +465,12 @@ class Watcher:
             self.discover()
         for tail, interpreter in list(self.watched.values()):
             interpreter.flush_pending()
-            for item in tail.read_records():
+            old_inode, old_offset = tail.inode, tail.offset
+            records = tail.read_records()
+            if not tail.read_error and (not interpreter.context_readable or
+                                        tail.inode != old_inode or tail.offset < old_offset):
+                interpreter.prime_context()
+            for item in records:
                 try:
                     interpreter.process(item)
                 except (TypeError, ValueError, KeyError, OverflowError):
@@ -360,11 +482,20 @@ class Watcher:
 
     def write_status(self):
         approvals = approval_status(self.vibecue_home)
+        waiting_approval = set(approvals.get('pending_thread_ids', []))
+        now = time.time()
+        tasks = []
+        for tid, (tail, interpreter) in self.watched.items():
+            task = interpreter.running_task(now)
+            if task and not tail.read_error and tid not in waiting_approval:
+                tasks.append(task)
+        tasks.sort(key=lambda task: (-task['last_activity'], task['thread_id']))
         state = {
-            'pid': os.getpid(), 'heartbeat': time.time(), 'running': self.running,
+            'pid': os.getpid(), 'heartbeat': now, 'running': self.running,
             'started_at': self.started_at, 'watched_threads': len(self.watched),
+            'running_tasks': tasks if self.running else [],
             'source': 'local-transcripts', 'provider': 'codex',
-            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic'],
+            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle'],
             'permission_status': 'connected' if approvals['connected'] else 'requires-codex-bridge-launch',
             'manual_approval': approvals,
             'pending_deliveries': sum(len(i.pending) for _, i in self.watched.values()),

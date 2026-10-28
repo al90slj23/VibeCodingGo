@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from vibecue.events import (emit_event, completion_event_id, classify_final_message,
                            is_main_thread, resolve_title, prune_event_spool, state_databases)
-from vibecue.providers.codex import Interpreter, TailReader, ThreadMetadata, Watcher
+from vibecue.providers.codex import ACTIVITY_TTL, MAX_PRIME, Interpreter, TailReader, ThreadMetadata, Watcher
 
 
 def record(kind, payload, timestamp=None):
@@ -139,6 +139,170 @@ class InterpretationTests(unittest.TestCase):
             self.assertEqual(classify_final_message(text)[0], 'complete', text)
         for text in ('請你確認再繼續。', '需要您選擇。', '请你确认再继续。', '需要您选择。', 'Please confirm the destination.', 'I need your approval.'):
             self.assertEqual(classify_final_message(text)[0], 'input', text)
+
+
+class RunningTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.path = self.home / 'thread.jsonl'
+        self.path.write_bytes(b'')
+        self.events = []
+        self.now = time.time()
+        self.interpreter = Interpreter(ThreadMetadata('main', self.path, '正在执行的对话', 'vscode'),
+                                       lambda **event: self.events.append(event))
+
+    def item(self, category, payload, delta=0):
+        return record(category, payload, self.now + delta)
+
+    def start(self, delta=0, turn='turn-one'):
+        self.interpreter.process(self.item('event_msg', {'type': 'task_started', 'turn_id': turn}, delta))
+
+    def test_running_start_and_final_clear_before_delayed_complete(self):
+        self.start()
+        task = self.interpreter.running_task(self.now + 1)
+        self.assertEqual(task['turn_id'], 'turn-one')
+        self.assertEqual(task['started_at'], self.now)
+        self.assertEqual(task['provider'], 'codex')
+        self.interpreter.process(self.item('response_item', {'type': 'message', 'role': 'assistant',
+                                                           'phase': 'final_answer', 'content': []}, 2))
+        self.assertIsNone(self.interpreter.running_task(self.now + 3))
+        self.interpreter.process(self.item('event_msg', {'type': 'token_count'}, 4))
+        self.assertEqual(self.interpreter.activity_state, 'idle')
+        self.interpreter.process(self.item('event_msg', {'type': 'task_complete', 'turn_id': 'turn-one'}, 5))
+        self.assertIsNone(self.interpreter.running_task(self.now + 6))
+
+    def test_complete_and_abort_clear_running(self):
+        for event_type in ('task_complete', 'task_completed', 'task_aborted', 'turn_aborted'):
+            with self.subTest(event_type=event_type):
+                self.start(1)
+                self.interpreter.process(self.item('event_msg', {'type': event_type, 'turn_id': 'turn-one'}, 2))
+                self.assertIsNone(self.interpreter.running_task(self.now + 3))
+
+    def test_blocking_question_waits_and_only_matching_output_resumes(self):
+        self.start()
+        self.interpreter.process(self.item('response_item', {'type': 'function_call', 'name': 'request_user_input', 'call_id': 'question'}, 1))
+        self.assertEqual(self.interpreter.activity_state, 'waiting')
+        self.assertIsNone(self.interpreter.running_task(self.now + 2))
+        self.interpreter.process(self.item('response_item', {'type': 'function_call_output', 'call_id': 'other'}, 2))
+        self.assertEqual(self.interpreter.activity_state, 'waiting')
+        self.interpreter.process(self.item('response_item', {'type': 'function_call_output', 'call_id': 'question'}, 3))
+        self.assertIsNotNone(self.interpreter.running_task(self.now + 4))
+
+    def test_awaited_nested_question_waits_but_async_does_not(self):
+        self.start()
+        self.interpreter.process(self.item('response_item', {'type': 'custom_tool_call', 'name': 'exec',
+                                                           'call_id': 'sync', 'input': 'await tools.request_user_input({});'}, 1))
+        self.assertEqual(self.interpreter.activity_state, 'waiting')
+        self.interpreter.process(self.item('response_item', {'type': 'custom_tool_call_output', 'call_id': 'sync'}, 2))
+        self.assertEqual(self.interpreter.activity_state, 'running')
+        for kind, name, code in [('function_call', 'request_user_input_async', ''),
+                                 ('custom_tool_call', 'exec', 'await tools.request_user_input_async({});'),
+                                 ('custom_tool_call', 'exec', 'text("await tools.request_user_input({})");')]:
+            self.interpreter.process(self.item('response_item', {'type': kind, 'name': name, 'input': code}, 3))
+            self.assertEqual(self.interpreter.activity_state, 'running')
+
+    def test_explicit_new_work_can_resume_a_wait_with_missing_output(self):
+        self.start()
+        self.interpreter.process(self.item('response_item', {'type': 'function_call', 'name': 'request_user_input', 'call_id': 'question'}, 1))
+        self.interpreter.process(self.item('response_item', {'type': 'message', 'role': 'assistant', 'phase': 'commentary', 'content': []}, 2))
+        self.assertEqual(self.interpreter.activity_state, 'running')
+        self.assertEqual(self.interpreter.blocking_calls, set())
+
+    def test_old_events_cannot_reverse_newer_state_or_finish_another_turn(self):
+        self.start(10, turn='new-turn')
+        self.interpreter.process(self.item('event_msg', {'type': 'task_complete', 'turn_id': 'new-turn'}, 9))
+        self.interpreter.process(self.item('event_msg', {'type': 'task_complete', 'turn_id': 'old-turn'}, 11))
+        self.assertEqual(self.interpreter.running_task(self.now + 12)['turn_id'], 'new-turn')
+        self.interpreter.process(self.item('event_msg', {'type': 'task_complete', 'turn_id': 'new-turn'}, 13))
+        self.interpreter.process(self.item('response_item', {'type': 'function_call', 'name': 'exec_command'}, 12))
+        self.assertIsNone(self.interpreter.running_task(self.now + 14))
+
+    def test_subagent_and_stale_or_undated_activity_are_not_running(self):
+        child = Interpreter(ThreadMetadata('child', self.path, source={'subagent': {'thread_spawn': {}}}), lambda **kw: None)
+        child.process(self.item('event_msg', {'type': 'task_started', 'turn_id': 'turn'}, 0))
+        self.assertIsNone(child.running_task(self.now))
+        self.start(-ACTIVITY_TTL - 1)
+        self.assertIsNone(self.interpreter.running_task(self.now))
+        unknown = Interpreter(ThreadMetadata('unknown', self.path, source='vscode'), lambda **kw: None)
+        unknown.process({'type': 'event_msg', 'payload': {'type': 'task_started'}})
+        self.assertIsNone(unknown.running_task(self.now))
+
+    def test_prime_recovers_live_turn_without_replaying_alerts(self):
+        self.path.write_bytes(line(self.item('event_msg', {'type': 'task_started', 'turn_id': 'live'}, -10)) +
+                              line(self.item('response_item', {'type': 'function_call', 'name': 'exec_command', 'call_id': 'tool'}, -5)))
+        self.interpreter.started_at = self.now
+        self.interpreter.prime_context()
+        task = self.interpreter.running_task(self.now)
+        self.assertEqual(task['turn_id'], 'live')
+        self.assertEqual(task['last_activity'], self.now - 5)
+        self.assertEqual(self.events, [])
+
+    def test_prime_recovers_wait_and_ignores_token_only_tail(self):
+        self.path.write_bytes(line(self.item('event_msg', {'type': 'task_started', 'turn_id': 'live'}, -10)) +
+                              line(self.item('response_item', {'type': 'function_call', 'name': 'request_user_input', 'call_id': 'question'}, -5)))
+        self.interpreter.prime_context()
+        self.assertEqual(self.interpreter.activity_state, 'waiting')
+        self.assertEqual(self.events, [])
+        self.path.write_bytes(line(self.item('event_msg', {'type': 'task_started', 'turn_id': 'old'}, -10)) +
+                              line(self.item('event_msg', {'type': 'task_complete', 'turn_id': 'old'}, -5)) +
+                              line(self.item('event_msg', {'type': 'token_count'}, -1)))
+        self.interpreter.prime_context()
+        self.assertIsNone(self.interpreter.running_task(self.now))
+        self.path.write_bytes(b' ' * (MAX_PRIME + 100) + b'\n' + line(self.item('event_msg', {'type': 'token_count'}, -1)))
+        self.interpreter.prime_context()
+        self.assertIsNone(self.interpreter.running_task(self.now))
+
+    def test_bounded_prime_can_use_commentary_but_not_partial_last_record(self):
+        commentary = self.item('response_item', {'type': 'message', 'role': 'assistant', 'phase': 'commentary', 'content': []}, -1)
+        self.path.write_bytes(b'x' * (MAX_PRIME + 100) + b'\n' + line(commentary))
+        self.interpreter.prime_context()
+        self.assertIsNotNone(self.interpreter.running_task(self.now))
+        self.path.write_bytes(line(commentary).rstrip(b'\n'))
+        self.interpreter.prime_context()
+        self.assertIsNone(self.interpreter.running_task(self.now))
+
+    def watcher(self):
+        watcher = Watcher(self.home, self.home / 'vibecue', emit=lambda **kw: self.events.append(kw))
+        watcher.metadata = lambda: [self.interpreter.metadata]
+        watcher.running = True
+        watcher.discover(initial=True)
+        return watcher
+
+    def status(self, watcher, approvals=None):
+        with patch('vibecue.providers.codex.approval_status', return_value=approvals or {'connected': False}):
+            watcher.write_status()
+        return json.loads((watcher.vibecue_home / 'watcher-state.json').read_text())
+
+    def test_status_hides_read_errors_and_real_manual_waits_then_recovers(self):
+        self.path.write_bytes(line(self.item('event_msg', {'type': 'task_started', 'turn_id': 'live'}, -5)))
+        watcher = self.watcher()
+        self.assertEqual(len(self.status(watcher)['running_tasks']), 1)
+        tail, _ = watcher.watched['main']
+        tail.read_error = 'PermissionError: fixture'
+        self.assertEqual(self.status(watcher)['running_tasks'], [])
+        tail.read_records()
+        self.assertEqual(len(self.status(watcher)['running_tasks']), 1)
+        self.assertEqual(self.status(watcher, {'connected': True, 'pending_thread_ids': ['main']})['running_tasks'], [])
+        self.assertEqual(len(self.status(watcher, {'connected': True, 'pending_thread_ids': []})['running_tasks']), 1)
+        watcher.running = False
+        self.assertEqual(self.status(watcher)['running_tasks'], [])
+
+    def test_prime_read_failure_recovers_and_replacement_clears_activity(self):
+        self.path.write_bytes(line(self.item('event_msg', {'type': 'task_started', 'turn_id': 'live'}, -5)))
+        watcher = self.watcher()
+        _, interpreter = watcher.watched['main']
+        with patch.object(Path, 'open', side_effect=PermissionError(13, 'Permission denied')):
+            interpreter.prime_context()
+        self.assertIsNone(interpreter.running_task(self.now))
+        watcher.poll_once()
+        self.assertIsNotNone(interpreter.running_task(self.now))
+        replacement = self.home / 'empty.jsonl'
+        replacement.write_bytes(b'')
+        replacement.replace(self.path)
+        watcher.poll_once()
+        self.assertIsNone(interpreter.running_task(self.now))
 
 
 class MetadataAndSpoolTests(unittest.TestCase):

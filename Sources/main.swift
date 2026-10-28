@@ -51,6 +51,13 @@ struct CueEvent {
         source = "native demo"; requiresUserAction = kind == "permission"
     }
 
+    // Navigation-only state. External alert JSON never accepts this kind.
+    init(runningThreadID: String, title: String, date: Date) {
+        id = "running:" + runningThreadID; kind = "running"; self.title = title
+        threadID = runningThreadID; message = "正在运行"; self.date = date
+        provider = "codex"; source = "running task navigation"; requiresUserAction = false
+    }
+
     private static func parseDate(_ text: String) -> Date? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -277,6 +284,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var lastPlayedSoundToken = ""
     var pending: [CueEvent] = []
     var recent: [CueEvent] = []
+    var runningTasks: [CueRunningTask] = []
+    private var runningTaskSnapshot = Data()
     lazy var recentHistory = CueRecentHistory(home: home)
     var shortcutMenu: NSMenu?
     var statusPopover: NSPopover?
@@ -706,6 +715,11 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard let id = sender.representedObject as? String, let event = recent.first(where: { $0.id == id }) else { return }
         open(event: event)
     }
+    @objc func openRunningRecent(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let task = runningTasks.first(where: { $0.threadID == id }) else { return }
+        open(event: task.ephemeralCueEvent)
+    }
     @objc func toggleMute() {
         muted.toggle(); saveSettings()
         if muted { audioPlayer?.stop() }
@@ -804,6 +818,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         nextHealthCheck = Date().addingTimeInterval(2)
         var message = "监控进程未连接"
         let previousManual = manualApprovalConnected
+        var nextRunningTasks: [CueRunningTask] = []
+        var nextRunningSnapshot = Data()
         manualApprovalConnected = false
         manualApprovalStatus = approvalLauncher?.isRunning == true ? "等待 Codex 退出后接通" : "人工批准监听未连接"
         if let launchData = try? Data(contentsOf: home.appendingPathComponent("bridge-launch-state.json")), launchData.count < 65_536,
@@ -827,6 +843,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 if manualApprovalConnected { manualApprovalStatus = "人工批准监听已连接" }
             }
             let count = state["watched_threads"] as? Int ?? 0
+            let taskRows = state["running_tasks"] as? [[String: Any]] ?? []
+            nextRunningTasks = taskRows.compactMap { CueRunningTask(raw: $0) }
+            nextRunningSnapshot = (try? JSONSerialization.data(withJSONObject: taskRows, options: [.sortedKeys])) ?? Data()
             let errors = state["read_error_count"] as? Int ?? 0
             if errors > 0 {
                 message = "需要授权读取记录 · \(errors) 个文件无法读取"
@@ -836,7 +855,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 message = "本机监控中 · \(count) 个对话"
             }
         }
-        if watcherHealthText != message {
+        let runningChanged = runningTaskSnapshot != nextRunningSnapshot
+        runningTasks = nextRunningTasks; runningTaskSnapshot = nextRunningSnapshot
+        if watcherHealthText != message || runningChanged {
             watcherHealthText = message
             if statusItem != nil { refreshMenu() }
         }
@@ -1092,25 +1113,42 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             item.target = self; item.representedObject = kind; item.isEnabled = !muted; audioMenu.addItem(item)
         }
         let audioTests = NSMenuItem(title: "只测试提示音", action: nil, keyEquivalent: ""); audioTests.submenu = audioMenu; menu.addItem(audioTests)
-        if !recent.isEmpty {
+        if !recent.isEmpty || !runningTasks.isEmpty {
             menu.addItem(.separator())
-            let header = NSMenuItem(title: "最近提醒 · \(recentHistory.unopenedCount) 条未读", action: nil, keyEquivalent: "")
-            header.isEnabled = false; menu.addItem(header)
-            for record in recentHistory.records {
+            func heading(_ title: String) {
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                item.isEnabled = false; menu.addItem(item)
+            }
+            func reminder(_ record: CueRecentRecord) {
                 let event = record.event
-                let title = "\(record.isOpened ? "↗" : "●") \(event.title.prefix(52))"
+                let isRunning = runningTasks.contains { $0.threadID == event.threadID && event.provider == "codex" }
+                let title = "\(record.isOpened ? "↗" : "●") \(event.title.prefix(52))\(isRunning ? " · 运行中" : "")"
                 let item = NSMenuItem(title: title, action: #selector(openRecent(_:)), keyEquivalent: "")
                 item.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: record.isOpened ? NSColor.secondaryLabelColor : NSColor.systemBlue, .font: NSFont.systemFont(ofSize: 13, weight: record.isOpened ? .regular : .semibold)])
                 item.target = self; item.representedObject = event.id; item.isEnabled = record.canOpen
                 item.toolTip = "\(event.label) · \(event.title)"; menu.addItem(item)
             }
+            let pinned = recentHistory.records.filter(\.isPinned)
+            if !pinned.isEmpty { heading("置顶提醒 · \(pinned.count) 条"); pinned.forEach(reminder) }
+            let pinnedThreads = Set(pinned.filter { $0.event.provider == "codex" }.map { $0.event.threadID })
+            let active = runningTasks.filter { !pinnedThreads.contains($0.threadID) }
+            if !active.isEmpty {
+                heading("正在运行 · \(active.count) 项")
+                for task in active {
+                    let item = NSMenuItem(title: "◉ \(task.title.prefix(52))", action: #selector(openRunningRecent(_:)), keyEquivalent: "")
+                    item.target = self; item.representedObject = task.threadID; menu.addItem(item)
+                }
+            }
+            let activeIDs = Set(runningTasks.map(\.threadID))
+            let ordinary = recentHistory.records.filter { !$0.isPinned && !($0.event.provider == "codex" && activeIDs.contains($0.event.threadID)) }
+            if !ordinary.isEmpty { heading("历史提醒 · \(ordinary.count) 条"); ordinary.forEach(reminder) }
         }
         menu.addItem(.separator())
         let exit = NSMenuItem(title: "结束 VibeCue", action: #selector(quit), keyEquivalent: "q")
         exit.target = self; menu.addItem(exit)
         shortcutMenu = menu
         statusItem.button?.title = recentHistory.unopenedCount > 0 ? " \(recentHistory.unopenedCount)" : ""
-        statusItem.button?.toolTip = "VibeCue · \(recentHistory.unopenedCount) 条未读提醒"
+        statusItem.button?.toolTip = "VibeCue · \(recentHistory.unopenedCount) 条未读提醒 · \(runningTasks.count) 个任务正在运行"
         if statusPopover?.isShown == true { updateStatusPopover() }
     }
 
@@ -1166,7 +1204,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
         let height = min(900, (screen?.visibleFrame.height ?? 900) - 52)
         statusPopoverController?.update(status: watcherHealthText, enabled: settings.enabled,
-                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height)
+                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks)
         if let controller = statusPopoverController, controller.isViewLoaded { statusPopover?.contentSize = controller.preferredContentSize }
     }
 
@@ -1185,7 +1223,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "effect_preset_count": CueEffectCatalog.presets.count, "card_style_count": CueCardCatalog.presets.count,
             "sound_preset_count": CueSoundCatalog.presets.count,
             "current_is_preview": current?.isPreview ?? false, "preview_component": previewComponent,
-            "appearance_migration_error": appearanceMigrationError, "preview_feedback": previewFeedback, "recent_count": recent.count, "recent_capacity": CueRecentHistory.capacity, "recent_pinned_count": recentHistory.pinnedCount, "recent_ordinary_count": recentHistory.ordinaryCount, "recent_unopened_count": recentHistory.unopenedCount, "recent_history_error": recentHistory.lastError, "recent_panel_visible": statusPopover?.isShown ?? false, "recent_panel_size": NSStringFromSize(statusPopover?.contentSize ?? .zero), "seen_count": seen.count,
+            "appearance_migration_error": appearanceMigrationError, "preview_feedback": previewFeedback, "recent_count": recent.count, "recent_capacity": CueRecentHistory.capacity, "recent_pinned_count": recentHistory.pinnedCount, "recent_ordinary_count": recentHistory.ordinaryCount, "recent_unopened_count": recentHistory.unopenedCount, "running_task_count": runningTasks.count, "recent_history_error": recentHistory.lastError, "recent_panel_visible": statusPopover?.isShown ?? false, "recent_panel_size": NSStringFromSize(statusPopover?.contentSize ?? .zero), "seen_count": seen.count,
             "current_effect": current.map { resolvedVisualStyle(for: $0).effectID } ?? "",
             "current_card_style": current.map { _ in CueCardStyle(fields: resolvedFields).id } ?? "",
             "selected_sound": lastPlayedSoundToken,
@@ -1872,23 +1910,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
     cue.openConversationURL = { _ in true }
     results["successful_handoff_marks_only_its_event"] = cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 1 && cue.recentHistory.records.first(where: { $0.event.id == "second" })?.isOpened == false
     if let index = CommandLine.arguments.firstIndex(of: "--capture-status-panel"), CommandLine.arguments.indices.contains(index + 1) {
-        for number in 0..<50 {
-            let raw: [String: Any] = ["id": "capture-\(number)", "kind": number % 3 == 0 ? "input" : "complete", "thread_id": "fixture-chat-\(number)", "title": "验收样例 \(number + 1) · 多任务提醒与打开状态", "created_at": Date().addingTimeInterval(Double(number) * 60).timeIntervalSince1970]
-            let value = CueEvent(try! JSONSerialization.data(withJSONObject: raw))!
-            cue.recentHistory.append(value)
-            if number % 3 == 0 { cue.recentHistory.markOpened(id: value.id, didOpen: true) }
-        }
-        let actions = CueStatusPopoverActions(openSettings: {}, openUsage: {}, toggleEnabled: {}, toggleSound: {}, pause: {}, demo: {}, quit: {}, openEvent: { _ in })
-        let panel = CueStatusPopoverController(history: cue.recentHistory, actions: actions)
-        panel.update(status: "界面验收样例 · 50 条提醒", enabled: true, soundEnabled: true, paused: false, maximumHeight: 900)
-        let view = panel.view
-        let window = NSWindow(contentRect: view.bounds, styleMask: .borderless, backing: .buffered, defer: false)
-        window.contentView = view; window.displayIfNeeded()
-        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-            view.cacheDisplay(in: view.bounds, to: rep)
-            if let png = rep.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1])) }
-        }
-        results["status_panel_limits_visible_height"] = view.bounds.height <= 900 && cue.recentHistory.records.count >= 50 && cue.recentHistory.ordinaryCount <= CueRecentHistory.capacity
+        results["status_panel_three_layer_fixture"] = CueStatusPopoverController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
     }
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
     exit(results.values.allSatisfy { $0 } ? 0 : 1)
