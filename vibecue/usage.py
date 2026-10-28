@@ -7,6 +7,7 @@ add an already imported request a second time. Sources are opened read-only.
 from __future__ import annotations
 
 import argparse
+import bisect
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -20,10 +21,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 
 from .events import vibecue_directory, codex_directory
 
 SCHEMA_VERSION = 1
+CODEX_IMPORT_VERSION = 3
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 TOKEN_COLUMNS = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens')
 APPS = {'codex': 'Codex', 'claude': 'Claude Code'}
@@ -158,6 +161,12 @@ def connect(home):
       CREATE TABLE IF NOT EXISTS usage_codex_fallbacks (
         session_id TEXT NOT NULL, key TEXT NOT NULL, timestamp REAL NOT NULL,
         model TEXT NOT NULL, PRIMARY KEY(session_id,key));
+      CREATE TABLE IF NOT EXISTS usage_codex_timeline (
+        position INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT UNIQUE NOT NULL, session_id TEXT NOT NULL,
+        timestamp REAL NOT NULL, signature TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS usage_codex_timeline_order
+        ON usage_codex_timeline(session_id,timestamp,position);
     ''')
     conn.commit()
     return conn
@@ -245,17 +254,59 @@ def read_header(path):
     return {}
 
 
-def inherited_codex_snapshot(conn, state, key, timestamp, totals=None):
+def codex_numeric_signature(kind, total=None, last=None):
+    """Usage identity for replay matching; receipt time is not request identity.
+
+    Forked rollouts may rewrite thousands of inherited timestamps into a few
+    milliseconds. Keep the complete numeric snapshots, including field presence,
+    while leaving their physical sequence to the timeline.
+    """
+    def counters(value):
+        if not isinstance(value, dict):
+            return None
+        return [number(value.get('input_tokens')), number(value.get('output_tokens')),
+                number(value.get('cached_input_tokens', value.get('cache_read_input_tokens'))),
+                number(value.get('cache_write_input_tokens', value.get('cache_creation_input_tokens'))),
+                number(value.get('reasoning_output_tokens')), number(value.get('total_tokens'))]
+    return digest(kind, counters(total), counters(last))
+
+
+def record_codex_timeline(conn, state, timestamp, signature):
+    # The ordinal is persisted with the byte cursor. Copies preserve it, and
+    # same-millisecond events retain physical insertion order instead of hash ID
+    # order. Non-billable token snapshots are needed to align an entire replay.
+    ordinal = int(state.get('token_ordinal', 0)) + 1
+    state['token_ordinal'] = ordinal
+    event_id = digest(state['session'], timestamp, signature, ordinal)
+    conn.execute('''INSERT OR IGNORE INTO usage_codex_timeline
+        (event_id,session_id,timestamp,signature) VALUES (?,?,?,?)''',
+        (event_id,state['session'],timestamp,signature))
+
+
+def inherited_codex_snapshot(conn, state, key, timestamp, totals=None, signature=None):
     session = state['session']
     conn.execute('INSERT OR IGNORE INTO usage_codex_snapshots VALUES (?,?,?,?)',
                  (session,key,timestamp,json.dumps(totals) if totals else None))
     parent=state.get('parent')
     if not parent or not state.get('prefix'):
         return False
-    matched=conn.execute('SELECT 1 FROM usage_codex_snapshots WHERE session_id=? AND key=?',(parent,key)).fetchone()
-    if matched:
+    index = state.get('_runtime_parent_index')
+    if index is None:
+        if state.get('created') is None:
+            raise Deferred('子会话缺少可靠创建时间，已暂缓继承用量对齐')
+        index = {}
+        for ordinal, row in enumerate(conn.execute('''SELECT signature
+            FROM usage_codex_timeline WHERE session_id=? AND timestamp<=?
+            ORDER BY timestamp,position''', (parent,state['created']))):
+            index.setdefault(row['signature'], []).append(ordinal)
+        state['_runtime_parent_index'] = index
+    positions = index.get(signature, ())
+    offset = bisect.bisect_left(positions, int(state.get('parent_replay_cursor', 0)))
+    if offset < len(positions):
+        state['parent_replay_cursor'] = positions[offset] + 1
         if totals:
             state['highwater']=totals
+        state['inherited_snapshots'] = int(state.get('inherited_snapshots', 0)) + 1
         return True
     if state.get('created') is None or timestamp < state['created']:
         raise Deferred('子会话包含无法与父会话对齐的早期用量，已暂缓以防重复计数')
@@ -356,7 +407,9 @@ def parse_codex(conn, item, state, report):
         if not usage or not any(usage[:4]) or not session or timestamp is None:
             return
         key=digest(timestamp,None,usage)
-        if inherited_codex_snapshot(conn,state,key,timestamp):
+        replay_signature = codex_numeric_signature('record', last=payload.get('usage'))
+        record_codex_timeline(conn,state,timestamp,replay_signature)
+        if inherited_codex_snapshot(conn,state,key,timestamp,signature=replay_signature):
             return
         response=label(payload.get('response_id'),250)
         request_id='codex-record:'+session+':'+(digest(response) if response else key)
@@ -396,7 +449,9 @@ def parse_codex(conn, item, state, report):
     signature = digest(raw_total, raw_last)
     # Stable record identity survives copy, symlink aliases and archive moves.
     key = digest(timestamp, raw_total, raw_last)
-    if inherited_codex_snapshot(conn,state,key,timestamp,raw_total):
+    replay_signature = codex_numeric_signature('token',info.get('total_token_usage'),info.get('last_token_usage'))
+    record_codex_timeline(conn,state,timestamp,replay_signature)
+    if inherited_codex_snapshot(conn,state,key,timestamp,raw_total,replay_signature):
         state['last_signature']=signature
         return
     if raw_total is not None:
@@ -438,7 +493,9 @@ def parse_codex(conn, item, state, report):
         return
     if record_covers_empty_last:
         counts=[0,0,0,0]
-    elif raw_last is not None and any(raw_last[:4]):
+    elif raw_last is not None:
+        # An explicit zero last-usage snapshot is authoritative too. Rate or
+        # status refreshes can carry cumulative movement without a new request.
         counts = fresh_counts(raw_last)
     elif raw_total is not None:
         delta = [max(0, raw_total[i] - (previous or [0]*5)[i]) for i in range(5)]
@@ -561,8 +618,9 @@ def scan_file(conn, app, path, report):
             if app=='codex' and state.pop('_reconcile_fallbacks',False) and state.get('session'):
                 reconcile_codex_fallbacks(conn,state['session'])
             fingerprint = None if compressed else tail_fingerprint(stream,offset)
+            stored_state = {key:value for key,value in state.items() if not key.startswith('_runtime_')}
             conn.execute('''INSERT OR REPLACE INTO usage_files VALUES (?,?,?,?,?,?,?,?)''',
-                         (str(path),app,stat.st_ino,stat.st_size,stat.st_mtime_ns,offset,fingerprint,json.dumps(state)))
+                         (str(path),app,stat.st_ino,stat.st_size,stat.st_mtime_ns,offset,fingerprint,json.dumps(stored_state)))
             if app == 'codex' and state.get('session'):
                 conn.execute('UPDATE usage_codex_sessions SET complete=1 WHERE id=?',(state['session'],))
             report['bytes_read'] += max(0,offset-start_offset)
@@ -570,6 +628,43 @@ def scan_file(conn, app, path, report):
         if process and process.poll() is None:
             process.terminate()
             process.wait()
+
+
+def upgrade_codex_import(conn, home):
+    """Back up and rebuild only the old Codex ledger before changing identity.
+
+    Timestamp-keyed rows cannot safely be repaired in place: replay receipt
+    times were rewritten and a cached cursor would hide the source prefix.
+    Claude rows and the independent reminder inbox are never changed here.
+    """
+    if get_meta(conn, 'codex_import_version', 0) == CODEX_IMPORT_VERSION:
+        return {}
+    existing = conn.execute("SELECT EXISTS(SELECT 1 FROM usage_requests WHERE app='codex') OR EXISTS(SELECT 1 FROM usage_files WHERE app='codex')").fetchone()[0]
+    result = {}
+    if existing:
+        backups = Path(home) / 'backups'
+        backups.mkdir(parents=True,exist_ok=True,mode=0o700)
+        os.chmod(backups,0o700)
+        target = backups / ('usage-before-codex-replay-v' + str(CODEX_IMPORT_VERSION) + '-' + uuid.uuid4().hex + '.sqlite3')
+        fd = os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        os.close(fd)
+        # A connection cannot back itself up while it owns a write transaction.
+        # Finish before backup and do not delete a single old row until it succeeds.
+        conn.commit()
+        with closing(sqlite3.connect(target)) as saved:
+            conn.backup(saved)
+        os.chmod(target,0o600)
+        with conn:
+            conn.execute("DELETE FROM usage_requests WHERE app='codex'")
+            conn.execute("DELETE FROM usage_files WHERE app='codex'")
+            for table in ('usage_codex_snapshots','usage_codex_sessions','usage_codex_fallbacks','usage_codex_timeline'):
+                conn.execute('DELETE FROM ' + table)
+        result = {'rebuild':True,
+                  'rebuild_reason':'分叉历史去重规则升级，旧统计已备份，正在重新导入 Codex 用量',
+                  'rebuild_backup':target.name}
+    set_meta(conn,'codex_import_version',CODEX_IMPORT_VERSION)
+    conn.commit()
+    return result
 
 
 def sync(home=None):
@@ -591,6 +686,8 @@ def sync(home=None):
                       'phase':'discovering','headers_scanned':0}
             set_meta(conn,'sync',report);conn.commit()
             try:
+                report.update(upgrade_codex_import(conn,home))
+                set_meta(conn,'sync',report);conn.commit()
                 roots = source_roots(home)
                 files = []
                 seen_paths = set()

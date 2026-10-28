@@ -481,9 +481,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             return
         }
         guard !seen.contains(event.id), !resolutions.contains(event.id) else { return }
+        guard recentHistory.append(event) else { return }
         seen.append(event.id)
         if seen.count > 512 { seen.removeFirst(seen.count - 512) }
-        _ = recentHistory.append(event)
         recent = recentHistory.events
         refreshMenu()
         guard pausedUntil == nil, settings.allows(event) else { return }
@@ -1094,7 +1094,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let audioTests = NSMenuItem(title: "只测试提示音", action: nil, keyEquivalent: ""); audioTests.submenu = audioMenu; menu.addItem(audioTests)
         if !recent.isEmpty {
             menu.addItem(.separator())
-            let header = NSMenuItem(title: "最近提醒 · \(recentHistory.unopenedCount) 条未打开", action: nil, keyEquivalent: "")
+            let header = NSMenuItem(title: "最近提醒 · \(recentHistory.unopenedCount) 条未读", action: nil, keyEquivalent: "")
             header.isEnabled = false; menu.addItem(header)
             for record in recentHistory.records {
                 let event = record.event
@@ -1110,7 +1110,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         exit.target = self; menu.addItem(exit)
         shortcutMenu = menu
         statusItem.button?.title = recentHistory.unopenedCount > 0 ? " \(recentHistory.unopenedCount)" : ""
-        statusItem.button?.toolTip = "VibeCue · \(recentHistory.unopenedCount) 条尚未通过 VibeCue 打开"
+        statusItem.button?.toolTip = "VibeCue · \(recentHistory.unopenedCount) 条未读提醒"
         if statusPopover?.isShown == true { updateStatusPopover() }
     }
 
@@ -1146,6 +1146,11 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 openEvent: { [weak self] event in
                     guard let self else { return }
                     if self.open(event: event) { self.statusPopover?.performClose(nil) }
+                },
+                historyChanged: { [weak self] in
+                    guard let self else { return }
+                    self.recent = self.recentHistory.events
+                    self.refreshMenu(); self.settingsPanel?.updateHealth(); self.writeStatus()
                 })
             statusPopoverController = CueStatusPopoverController(history: recentHistory, actions: actions)
             let popover = NSPopover(); popover.behavior = .transient
@@ -1180,7 +1185,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "effect_preset_count": CueEffectCatalog.presets.count, "card_style_count": CueCardCatalog.presets.count,
             "sound_preset_count": CueSoundCatalog.presets.count,
             "current_is_preview": current?.isPreview ?? false, "preview_component": previewComponent,
-            "appearance_migration_error": appearanceMigrationError, "preview_feedback": previewFeedback, "recent_count": recent.count, "recent_capacity": CueRecentHistory.capacity, "recent_unopened_count": recentHistory.unopenedCount, "recent_history_error": recentHistory.lastError, "recent_panel_visible": statusPopover?.isShown ?? false, "recent_panel_size": NSStringFromSize(statusPopover?.contentSize ?? .zero), "seen_count": seen.count,
+            "appearance_migration_error": appearanceMigrationError, "preview_feedback": previewFeedback, "recent_count": recent.count, "recent_capacity": CueRecentHistory.capacity, "recent_pinned_count": recentHistory.pinnedCount, "recent_ordinary_count": recentHistory.ordinaryCount, "recent_unopened_count": recentHistory.unopenedCount, "recent_history_error": recentHistory.lastError, "recent_panel_visible": statusPopover?.isShown ?? false, "recent_panel_size": NSStringFromSize(statusPopover?.contentSize ?? .zero), "seen_count": seen.count,
             "current_effect": current.map { resolvedVisualStyle(for: $0).effectID } ?? "",
             "current_card_style": current.map { _ in CueCardStyle(fields: resolvedFields).id } ?? "",
             "selected_sound": lastPlayedSoundToken,
@@ -1857,6 +1862,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
     defer { try? FileManager.default.removeItem(at: home) }
     let cue = CueController(); cue.presentsWindows = false; cue.settings.enabled = false
     var results = CueRecentHistory.validationReport()
+    results.merge(CueStatusPopoverController.validationReport()) { _, new in new }
     func event(_ id: String) -> CueEvent {
         CueEvent(try! JSONSerialization.data(withJSONObject: ["id": id, "kind": "complete", "thread_id": "fixture-chat", "title": "验收样例 · " + id, "created_at": Date().timeIntervalSince1970]))!
     }
@@ -1882,7 +1888,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
             view.cacheDisplay(in: view.bounds, to: rep)
             if let png = rep.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1])) }
         }
-        results["status_panel_limits_visible_height"] = view.bounds.height <= 900 && cue.recentHistory.records.count == 50
+        results["status_panel_limits_visible_height"] = view.bounds.height <= 900 && cue.recentHistory.records.count >= 50 && cue.recentHistory.ordinaryCount <= CueRecentHistory.capacity
     }
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
     exit(results.values.allSatisfy { $0 } ? 0 : 1)

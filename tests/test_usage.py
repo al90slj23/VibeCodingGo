@@ -91,6 +91,25 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(data['summary']['total_tokens'],180)
         self.assertEqual(data['summary']['input_tokens'],60)
 
+    def test_explicit_zero_last_is_authoritative_and_sets_fallback_baseline(self):
+        zero=counts(0)
+        zero['total_tokens']=80259
+        path=self.write('one.jsonl',[meta(),token(counts(41105375,25492,28451328,reasoning=8330),zero)])
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],0)
+        conn=connect(self.home)
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM usage_codex_fallbacks').fetchone()[0],0)
+        conn.close()
+        # A genuinely missing last field still permits a delta from the zero
+        # snapshot's cumulative baseline, including after an importer restart.
+        with path.open('a') as stream:
+            stream.write(json.dumps(token(counts(41105475,25502,28451368),timestamp='2026-10-01T02:00:00Z'))+'\n')
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],1)
+        self.assertEqual(data['summary']['total_tokens'],110)
+        self.assertEqual(data['summary']['input_tokens'],60)
+        self.assertEqual(data['summary']['cache_read_tokens'],40)
+
     def test_total_only_continuation_pages_share_session_highwater(self):
         self.write('a.jsonl',[meta('same-session'),token(counts(100,10))])
         self.write('b.jsonl',[meta('same-session'),token(counts(150,20),timestamp='2026-10-01T02:00:00Z')])
@@ -168,6 +187,96 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(data['summary']['requests'],2)
         self.assertEqual(data['summary']['total_tokens'],170)
         self.assertEqual(sum(x['total_tokens'] for x in data['logs'] if x['thread_id']=='child'),60)
+
+    def test_fork_rewritten_same_millisecond_prefix_keeps_physical_order(self):
+        events=[token(counts(100,10),counts(100,10)),
+                token(counts(150,20),counts(50,10),timestamp='2026-10-01T01:10:00Z'),
+                token(counts(210,30),counts(60,10),timestamp='2026-10-01T01:20:00Z')]
+        replay=json.loads(json.dumps(events))
+        for event in replay:event['timestamp']='2026-10-01T01:30:01Z'
+        self.write('parent.jsonl',[meta('parent'),*events])
+        self.write('child.jsonl',[meta('child','parent','2026-10-01T01:30:00Z'),meta('parent'),*replay,
+                   token(counts(280,40),counts(70,10),timestamp='2026-10-01T02:00:00Z')])
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],4)
+        self.assertEqual(data['summary']['total_tokens'],320)
+        self.assertEqual(sum(x['total_tokens'] for x in data['logs'] if x['thread_id']=='child'),80)
+        self.assertEqual(data['sync']['deferred_files'],0)
+        self.assertEqual(sync(self.home)['summary']['total_tokens'],320)
+
+    def test_replay_alignment_resumes_after_restart_before_new_usage(self):
+        events=[token(counts(100,10),counts(100,10)),
+                token(counts(150,20),counts(50,10),timestamp='2026-10-01T01:10:00Z')]
+        replay=json.loads(json.dumps(events))
+        for event in replay:event['timestamp']='2026-10-01T01:30:01Z'
+        self.write('parent.jsonl',[meta('parent'),*events])
+        path=self.write('child.jsonl',[meta('child','parent','2026-10-01T01:30:00Z'),replay[0]])
+        self.assertEqual(sync(self.home)['summary']['total_tokens'],170)
+        with path.open('a') as stream:
+            stream.write(json.dumps(replay[1])+'\n')
+            stream.write(json.dumps(token(counts(220,30),counts(70,10),timestamp='2026-10-01T02:00:00Z'))+'\n')
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],3)
+        self.assertEqual(data['summary']['total_tokens'],250)
+
+    def test_identical_old_usage_after_first_new_request_is_not_global_deduped(self):
+        original=token(counts(100,10),counts(100,10))
+        self.write('parent.jsonl',[meta('parent'),original])
+        repeated=json.loads(json.dumps(original));repeated['timestamp']='2026-10-01T02:00:01Z'
+        self.write('child.jsonl',[meta('child','parent','2026-10-01T01:30:00Z'),
+                   token(counts(150,20),counts(50,10),timestamp='2026-10-01T02:00:00Z'),repeated])
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],3)
+        self.assertEqual(data['summary']['total_tokens'],280)
+
+    def test_nested_rewritten_replay_is_available_to_the_next_generation(self):
+        original=token(counts(100,10),counts(100,10))
+        child_replay=json.loads(json.dumps(original));child_replay['timestamp']='2026-10-01T01:30:01Z'
+        child_live=token(counts(150,20),counts(50,10),timestamp='2026-10-01T02:00:00Z')
+        grand_replay=json.loads(json.dumps([child_replay,child_live]))
+        for event in grand_replay:event['timestamp']='2026-10-01T02:30:01Z'
+        self.write('parent.jsonl',[meta('parent'),original])
+        self.write('child.jsonl',[meta('child','parent','2026-10-01T01:30:00Z'),child_replay,child_live])
+        self.write('grand.jsonl',[meta('grand','child','2026-10-01T02:30:00Z'),*grand_replay,
+                   token(counts(220,30),counts(70,10),timestamp='2026-10-01T03:00:00Z')])
+        data=sync(self.home)
+        self.assertEqual(data['summary']['requests'],3)
+        self.assertEqual(data['summary']['total_tokens'],250)
+        self.assertEqual(data['sync']['deferred_files'],0)
+
+    def test_import_upgrade_backs_up_and_rebuilds_only_codex(self):
+        self.write('parent.jsonl',[meta('parent'),token(counts(100,10),counts(100,10))])
+        self.write('claude.jsonl',[claude('stable-claude')],app='claude')
+        first=sync(self.home)
+        reminder=self.home/'recent-alerts.json';reminder.write_text('reminder fixture')
+        with connect(self.home) as conn:
+            conn.execute("DELETE FROM usage_meta WHERE key='codex_import_version'")
+            conn.execute("UPDATE usage_requests SET total_tokens=999 WHERE app='codex'")
+            conn.commit()
+        rebuilt=sync(self.home)
+        self.assertTrue(rebuilt['sync']['rebuild'])
+        self.assertEqual(rebuilt['summary']['total_tokens'],first['summary']['total_tokens'])
+        self.assertEqual(reminder.read_text(),'reminder fixture')
+        backups=list((self.home/'backups').glob('usage-before-codex-replay-v3-*.sqlite3'))
+        self.assertEqual(len(backups),1)
+        self.assertEqual(backups[0].stat().st_mode&0o777,0o600)
+        import sqlite3
+        with sqlite3.connect(backups[0]) as saved:
+            self.assertEqual(saved.execute("SELECT total_tokens FROM usage_requests WHERE app='codex'").fetchone()[0],999)
+        self.assertEqual(self.result(app='claude')['summary']['requests'],1)
+        self.assertNotIn('rebuild',sync(self.home)['sync'])
+
+    def test_import_upgrade_backup_failure_preserves_existing_codex_ledger(self):
+        self.write('parent.jsonl',[meta('parent'),token(counts(100,10),counts(100,10))])
+        sync(self.home)
+        with connect(self.home) as conn:
+            conn.execute("DELETE FROM usage_meta WHERE key='codex_import_version'")
+            conn.commit()
+        (self.home/'backups').write_text('blocked directory fixture')
+        result=sync(self.home)
+        self.assertTrue(result['sync']['errors'])
+        self.assertEqual(result['summary']['requests'],1)
+        self.assertEqual(result['summary']['total_tokens'],110)
 
     def test_inherited_parent_metadata_cannot_replace_physical_file_owner(self):
         inherited=token(counts(100,10),counts(100,10))

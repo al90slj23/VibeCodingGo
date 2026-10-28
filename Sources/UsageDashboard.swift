@@ -394,17 +394,19 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     }
     private func updateStatus() {
         let busy = syncing || backendRunning
-        syncButton.isEnabled = !busy; syncButton.title = busy ? "正在同步…" : "立即同步"
+        let rebuilding = syncMetadata["rebuild"] as? Bool == true
+        syncButton.isEnabled = !busy; syncButton.title = busy ? (rebuilding ? "正在重建…" : "正在同步…") : "立即同步"
         let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm:ss"
         if busy {
             switch syncMetadata["phase"] as? String ?? "" {
             case "preparing": syncLabel.stringValue = "准备历史记录 \(Int(number(syncMetadata, "headers_scanned")))"
-            case "importing": syncLabel.stringValue = "扫描 \(Int(number(syncMetadata, "files_scanned"))) / \(Int(number(syncMetadata, "files_total"))) · 已导入 \(Self.integer(number(syncMetadata, "imported")))"
+            case "importing": syncLabel.stringValue = "\(rebuilding ? "重建" : "扫描") \(Int(number(syncMetadata, "files_scanned"))) / \(Int(number(syncMetadata, "files_total"))) · 已导入 \(Self.integer(number(syncMetadata, "imported")))"
             default: syncLabel.stringValue = "正在读取本机历史，已有统计仍可查看"
             }
         } else { syncLabel.stringValue = lastSync == .distantPast ? "尚未同步" : "上次同步 \(formatter.string(from: lastSync))" }
         let error = queryError.isEmpty ? syncError : queryError
         if !error.isEmpty { status.stringValue = error; status.textColor = .systemRed; status.toolTip = error }
+        else if rebuilding && busy { status.stringValue = "正在按分叉历史去重规则重建 Codex 用量，已导入部分仍可查看。"; status.textColor = .secondaryLabelColor; status.toolTip = syncMetadata["rebuild_reason"] as? String }
         else if !warnings.isEmpty { status.stringValue = "部分记录未导入 · \(warnings.count) 项，请查看数据说明"; status.textColor = .systemOrange; status.toolTip = warnings.joined(separator: "\n") }
         else { status.stringValue = busy ? "同步在后台进行，已有统计每 5 秒更新。" : "本机用量记录 · 不含账单估算"; status.textColor = .secondaryLabelColor; status.toolTip = nil }
     }
