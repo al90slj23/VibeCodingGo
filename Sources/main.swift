@@ -920,7 +920,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             case "waiting_for_codex_exit" where approvalLauncher?.isRunning == true: manualApprovalStatus = "等待你退出 Codex 后接通"
             case "launching" where approvalLauncher?.isRunning == true: manualApprovalStatus = "正在重新打开 Codex"
             case "launched": manualApprovalStatus = "Codex 已启动，等待人工批准监听连接"
-            case "error": manualApprovalStatus = "人工批准监听启动失败，请查看诊断日志"
+            case "cancelled": manualApprovalStatus = "监听接通已取消，可以重新连接"
+            case "error": manualApprovalStatus = "监听尚未接通：" + String((launch["message"] as? String ?? "请查看诊断日志").prefix(220))
             default: break
             }
         }

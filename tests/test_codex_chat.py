@@ -133,6 +133,11 @@ class ChatControllerTests(unittest.TestCase):
 
 
 class ChatRoutingTests(unittest.TestCase):
+    def setUp(self):
+        # Routing fixtures must never discover a developer's real desktop IPC.
+        desktop = patch('vibecue.codex_chat.desktop_run', return_value=None)
+        desktop.start(); self.addCleanup(desktop.stop)
+
     def test_legacy_bridge_is_detected_without_probing_unsupported_rpcs(self):
         with patch('vibecue.codex_chat.connections', return_value=[{'socket_path': '/fixture'}]), patch('vibecue.codex_chat.socket_call') as call:
             result = run('status', {'thread_id': 'thread-one'})

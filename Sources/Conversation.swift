@@ -76,7 +76,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     private var timer: Timer?
     private var reading = false, checking = false, sending = false, loading = false
     private var canSend = false, canLoad = false, messageLimit = 8192
-    private var activeTurnID = "", chatState = "unknown", pendingRequestID = ""
+    private var activeTurnID = "", chatState = "unknown", chatTransport = "", pendingRequestID = ""
     private var fingerprint = "", bodySignature = ""
     private var lastStatusCheck = Date.distantPast
     private var lastRead = Date.distantPast
@@ -250,6 +250,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     }
     private func applyChatStatus(_ data: [String: Any]) {
         canSend = data["can_send"] as? Bool == true; chatState = data["state"] as? String ?? "unknown"
+        chatTransport = data["transport"] as? String ?? ""
         canLoad = data["supported"] as? Bool == true && data["connected"] as? Bool == true && (data["needs_load"] as? Bool == true || chatState == "not_loaded")
         activeTurnID = data["active_turn_id"] as? String ?? ""
         if let value = data["max_text_bytes"] as? Int, value > 0 { messageLimit = value }
@@ -262,7 +263,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         count.stringValue = "\(length) / \(messageLimit) 字节"; count.textColor = length > messageLimit ? .systemRed : .secondaryLabelColor
         count.toolTip = "输入长度按 UTF-8 计算。中文通常占 3 字节；超限不会截断或发送。"
         sendButton.isEnabled = canSend && hasText && length <= messageLimit && !sending && !loading && pendingRequestID.isEmpty
-        sendButton.title = sending ? "正在发送…" : chatState == "active" ? "追加到当前任务" : "发送到 Codex"
+        sendButton.title = sending ? "正在发送…" : chatTransport == "desktop_ipc" ? "发送到当前对话" : chatState == "active" ? "追加到当前任务" : "发送到 Codex"
+        sendButton.toolTip = !canSend ? connection.stringValue : chatTransport == "desktop_ipc" ? "发送到当前 Codex 对话（⌘↩）。运行时作为补充，本轮已结束时开始新一轮。" : "发送到当前对话（⌘↩）。不会自动发送草稿。"
         loadButton.isEnabled = canLoad && !loading && !sending; loadButton.isHidden = !canLoad; loadButton.title = loading ? "正在载入…" : "载入对话"
         doneButton.isEnabled = !sending && !loading; doneButton.title = handled ? "已标记处理完成" : "标记处理完成"
         unlockButton.isHidden = pendingRequestID.isEmpty || sending
@@ -358,6 +360,10 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         results["accepted_send_preserves_new_edits_and_never_marks_task_handled"] = controller.pendingRequestID.isEmpty && controller.composer.string == "发送期间编辑的新内容" && handledCalls == 0
         controller.applyChatStatus(["supported": false, "connected": true, "state": "legacy_bridge", "can_send": false, "message": "旧通道待重新连接"])
         results["legacy_connection_does_not_enable_send_or_load"] = !controller.sendButton.isEnabled && !controller.loadButton.isEnabled
+        controller.applyChatStatus(["supported": true, "connected": true, "transport": "desktop_ipc", "state": "active", "can_send": true, "active_turn_id": "current-turn", "message": "已接通当前对话"])
+        results["existing_desktop_owner_enables_send_without_restart_or_load"] = controller.sendButton.isEnabled && controller.sendButton.title == "发送到当前对话" && controller.connectButton.isHidden && controller.loadButton.isHidden
+        controller.applyChatStatus(["supported": true, "connected": true, "transport": "desktop_ipc", "state": "waiting", "can_send": false, "message": "请先在 Codex 回答当前问题"])
+        results["desktop_pending_input_blocks_send_with_actionable_reason"] = !controller.sendButton.isEnabled && controller.sendButton.toolTip == "请先在 Codex 回答当前问题"
         controller.markHandled()
         results["explicit_handled_button_is_the_only_completion_action"] = handledCalls == 1
         let blocked = home.appendingPathComponent("blocked-home"); try? Data("file".utf8).write(to: blocked)

@@ -65,6 +65,7 @@ def unavailable(state='disconnected', connected=False):
 
 class ChatController:
     """Owner-local operations; only send() can generate user input."""
+    accepts_current_turn_result = False
     def __init__(self, channel, home=None, deadline=None):
         self.channel = channel
         self.home = vibecue_directory(home)
@@ -196,7 +197,7 @@ class ChatController:
             try:
                 reply = self.rpc(method, rpc)
                 turn = reply.get('turn', {}).get('id') if method == 'turn/start' else reply.get('turnId')
-                if not isinstance(turn, str) or not THREAD_ID.fullmatch(turn) or (expected and turn != expected):
+                if not isinstance(turn, str) or not THREAD_ID.fullmatch(turn) or (expected and turn != expected and not self.accepts_current_turn_result):
                     result = dict(result, message='Codex 已返回响应，但轮次无法核对；请查看对话，不会自动重发。')
                 else:
                     result = dict(result, status='accepted', turn_id=turn, message='Codex 已接收消息。')
@@ -207,6 +208,89 @@ class ChatController:
             receipts[request]['result'] = result
             save()
             return result
+
+
+class DesktopChatController(ChatController):
+    """Follow the existing desktop owner; never take ownership or resume it.
+
+    The desktop's text-only start operation can add input to its current turn.
+    It preserves the owner's settings and may return a new turn if the old one
+    just ended. A matching request receipt, rather than a guessed turn binding,
+    confirms this transport. Submission is still never retried automatically.
+    """
+    accepts_current_turn_result = True
+
+    def status(self, params):
+        identifier = thread_id(params, ('thread_id',))
+        if identifier != self.channel.thread_id:
+            raise ControlError('回复对话与窗口不一致')
+        snapshot = self.channel.runtime_snapshot()
+        if snapshot.get('thread_id') != identifier:
+            raise ControlError('Codex 返回的对话与所选项不一致')
+        base = {'schema_version': 1, 'thread_id': identifier, 'connected': True,
+                'supported': True, 'can_send': False, 'needs_load': False,
+                'max_text_bytes': MAX_TEXT_BYTES, 'transport': 'desktop_ipc'}
+        runtime = snapshot.get('thread_runtime_status')
+        if snapshot.get('resume_state') != 'resumed' or not isinstance(runtime, dict):
+            return dict(base, state='unknown', message='Codex 尚未就绪，请在 Codex 中打开此对话后刷新。')
+        kind = runtime.get('type')
+        flags = runtime.get('activeFlags', [] if kind == 'idle' else None)
+        if not isinstance(flags, list) or not all(isinstance(flag, str) for flag in flags) or type(snapshot.get('requests_pending')) is not bool:
+            return dict(base, state='unknown', message='Codex 对话状态尚不完整，请稍后刷新。')
+        if snapshot['requests_pending'] or flags:
+            return dict(base, state='waiting', message='Codex 正在等待批准或回答，请先在 Codex 处理对应请求。')
+        if kind == 'idle':
+            return dict(base, state='idle', can_send=True, active_turn_id=None,
+                        message='已接通当前 Codex 对话，可直接发送。沿用此对话的模型与权限设置。')
+        if kind == 'active':
+            last = snapshot.get('last_turn')
+            last = last if isinstance(last, dict) else {}
+            active_id = last.get('turnId', last.get('id'))
+            if last.get('status') != 'inProgress' or not isinstance(active_id, str) or not THREAD_ID.fullmatch(active_id):
+                return dict(base, state='active', message='已连接；当前轮次尚未确认，请稍后刷新。')
+            return dict(base, state='active', can_send=True, active_turn_id=active_id,
+                        message='已接通，可发送到当前对话。运行时作为补充；本轮刚结束时会进入新一轮。')
+        return dict(base, state='unknown', message='Codex 当前状态尚未确认，请刷新后重试。')
+
+    def load(self, params):
+        # Existing owners already hold the conversation. Never claim ownership
+        # or implicitly resume a thread through the desktop's follower API.
+        return self.status(params)
+
+    def rpc(self, method, params):
+        if method not in ('turn/start', 'turn/steer'):
+            raise ControlError('窗口回复只允许发送用户文字')
+        request = {key: params[key] for key in ('threadId', 'input', 'clientUserMessageId')}
+        result = self.channel.start_turn(request)
+        if not isinstance(result, dict) or not isinstance(result.get('turn'), dict):
+            raise UnconfirmedUpdate('Codex 消息响应尚未确认，请核对对话')
+        return {'turnId': result['turn'].get('id')} if method == 'turn/steer' else result
+
+
+def desktop_run(operation, params, home=None):
+    from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable
+    from .events import codex_directory
+    if not (codex_directory() / 'ipc/ipc.sock').exists():
+        return None
+    identifier = params['thread_id']
+    try:
+        with DesktopChannel(identifier) as channel:
+            controller = DesktopChatController(channel, home=home)
+            return getattr(controller, operation)(params)
+    except DesktopOwnerUnavailable:
+        return {'schema_version': 1, 'thread_id': identifier, 'connected': True,
+                'supported': True, 'can_send': False, 'needs_load': False,
+                'state': 'not_open', 'transport': 'desktop_ipc',
+                'status': 'unavailable' if operation == 'status' else 'failed',
+                'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,
+                'message': '请先点击“在 Codex 打开”此对话；窗口就绪后会自动接通，草稿会保留。'}
+    except ControlError as error:
+        return {'schema_version': 1, 'thread_id': identifier, 'connected': False,
+                'supported': False, 'can_send': False, 'needs_load': False,
+                'state': 'disconnected', 'transport': 'desktop_ipc',
+                'status': 'unavailable' if operation == 'status' else 'failed',
+                'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,
+                'message': str(error)}
 
 
 def socket_call(connection, operation, params):
@@ -241,6 +325,9 @@ def run(operation, params, home=None):
     live = connections(home)
     capable = [value for value in live if value.get('chat_version') == CHAT_VERSION]
     if not capable:
+        desktop = desktop_run(operation, params, home=home)
+        if desktop is not None:
+            return desktop
         return dict(unavailable('legacy_bridge' if live else 'disconnected', bool(live)), thread_id=identifier,
                     status='failed' if operation != 'status' else 'unavailable')
     if len(capable) != len(live):
