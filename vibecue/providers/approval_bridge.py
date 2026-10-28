@@ -477,9 +477,10 @@ def run_bridge(real_cli, args, home=None):
         pass
     control = None
     try:
-        from ..codex_control_relay import ControlHub, atomic_pipe_write
+        from ..codex_control_relay import ControlHub, atomic_pipe_write, framed_pipe_write
         control = ControlHub(lambda chunk: _write_all(process.stdin.fileno(), chunk), process.pid, home=home,
-                             write_control=lambda chunk, deadline: atomic_pipe_write(process.stdin.fileno(), chunk, deadline))
+                             write_control=lambda chunk, deadline: atomic_pipe_write(process.stdin.fileno(), chunk, deadline),
+                             write_chat=lambda chunk, deadline, commit: framed_pipe_write(process.stdin.fileno(), chunk, deadline, commit, control.closed))
         control.start()
     except Exception:
         if control is not None:

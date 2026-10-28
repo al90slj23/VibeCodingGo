@@ -295,6 +295,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var statusPopoverController: CueStatusPopoverController?
     var usageDashboard: CueUsageDashboardController?
     private var recoveryClient: CueUsageClient?
+    private var conversationClient: CueUsageClient?
+    private var conversationWindows: [String: CueConversationController] = [:]
     var openConversationURL: (URL) -> Bool = { NSWorkspace.shared.open($0) }
     var seen: [String] = []
     var resolutions = CueResolutionTracker()
@@ -717,12 +719,90 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
     @objc func openRecent(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let event = recent.first(where: { $0.id == id }) else { return }
-        open(event: event)
+        showConversation(event: event)
     }
     @objc func openRunningRecent(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
               let task = (runningTasks + interruptedTasks).first(where: { $0.threadID == id }) else { return }
-        open(event: task.ephemeralCueEvent)
+        showConversation(event: task.ephemeralCueEvent)
+    }
+    @objc func openFollowupRecent(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let item = recentHistory.followups.records.first(where: { $0.threadID == id }) else { return }
+        showConversation(event: item.event)
+    }
+    func showConversation(event: CueEvent) {
+        guard CueBatchTarget(threadID: event.threadID, title: event.title, provider: event.provider) != nil else { return }
+        statusPopover?.performClose(nil)
+        if conversationWindows[event.threadID] == nil {
+            conversationWindows[event.threadID] = CueConversationController(home: home, event: event,
+                detailProvider: { [weak self] in self?.taskDetails[event.threadID] },
+                onHandled: { [weak self] in
+                    guard let self else { return }
+                    self.recentHistory.markThreadHandled(threadID: event.threadID)
+                    if let task = self.interruptedTasks.first(where: { $0.threadID == event.threadID }) { self.dismissInterrupted(task) }
+                    self.refreshConversationHistory()
+                }, onCodex: { [weak self] in _ = self?.open(event: event) },
+                onConnect: { [weak self] in self?.connectManualApproval() },
+                onPathAction: { [weak self] command in self?.performThreadAction(threadID: event.threadID, command: command) })
+        }
+        conversationWindows[event.threadID]?.showWindow(nil)
+        recentHistory.beginReview(event: event)
+        refreshConversationHistory()
+    }
+    private func refreshConversationHistory() {
+        recent = recentHistory.events; refreshMenu(); settingsPanel?.updateHealth(); writeStatus()
+    }
+    private func dismissInterrupted(_ task: CueRunningTask) {
+        guard let interrupted = task.interruptedAt else { return }
+        if recoveryClient == nil { recoveryClient = CueUsageClient(home: home) }
+        recoveryClient?.run(["dismiss", "--thread-id", task.threadID, "--turn-id", task.turnID, "--interrupted-at", String(interrupted.timeIntervalSince1970)], module: "vibecue.providers.task_recovery") { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success: self.nextHealthCheck = .distantPast; self.updateWatcherHealth()
+            case .failure(let error): self.showThreadActionError(error.localizedDescription, threadID: task.threadID)
+            }
+        }
+    }
+    private func showThreadActionError(_ message: String, threadID: String) {
+        let alert = NSAlert(); alert.messageText = "暂时无法完成此操作"; alert.informativeText = message; alert.addButton(withTitle: "知道了")
+        if let parent = conversationWindows[threadID]?.window, parent.isVisible { alert.beginSheetModal(for: parent) }
+        else { alert.runModal() }
+    }
+    private func performThreadAction(threadID: String, command: String) {
+        guard CueBatchTarget(threadID: threadID, title: "") != nil,
+              ["copy_project_path", "copy_log_path", "reveal_project", "reveal_log", "open_terminal"].contains(command),
+              let input = try? JSONSerialization.data(withJSONObject: ["thread_id": threadID, "metadata_only": true]) else { return }
+        if conversationClient == nil { conversationClient = CueUsageClient(home: home) }
+        conversationClient?.run(["read"], module: "vibecue.thread_info", input: input) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error): self.showThreadActionError(error.localizedDescription, threadID: threadID)
+            case .success(let data):
+                guard data["thread_id"] as? String == threadID else { return }
+                let isLog = command == "copy_log_path" || command == "reveal_log"
+                let actual = data["actual_transcript_path"] as? String ?? ""
+                let raw = isLog ? (actual.isEmpty ? data["transcript_path"] as? String ?? "" : actual) : data["cwd"] as? String ?? ""
+                guard !raw.isEmpty, (raw as NSString).isAbsolutePath, !raw.contains("\0") else {
+                    self.showThreadActionError(isLog ? "此对话没有可用的本机会话记录路径。" : "此对话没有记录本机项目目录。", threadID: threadID); return
+                }
+                if command.hasPrefix("copy_") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(raw, forType: .string); return }
+                var directory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: raw, isDirectory: &directory) else {
+                    self.showThreadActionError("路径不在本机，或已移动。可以先复制路径核对。\n" + raw, threadID: threadID); return
+                }
+                let url = URL(fileURLWithPath: raw, isDirectory: directory.boolValue)
+                if command == "reveal_log" { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                else if command == "reveal_project" {
+                    guard directory.boolValue else { self.showThreadActionError("项目路径不是文件夹。", threadID: threadID); return }
+                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: raw)
+                } else if command == "open_terminal" {
+                    guard directory.boolValue, let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else { self.showThreadActionError("未找到可用的终端或本机项目文件夹。", threadID: threadID); return }
+                    NSWorkspace.shared.open([url], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                        if error != nil { DispatchQueue.main.async { self.showThreadActionError("终端未能打开此项目目录。", threadID: threadID) } }
+                    }
+                }
+            }
+        }
     }
     @objc func toggleMute() {
         muted.toggle(); saveSettings()
@@ -1014,8 +1094,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     @objc func connectManualApproval() {
         guard approvalLauncher?.isRunning != true else { return }
         let alert = NSAlert()
-        alert.messageText = "接通 Codex 提醒与批量设置"
-        alert.informativeText = "首次连接需要你主动退出并重新打开 Codex。请先完成或保存当前工作；VibeCue 会等你退出后重新打开，并连接待确认提醒与模型控制。模型设置只在你点击“应用”后修改。"
+        alert.messageText = "接通 Codex 提醒、对话与批量设置"
+        alert.informativeText = "首次连接或升级对话输入通道，需要你主动退出并重新打开 Codex。请先完成或保存当前工作；VibeCue 会等你退出后重新打开。对话输入只在你点击“载入对话”或“发送”时执行，模型设置只在点击“应用”后修改。"
         alert.addButton(withTitle: "准备连接，等待我退出")
         alert.addButton(withTitle: "稍后")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -1132,7 +1212,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             item.target = self; item.representedObject = kind; item.isEnabled = !muted; audioMenu.addItem(item)
         }
         let audioTests = NSMenuItem(title: "只测试提示音", action: nil, keyEquivalent: ""); audioTests.submenu = audioMenu; menu.addItem(audioTests)
-        if !recent.isEmpty || !runningTasks.isEmpty || !interruptedTasks.isEmpty {
+        if !recent.isEmpty || !runningTasks.isEmpty || !interruptedTasks.isEmpty || !recentHistory.followups.records.isEmpty {
             menu.addItem(.separator())
             func heading(_ title: String) {
                 let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
@@ -1167,7 +1247,16 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 }
             }
             let activeIDs = Set((runningTasks + interruptedTasks).map(\.threadID))
-            let ordinary = recentHistory.records.filter { !$0.isPinned && !($0.event.provider == "codex" && activeIDs.contains($0.event.threadID)) }
+            let pending = recentHistory.followups.records.filter { !activeIDs.contains($0.threadID) && !pinnedThreads.contains($0.threadID) }
+            if !pending.isEmpty {
+                heading("待续 · \(pending.count) 项")
+                for task in pending {
+                    let item = NSMenuItem(title: "🔖 \(task.title.prefix(52))", action: #selector(openFollowupRecent(_:)), keyEquivalent: "")
+                    item.target = self; item.representedObject = task.threadID; menu.addItem(item)
+                }
+            }
+            let pendingIDs = Set(recentHistory.followups.records.map(\.threadID))
+            let ordinary = recentHistory.records.filter { !$0.isPinned && !($0.event.provider == "codex" && (activeIDs.contains($0.event.threadID) || pendingIDs.contains($0.event.threadID))) }
             if !ordinary.isEmpty { heading("历史提醒 · \(ordinary.count) 条"); ordinary.forEach(reminder) }
         }
         menu.addItem(.separator())
@@ -1209,8 +1298,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 },
                 quit: { [weak self] in self?.quit() },
                 openEvent: { [weak self] event in
-                    guard let self else { return }
-                    if self.open(event: event) { self.statusPopover?.performClose(nil) }
+                    self?.showConversation(event: event)
                 },
                 historyChanged: { [weak self] in
                     guard let self else { return }
@@ -1227,15 +1315,12 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 connectCodex: { [weak self] in
                     self?.statusPopover?.performClose(nil); self?.connectManualApproval()
                 }, dismissInterrupted: { [weak self] task in
-                    guard let self, let interrupted = task.interruptedAt else { return }
-                    if self.recoveryClient == nil { self.recoveryClient = CueUsageClient(home: self.home) }
-                    self.recoveryClient?.run(["dismiss", "--thread-id", task.threadID, "--turn-id", task.turnID, "--interrupted-at", String(interrupted.timeIntervalSince1970)], module: "vibecue.providers.task_recovery") { [weak self] result in
-                        guard let self else { return }
-                        switch result {
-                        case .success: self.nextHealthCheck = .distantPast; self.updateWatcherHealth()
-                        case .failure(let error): self.watcherLaunchError = error.localizedDescription; self.settingsPanel?.updateHealth()
-                        }
-                    }
+                    self?.dismissInterrupted(task)
+                }, openInCodex: { [weak self] event in
+                    guard let self else { return }
+                    if self.open(event: event) { self.recentHistory.beginReview(event: event); self.statusPopover?.performClose(nil); self.refreshConversationHistory() }
+                }, threadAction: { [weak self] id, command in
+                    self?.performThreadAction(threadID: id, command: command)
                 })
             statusPopoverController = CueStatusPopoverController(history: recentHistory, actions: actions)
             let popover = NSPopover(); popover.behavior = .transient
@@ -1309,6 +1394,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard ownsLock else { if lockFD >= 0 { Darwin.close(lockFD) }; return }
         shuttingDown = true
         usageDashboard?.stopBackgroundSync()
+        conversationWindows.values.forEach { $0.stop() }; conversationClient?.stop(); recoveryClient?.stop()
         approvalLauncher?.terminate()
         try? approvalLaunchLog?.close(); approvalLaunchLog = nil
         watcherRestartTimer?.invalidate()
@@ -1951,6 +2037,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results.merge(CueCodexBatchController.validationReport()) { _, new in new }
     results.merge(CueTaskHoverController.validationReport()) { _, new in new }
     results.merge(CueTaskRecoverySnapshot.validationReport()) { _, new in new }
+    results.merge(CueConversationController.validationReport()) { _, new in new }
     func event(_ id: String) -> CueEvent {
         CueEvent(try! JSONSerialization.data(withJSONObject: ["id": id, "kind": "complete", "thread_id": "fixture-chat", "title": "验收样例 · " + id, "created_at": Date().timeIntervalSince1970]))!
     }
@@ -2207,6 +2294,11 @@ if CommandLine.arguments.contains("--sound-source-self-test") {
     exit(results.allSatisfy { $0["started"] as? Bool == true && $0["playing_after_100ms"] as? Bool == true } ? 0 : 1)
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--capture-conversation"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do { try CueConversationController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
+    catch { print("对话详情窗口截图失败"); exit(1) }
+}
 if CommandLine.arguments.contains("--usage-money-self-test") {
     _ = NSApplication.shared
     let results = CueUsagePreferencesController.validationReport()

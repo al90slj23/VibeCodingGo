@@ -1,9 +1,9 @@
 """Owner-bound local control for an explicitly opted-in Codex stdio bridge.
 
-The control socket is private and accepts three high-level operations only.
-Backend RPCs are restricted to model catalog, loaded/read metadata, and sparse
-thread settings. No turn, input, resume, permission decision or auth RPC is ever
-generated. Normal desktop messages are returned byte-for-byte unchanged.
+The private socket accepts batch controls and separately requested chat actions.
+Opening a window is read-only. Loading and user input are explicit operations,
+with no authentication or permission-decision RPCs. Normal desktop messages are
+returned byte-for-byte unchanged.
 """
 from collections import OrderedDict
 from contextlib import suppress
@@ -25,7 +25,10 @@ from .codex_control import Controller, ControlError, UnconfirmedUpdate, fields_m
 
 MAX_FRAME = 8 * 1024 * 1024
 MAX_CONTROL_REQUEST = 65536
-ALLOWED_METHODS = frozenset(('model/list', 'thread/loaded/list', 'thread/read', 'thread/settings/update'))
+ALLOWED_METHODS = frozenset(('model/list', 'thread/loaded/list', 'thread/read', 'thread/settings/update',
+                             'thread/resume', 'turn/start', 'turn/steer'))
+CHAT_FRAME_LIMIT = 16 * 1024
+MUTATIONS = frozenset(('thread/settings/update', 'thread/resume', 'turn/start', 'turn/steer'))
 
 
 def atomic_pipe_write(fd, payload, deadline):
@@ -51,6 +54,47 @@ def atomic_pipe_write(fd, payload, deadline):
         with suppress(OSError): fcntl.fcntl(fd, fcntl.F_SETFL, original)
 
 
+def framed_pipe_write(fd, payload, deadline, commit, closed=None):
+    """Write a whole chat frame while ControlHub holds its sole wire lock.
+
+    Before the first byte a deadline cancels the write. Once committed, the
+    frame is completed despite an expired caller deadline; no desktop bytes may
+    interleave. A caller timing out observes an uncertain result and never
+    retries automatically. Only actual pipe closure or owner shutdown aborts a
+    committed frame, just as it aborts ordinary desktop forwarding.
+    """
+    if len(payload) > CHAT_FRAME_LIMIT:
+        raise ControlError('对话消息序列化后过长，未发送')
+    original = fcntl.fcntl(fd, fcntl.F_GETFL)
+    offset = 0
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETFL, original | os.O_NONBLOCK)
+        while offset < len(payload):
+            if closed is not None and closed.is_set():
+                raise OSError('Codex owner connection closed')
+            remaining = deadline - time.monotonic()
+            if not offset and remaining <= 0:
+                raise ControlError('对话消息尚未发送，等待连接已到时')
+            pause = .25 if offset else min(.25, max(0, remaining))
+            try:
+                writable = select.select([], [fd], [], pause)[1]
+            except InterruptedError:
+                continue
+            if not writable:
+                continue
+            if not offset and not commit():
+                raise ControlError('对话消息尚未发送，请刷新后重试')
+            try:
+                count = os.write(fd, memoryview(payload)[offset:])
+            except (BlockingIOError, InterruptedError):
+                continue
+            if count <= 0:
+                raise OSError('Codex owner pipe closed')
+            offset += count
+    finally:
+        with suppress(OSError): fcntl.fcntl(fd, fcntl.F_SETFL, original)
+
+
 def private_directory(path):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -61,9 +105,10 @@ def private_directory(path):
 
 
 class ControlHub:
-    def __init__(self, write_backend, backend_pid, home=None, clock=time.time, write_control=None):
+    def __init__(self, write_backend, backend_pid, home=None, clock=time.time, write_control=None, write_chat=None):
         self.write_backend = write_backend
         self.write_control = write_control or (lambda payload, deadline: self.write_backend(payload))
+        self.write_chat = write_chat or (lambda payload, deadline, commit: self.write_backend(payload) if commit() else None)
         self.backend_pid = backend_pid
         self.home = vibecue_directory(home)
         self.folder = private_directory(self.home / 'control')
@@ -84,6 +129,7 @@ class ControlHub:
         self.send_queue = OrderedDict()
         self.pending = {}
         self.thread_settings = OrderedDict()
+        self.thread_activity = OrderedDict()
         self.revision = 0
         self.counter = 0
         self.initialize_id = None
@@ -120,7 +166,7 @@ class ControlHub:
     def _health(self):
         value = {'version': 1, 'pid': os.getpid(), 'backend_pid': self.backend_pid,
                  'last_seen': self.clock(), 'ready': self.ready, 'socket_path': str(self.socket_path),
-                 'session_id': self.session, 'boot_time': self.boot_time}
+                 'session_id': self.session, 'boot_time': self.boot_time, 'chat_version': 1}
         fd, temporary = tempfile.mkstemp(prefix='.control-', dir=self.folder)
         try:
             os.fchmod(fd, 0o600)
@@ -164,6 +210,8 @@ class ControlHub:
             self.client_forwarded(chunk)
             if chunk:
                 self.client_boundary = bytes(chunk).endswith(b'\n')
+            with self.condition:
+                self.condition.notify_all()
             if self.client_boundary:
                 queued = list(self.send_queue.items())
                 self.send_queue.clear()
@@ -197,6 +245,45 @@ class ControlHub:
         finally:
             self.wire_lock.release()
 
+    def _send_chat(self, identifier, payload, deadline, pending, method, params):
+        """The caller may time out; a committed frame still owns the wire."""
+        def commit():
+            with self.condition:
+                if pending.get('cancelled') or self.closed.is_set() or time.monotonic() >= deadline:
+                    return False
+                activity = self.thread_activity.get(params['threadId'], {})
+                if method == 'turn/start' and activity.get('state') == 'active':
+                    return False
+                if method == 'turn/steer' and (activity.get('state') != 'active' or activity.get('turn_id') != params['expectedTurnId']):
+                    return False
+                # Reserve uncertain-send state before the first write attempt.
+                # A nonblocking EAGAIN can conservatively leave it uncertain.
+                pending['sent'] = True
+                return True
+
+        def writer():
+            try:
+                while not self.closed.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ControlError('对话消息尚未发送，等待连接已到时')
+                    if not self.wire_lock.acquire(timeout=remaining):
+                        raise ControlError('Codex 正在传输其他请求，对话消息尚未发送')
+                    try:
+                        if self.client_boundary:
+                            self.write_chat(payload, deadline, commit)
+                            return
+                    finally:
+                        self.wire_lock.release()
+                    with self.condition:
+                        self.condition.wait(min(.05, max(0, deadline-time.monotonic())))
+            except (OSError, ValueError, ControlError) as error:
+                with self.condition:
+                    pending['response'] = {'error': {'message': 'Codex 对话连接未完成发送'}}
+                    pending['write_failed'] = pending.get('sent', False)
+                    pending['event'].set()
+        threading.Thread(target=writer, name='vibecue-chat-frame', daemon=True).start()
+
     def _receive(self, frame):
         try:
             value = json.loads(frame)
@@ -210,6 +297,16 @@ class ControlHub:
                 pending = self.pending.get(identifier)
                 if pending is not None:
                     pending['response'] = value
+                    result = value.get('result', {})
+                    if isinstance(result, dict) and pending.get('method') in ('thread/read', 'thread/resume'):
+                        thread = result.get('thread', {})
+                        if isinstance(thread, dict) and thread.get('id') == pending.get('thread_id'):
+                            status = thread.get('status', {})
+                            if isinstance(status, dict) and status.get('type') != 'active':
+                                self.thread_activity[thread['id']] = {'state': status.get('type'), 'turn_id': None}
+                                self.thread_activity.move_to_end(thread['id'])
+                                while len(self.thread_activity) > 512:
+                                    self.thread_activity.popitem(last=False)
                     pending['event'].set()
             return True
         if value.get('method') is None and identifier == self.initialize_id and 'result' in value:
@@ -225,6 +322,26 @@ class ControlHub:
                     while len(self.thread_settings) > 512:
                         self.thread_settings.popitem(last=False)
                     self.condition.notify_all()
+        method, params = value.get('method'), value.get('params')
+        if isinstance(params, dict) and isinstance(params.get('threadId'), str):
+            tid = params['threadId']
+            if THREAD_ID.fullmatch(tid):
+                activity = None
+                if method in ('turn/started', 'turn/completed'):
+                    turn = params.get('turn', {})
+                    if isinstance(turn, dict) and isinstance(turn.get('id'), str):
+                        activity = {'state': 'active' if method == 'turn/started' else 'idle',
+                                    'turn_id': turn['id'] if method == 'turn/started' else None}
+                elif method == 'thread/status/changed':
+                    status = params.get('status', {})
+                    if isinstance(status, dict) and status.get('type') != 'active':
+                        activity = {'state': status.get('type'), 'turn_id': None}
+                if activity is not None:
+                    with self.condition:
+                        self.thread_activity[tid] = activity
+                        self.thread_activity.move_to_end(tid)
+                        while len(self.thread_activity) > 512:
+                            self.thread_activity.popitem(last=False)
         return False
 
     def server_chunk(self, chunk):
@@ -273,12 +390,26 @@ class ControlHub:
             if method == 'thread/read':
                 if set(params) != {'threadId', 'includeTurns'} or params['includeTurns'] is not False:
                     raise ControlError('控制通道不读取对话正文')
-            else:
+            elif method == 'thread/settings/update':
                 if set(params) - {'threadId', 'model', 'effort', 'serviceTier'} or len(params) < 2:
                     raise ControlError('只允许修改模型、强度和快速档位')
                 for field in ('model', 'effort', 'serviceTier'):
                     if field in params and not (isinstance(params[field], str) and 0 < len(params[field]) <= 180) and not (field == 'serviceTier' and params[field] is None):
                         raise ControlError('模型设置参数无效')
+            elif method == 'thread/resume':
+                if set(params) != {'threadId', 'excludeTurns'} or params['excludeTurns'] is not True:
+                    raise ControlError('载入仅允许所选对话，不允许覆盖模型、指令或权限')
+            else:
+                from .codex_chat import send_params
+                allowed = {'threadId', 'input', 'clientUserMessageId'}
+                if method == 'turn/steer': allowed.add('expectedTurnId')
+                if set(params) != allowed or not isinstance(params.get('input'), list) or len(params['input']) != 1:
+                    raise ControlError('对话消息参数无效')
+                item = params['input'][0]
+                if not isinstance(item, dict) or set(item) != {'type', 'text'} or item['type'] != 'text':
+                    raise ControlError('对话窗口仅支持明确输入的文字')
+                send_params({'thread_id': tid, 'text': item['text'], 'request_id': params.get('clientUserMessageId'),
+                             **({'expected_turn_id': params.get('expectedTurnId')} if method == 'turn/steer' else {})})
 
     def request(self, method, params, timeout=8):
         self._validate_rpc(method, params)
@@ -287,22 +418,31 @@ class ControlHub:
         with self.condition:
             self.counter += 1
             identifier = self.prefix + str(self.counter)
-            pending = {'event': threading.Event()}
+            pending = {'event': threading.Event(), 'method': method, 'thread_id': params.get('threadId')}
             self.pending[identifier] = pending
         deadline = time.monotonic()+timeout
         try:
-            payload = json.dumps({'id': identifier, 'method': method, 'params': params}, separators=(',', ':')).encode() + b'\n'
+            payload = json.dumps({'id': identifier, 'method': method, 'params': params}, ensure_ascii=False, separators=(',', ':')).encode() + b'\n'
+            if method in ('turn/start', 'turn/steer') and len(payload) > CHAT_FRAME_LIMIT:
+                raise ControlError('对话消息序列化后过长，未发送')
             try:
-                self._send_control(identifier, payload, deadline)
+                if method in ('turn/start', 'turn/steer'):
+                    self._send_chat(identifier, payload, deadline, pending, method, params)
+                else:
+                    self._send_control(identifier, payload, deadline)
             except (OSError, ValueError) as error:
-                if method == 'thread/settings/update' and pending.get('sent'):
-                    raise UnconfirmedUpdate('设置请求可能已发送，连接已中断；请在 Codex 中核对，勿自动重试。') from error
+                if method in MUTATIONS and pending.get('sent'):
+                    raise UnconfirmedUpdate('请求可能已发送，连接已中断；请在 Codex 中核对，勿自动重试。') from error
                 raise ControlError('Codex 控制请求未能发送') from error
             if not pending['event'].wait(max(0, deadline-time.monotonic())) or self.closed.is_set():
-                if method == 'thread/settings/update' and pending.get('sent'):
-                    raise UnconfirmedUpdate('设置请求已发送，但确认超时或连接已关闭；请在 Codex 中核对。')
+                with self.condition:
+                    if not pending.get('sent'): pending['cancelled'] = True
+                if method in MUTATIONS and pending.get('sent'):
+                    raise UnconfirmedUpdate('请求已发送，但确认超时或连接已关闭；请在 Codex 中核对。')
                 raise ControlError('Codex 控制请求超时或连接已关闭')
             response = pending.get('response', {})
+            if pending.get('write_failed') and method in MUTATIONS:
+                raise UnconfirmedUpdate('请求可能已发送，但连接已经关闭，请核对对话。')
             if 'error' in response:
                 error = response['error']
                 message = error.get('message') if isinstance(error, dict) else None
@@ -321,6 +461,10 @@ class ControlHub:
         with self.condition:
             value, revision = self.thread_settings.get(identifier, ({}, 0))
             return dict(value), revision
+
+    def chat_activity(self, identifier):
+        with self.condition:
+            return dict(self.thread_activity.get(identifier, {}))
 
     def wait_settings(self, identifier, after, patch, timeout=2):
         deadline = time.monotonic() + timeout
@@ -359,6 +503,10 @@ class ControlHub:
                     response = controller.inspect(value['params'])
                 elif operation == 'apply':
                     response = controller.apply(value['params'])
+                elif operation in ('chat_status', 'chat_load', 'chat_send'):
+                    from .codex_chat import ChatController
+                    chat = ChatController(self, home=self.home, deadline=min(deadline, time.monotonic()+25))
+                    response = getattr(chat, operation.removeprefix('chat_'))(value['params'])
                 else:
                     raise ControlError('不支持的控制操作')
             except (ControlError, OSError, ValueError, TypeError, KeyError) as error:
