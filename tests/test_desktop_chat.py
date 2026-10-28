@@ -47,6 +47,26 @@ class DesktopChatTests(unittest.TestCase):
         self.assertTrue(self.controller.load({'thread_id': 'thread-one'})['can_send'])
         self.assertEqual(self.channel.sent, [])
 
+    def test_status_explicitly_clears_prediction_without_triggering_generation(self):
+        self.channel.snapshot['last_turn'] = {'turnId': 'finished-turn', 'status': 'completed'}
+        self.channel.snapshot['prediction'] = {'text': 'UNTRUSTED UNSUPPORTED FIELD'}
+        result = self.controller.status({'thread_id': 'thread-one'})
+        self.assertIsNone(result['prompt_suggestion'])
+        self.assertEqual(result['prompt_suggestion_status'], 'not_exposed')
+        self.assertEqual(result['latest_turn_id'], 'finished-turn')
+        self.assertNotIn('UNTRUSTED', json.dumps(result))
+        self.assertEqual(self.channel.sent, [])
+
+    def test_running_waiting_and_unknown_status_never_reuse_ghost_text(self):
+        for kind, pending in [('active', False), ('idle', True), ('unknown', False)]:
+            self.channel.snapshot['thread_runtime_status'] = {'type': kind, 'activeFlags': []}
+            self.channel.snapshot['requests_pending'] = pending
+            result = self.controller.status({'thread_id': 'thread-one'})
+            self.assertIsNone(result['prompt_suggestion'])
+        self.channel.snapshot['last_turn'] = {'turnId': '../invalid'}
+        self.assertIsNone(self.controller.status({'thread_id': 'thread-one'})['latest_turn_id'])
+        self.assertEqual(self.channel.sent, [])
+
     def test_active_owner_is_sendable_only_with_known_turn(self):
         self.channel.snapshot['thread_runtime_status']['type'] = 'active'
         self.assertTrue(self.controller.status({'thread_id': 'thread-one'})['can_send'])

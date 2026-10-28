@@ -1258,7 +1258,16 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             }
             let pinned = recentHistory.records.filter(\.isPinned)
             if !pinned.isEmpty { heading("置顶提醒 · \(pinned.count) 条"); pinned.forEach(reminder) }
-            let pinnedThreads = Set(pinned.filter { $0.event.provider == "codex" }.map { $0.event.threadID })
+            let alertPinnedThreads = Set(pinned.filter { $0.event.provider == "codex" }.map { $0.event.threadID })
+            let pinnedFollowups = recentHistory.followups.records.filter { $0.isPinned && !alertPinnedThreads.contains($0.threadID) }
+            if !pinnedFollowups.isEmpty {
+                heading("置顶任务 · \(pinnedFollowups.count) 项")
+                for task in pinnedFollowups {
+                    let item = NSMenuItem(title: "\(task.unread ? "● " : "📌 ")\(task.title.prefix(52))", action: #selector(openFollowupRecent(_:)), keyEquivalent: "")
+                    item.target = self; item.representedObject = task.threadID; menu.addItem(item)
+                }
+            }
+            let pinnedThreads = alertPinnedThreads.union(pinnedFollowups.map(\.threadID))
             let active = runningTasks.filter { !pinnedThreads.contains($0.threadID) }.sorted(by: CueRunningTask.titleAscending)
             if !active.isEmpty {
                 heading("正在运行 · \(active.count) 项")
@@ -1374,7 +1383,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func updateStatusPopover() {
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
-        let height = min(900, (screen?.visibleFrame.height ?? 900) - 52)
+        let height = min(1100, (screen?.visibleFrame.height ?? 900) - 52)
         statusPopoverController?.update(status: watcherHealthText, enabled: settings.enabled,
                                        soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks, interruptedTasks: interruptedTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected,
                                        connectionSummary: codexConnectionSummary, connectionState: codexConnectionState, showConnectionAction: codexConnectionState == "unsupported")
@@ -2346,6 +2355,10 @@ if CommandLine.arguments.contains("--conversation-renderer-self-test") {
     let results = CueConversationController.rendererValidationReport()
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
     exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+if let index = CommandLine.arguments.firstIndex(of: "--capture-recent"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    exit(CueStatusPopoverController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")) ? 0 : 1)
 }
 if let index = CommandLine.arguments.firstIndex(of: "--capture-conversation"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared

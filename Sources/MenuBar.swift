@@ -12,7 +12,7 @@ struct CueMenuBarWork {
 
     init(records: [CueRecentRecord], running: [CueRunningTask], interrupted: [CueRunningTask], followups: [CueThreadFollowup]) {
         let active = Set(running.map(\.threadID))
-        let unread = Set(records.filter { !$0.isOpened && $0.canOpen }.map { $0.event.threadID })
+        let unread = Set(records.filter { !$0.isOpened && $0.canOpen }.map { $0.event.threadID }).union(followups.filter(\.unread).map(\.threadID))
         let retained = Set(followups.map(\.threadID))
         let recovery = Set(interrupted.filter(\.needsRecovery).map(\.threadID)).subtracting(active)
         self.running = active.count

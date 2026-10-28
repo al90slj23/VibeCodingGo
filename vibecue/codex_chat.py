@@ -28,6 +28,22 @@ MAX_RECEIPTS = 512
 REQUEST_ID = re.compile(r'^[A-Za-z0-9_-]{16,64}$')
 
 
+def prompt_suggestion_metadata(*, connected=True, latest_turn_id=None):
+    """Explicit capability state; never infer a prediction from assistant prose.
+
+    In the audited desktop build, Cumberbatch predictions are cached by an
+    Electron service, outside the owner/follower snapshot and method table.
+    Its request method may perform inference when the cache is empty, so a
+    passive status read must not invoke it. See docs/codex-prompt-suggestions.md.
+    A future real provider must bind its text to this thread and latest turn;
+    null here also tells consumers to discard any stale ghost text.
+    """
+    return {'prompt_suggestion': None,
+            'prompt_suggestion_status': 'not_exposed' if connected else 'unavailable',
+            'latest_turn_id': latest_turn_id if isinstance(latest_turn_id, str)
+                              and THREAD_ID.fullmatch(latest_turn_id) else None}
+
+
 def thread_id(params, allowed):
     if not isinstance(params, dict) or set(params) - set(allowed):
         raise ControlError('对话操作包含不支持的字段')
@@ -59,6 +75,7 @@ def unavailable(state='disconnected', connected=False):
         'ambiguous_owner': '存在多个 Codex 实例，无法确认此对话的载入归属。请先在对应 Codex 实例打开。',
     }
     return {'schema_version': 1, 'connected': connected, 'supported': False, 'can_send': False,
+            **prompt_suggestion_metadata(connected=False),
             'needs_load': False, 'state': state, 'max_text_bytes': MAX_TEXT_BYTES,
             'message': messages.get(state, messages['disconnected'])}
 
@@ -92,6 +109,7 @@ class ChatController:
         identifier = thread_id(params, ('thread_id',))
         base = {'schema_version': 1, 'thread_id': identifier, 'connected': True,
                 'supported': True, 'can_send': False, 'needs_load': False,
+                **prompt_suggestion_metadata(),
                 'max_text_bytes': MAX_TEXT_BYTES}
         if identifier not in self.loaded():
             return dict(base, state='not_loaded', needs_load=True,
@@ -229,6 +247,8 @@ class DesktopChatController(ChatController):
             raise ControlError('Codex 返回的对话与所选项不一致')
         base = {'schema_version': 1, 'thread_id': identifier, 'connected': True,
                 'supported': True, 'can_send': False, 'needs_load': False,
+                **prompt_suggestion_metadata(latest_turn_id=(snapshot.get('last_turn') or {}).get('turnId')
+                    if isinstance(snapshot.get('last_turn'), dict) else None),
                 'max_text_bytes': MAX_TEXT_BYTES, 'transport': 'desktop_ipc'}
         runtime = snapshot.get('thread_runtime_status')
         if snapshot.get('resume_state') != 'resumed' or not isinstance(runtime, dict):
@@ -280,6 +300,7 @@ def desktop_run(operation, params, home=None):
     except DesktopOwnerUnavailable:
         return {'schema_version': 1, 'thread_id': identifier, 'connected': True,
                 'supported': True, 'can_send': False, 'needs_load': False,
+                **prompt_suggestion_metadata(connected=False),
                 'state': 'not_open', 'transport': 'desktop_ipc',
                 'status': 'unavailable' if operation == 'status' else 'failed',
                 'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,
@@ -287,6 +308,7 @@ def desktop_run(operation, params, home=None):
     except ControlError as error:
         return {'schema_version': 1, 'thread_id': identifier, 'connected': False,
                 'supported': False, 'can_send': False, 'needs_load': False,
+                **prompt_suggestion_metadata(connected=False),
                 'state': 'disconnected', 'transport': 'desktop_ipc',
                 'status': 'unavailable' if operation == 'status' else 'failed',
                 'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,

@@ -53,6 +53,8 @@ class ChatControllerTests(unittest.TestCase):
         self.assertNotIn('PRIVATE', json.dumps(result))
         self.assertEqual([m for m, p in channel.calls], ['thread/loaded/list', 'thread/read'])
         self.assertEqual(channel.calls[-1][1], {'threadId': 'thread-one', 'includeTurns': False})
+        self.assertIsNone(result['prompt_suggestion'])
+        self.assertEqual(result['prompt_suggestion_status'], 'not_exposed')
 
     def test_unloaded_window_never_implicitly_resumes(self):
         channel = FakeChannel(loaded=False)
