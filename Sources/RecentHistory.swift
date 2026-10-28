@@ -588,6 +588,9 @@ final class CueStatusPopoverController: NSViewController {
     private var interruptedTasks: [CueRunningTask] = []
     private var taskDetails: [String: CueTaskDetail] = [:]
     private var attentionConnected = false
+    private var connectionSummary: String?
+    private var connectionState = "legacy"
+    private var showConnectionAction: Bool?
     private let hoverController = CueTaskHoverController()
     private var batchMode = false
     private var selectedThreads = Set<String>()
@@ -613,11 +616,14 @@ final class CueStatusPopoverController: NSViewController {
         root.backgroundColor = .windowBackgroundColor; view = root
         rebuild()
     }
-    func update(status: String, enabled: Bool, soundEnabled: Bool, paused: Bool, maximumHeight: CGFloat = 900, runningTasks: [CueRunningTask] = [], interruptedTasks: [CueRunningTask] = [], taskDetails: [String: CueTaskDetail] = [:], attentionConnected: Bool = false) {
+    func update(status: String, enabled: Bool, soundEnabled: Bool, paused: Bool, maximumHeight: CGFloat = 900, runningTasks: [CueRunningTask] = [], interruptedTasks: [CueRunningTask] = [], taskDetails: [String: CueTaskDetail] = [:], attentionConnected: Bool = false, connectionSummary: String? = nil, connectionState: String = "legacy", showConnectionAction: Bool? = nil) {
         self.status = status; self.enabled = enabled; self.soundEnabled = soundEnabled
         self.paused = paused; self.maximumHeight = maximumHeight; self.runningTasks = runningTasks; self.taskDetails = taskDetails
         self.interruptedTasks = interruptedTasks
         self.attentionConnected = attentionConnected
+        self.connectionSummary = connectionSummary
+        self.connectionState = ["legacy", "connected", "reconnecting", "disconnected", "unsupported"].contains(connectionState) ? connectionState : "disconnected"
+        self.showConnectionAction = showConnectionAction
         hoverController.refresh()
         if isViewLoaded {
             if batchMode || hoverController.isEngaged { refreshInPlace() }
@@ -664,6 +670,20 @@ final class CueStatusPopoverController: NSViewController {
     @discardableResult private func button(_ title: String, _ rect: NSRect, _ selector: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: selector)
         button.bezelStyle = .rounded; button.frame = rect; view.addSubview(button); return button
+    }
+    private var showsConnectionAction: Bool { showConnectionAction ?? (connectionSummary == nil && !attentionConnected) }
+    private var footerText: String {
+        if !history.lastError.isEmpty { return history.lastError }
+        if !history.followups.lastError.isEmpty { return history.followups.lastError }
+        if let connectionSummary { return connectionSummary }
+        return attentionConnected ? "看过不等于处理完；待续记录不占 50 条历史额度。" : "浏览器批准提醒与批量应用尚未接通。"
+    }
+    private var footerColor: NSColor {
+        if !history.lastError.isEmpty || !history.followups.lastError.isEmpty { return .systemOrange }
+        if connectionSummary != nil {
+            return connectionState == "connected" ? .secondaryLabelColor : connectionState == "reconnecting" ? .secondaryLabelColor : .systemOrange
+        }
+        return attentionConnected ? .tertiaryLabelColor : .systemOrange
     }
     private func rebuild() {
         let origin = scroll.contentView.bounds.origin
@@ -811,9 +831,12 @@ final class CueStatusPopoverController: NSViewController {
         recentDocument = document; scroll.documentView = document; view.addSubview(scroll)
         scroll.contentView.scroll(to: scroll.contentView.constrainBoundsRect(NSRect(origin: origin, size: scroll.contentView.bounds.size)).origin)
         scroll.reflectScrolledClipView(scroll.contentView)
-        let footer = !history.lastError.isEmpty ? history.lastError : !history.followups.lastError.isEmpty ? history.followups.lastError : attentionConnected ? "看过不等于处理完；待续记录不占 50 条历史额度。" : "浏览器批准提醒与批量应用尚未接通。"
-        label(footer, NSRect(x: 22, y: height - 20, width: attentionConnected ? 535 : 412, height: 16), size: 10, color: attentionConnected && history.lastError.isEmpty ? .tertiaryLabelColor : .systemOrange).identifier = NSUserInterfaceItemIdentifier("panel-footer")
-        if !attentionConnected { button("接通 Codex…", NSRect(x: 438, y: height - 25, width: 118, height: 24), #selector(connectCodex)).identifier = NSUserInterfaceItemIdentifier("connect-codex") }
+        let footer = label(footerText, NSRect(x: 22, y: height - 20, width: showsConnectionAction ? 412 : 535, height: 16), size: 10, color: footerColor)
+        footer.identifier = NSUserInterfaceItemIdentifier("panel-footer"); footer.toolTip = footerText
+        // Keep this control available for an in-place health transition while
+        // a person is selecting or hovering, but hide it during auto recovery.
+        let connectionAction = button(connectionSummary == nil ? "接通 Codex…" : "连接诊断…", NSRect(x: 438, y: height - 25, width: 118, height: 24), #selector(connectCodex))
+        connectionAction.identifier = NSUserInterfaceItemIdentifier("connect-codex"); connectionAction.isHidden = !showsConnectionAction
         reconcilePointerHover()
     }
 
@@ -836,8 +859,8 @@ final class CueStatusPopoverController: NSViewController {
                     field.stringValue = batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(latest.activeCount) 运行 · \(latest.recoveryByThread.count) 中断 · \(history.followups.records.count) 待续 · 历史 \(history.ordinaryCount)/50"
                     field.textColor = history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor
                 case "panel-footer":
-                    field.stringValue = !history.lastError.isEmpty ? history.lastError : !history.followups.lastError.isEmpty ? history.followups.lastError : attentionConnected ? "看过不等于处理完；待续记录不占 50 条历史额度。" : "浏览器批准提醒与批量应用尚未接通。"
-                    field.textColor = attentionConnected && history.lastError.isEmpty ? .tertiaryLabelColor : .systemOrange
+                    field.stringValue = footerText; field.textColor = footerColor
+                    field.frame.size.width = showsConnectionAction ? 412 : 535
                     field.toolTip = field.stringValue
                 default: break
                 }
@@ -846,7 +869,7 @@ final class CueStatusPopoverController: NSViewController {
                 case "setting-enabled": button.state = enabled ? .on : .off
                 case "setting-sound": button.state = soundEnabled ? .on : .off
                 case "pause-button": button.title = paused ? "恢复提醒" : "暂停 30 分钟"
-                case "connect-codex": button.isHidden = attentionConnected
+                case "connect-codex": button.isHidden = !showsConnectionAction; button.title = connectionSummary == nil ? "接通 Codex…" : "连接诊断…"
                 case "batch-apply": button.title = "批量操作 (\(selectedThreads.count))"; button.isEnabled = !selectedThreads.isEmpty
                 case "batch-scope-pinned", "batch-scope-running":
                     let targets = button.identifier?.rawValue == "batch-scope-pinned" ? frozenPinnedTargets : frozenRunningTargets
@@ -1126,6 +1149,19 @@ final class CueStatusPopoverController: NSViewController {
         results["new_turn_clock_ignores_previous_turn_completed_details"] = clock.durationLine(threadID: "clock-run", eventDate: nil, now: clockNow) == "本轮 ≥1分5秒"
         clock.viewDidDisappear(); clockWindow.orderOut(nil)
         results["hidden_list_invalidates_second_clock"] = clock.elapsedTimer == nil
+        let reconnect = CueStatusPopoverController(history: liveHistory, actions: liveActions)
+        reconnect.pointerLocation = { nil }
+        reconnect.update(status: "连接状态验收", enabled: true, soundEnabled: true, paused: false, connectionSummary: "Codex 自动重连中…", connectionState: "reconnecting", showConnectionAction: false)
+        _ = reconnect.view
+        let connectionFooter = reconnect.view.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "panel-footer" }
+        let connectionAction = reconnect.view.subviews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "connect-codex" }
+        results["automatic_reconnect_footer_never_requires_manual_codex_exit"] = connectionFooter?.stringValue == "Codex 自动重连中…" && connectionAction?.isHidden == true
+        reconnect.toggleBatchMode()
+        let stableFooter = reconnect.view.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "panel-footer" }
+        reconnect.update(status: "连接状态验收", enabled: true, soundEnabled: true, paused: false, connectionSummary: "Codex 已自动连接 · 回复可用；批准提醒仍在恢复", connectionState: "connected", showConnectionAction: false)
+        results["connection_recovery_updates_in_place_without_claiming_all_capabilities"] = stableFooter === reconnect.view.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "panel-footer" } && stableFooter?.stringValue == "Codex 已自动连接 · 回复可用；批准提醒仍在恢复" && reconnect.view.subviews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "connect-codex" }?.isHidden == true
+        reconnect.update(status: "连接状态验收", enabled: true, soundEnabled: true, paused: false, connectionSummary: "当前 Codex 版本尚未适配", connectionState: "unsupported", showConnectionAction: true)
+        results["unsupported_connection_offers_diagnostics_instead_of_restart_prompt"] = reconnect.view.subviews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "connect-codex" }?.title == "连接诊断…" && reconnect.view.subviews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "connect-codex" }?.isHidden == false && stableFooter?.stringValue == "当前 Codex 版本尚未适配"
         return results
     }
 

@@ -303,6 +303,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var resolutions = CueResolutionTracker()
     var manualApprovalConnected = false
     var manualApprovalStatus = "人工批准监听未连接"
+    var codexConnectionState = "reconnecting"
+    var codexConnectionSummary = "正在自动连接 Codex…"
     var approvalLauncher: Process?
     var approvalLaunchLog: FileHandle?
     var readTimer: Timer?
@@ -908,11 +910,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         nextHealthCheck = Date().addingTimeInterval(2)
         var message = "监控进程未连接"
         let previousManual = manualApprovalConnected
+        let previousConnection = codexConnectionState + codexConnectionSummary
         var nextRunningTasks: [CueRunningTask] = []
         var nextInterruptedTasks: [CueRunningTask] = []
         var nextTaskDetails: [String: CueTaskDetail] = [:]
         var nextRunningSnapshot = Data()
         manualApprovalConnected = false
+        codexConnectionState = "reconnecting"
+        codexConnectionSummary = "Codex 连接恢复中，后台会自动重试。"
         manualApprovalStatus = approvalLauncher?.isRunning == true ? "等待 Codex 退出后接通" : "人工批准监听未连接"
         if let launchData = try? Data(contentsOf: home.appendingPathComponent("bridge-launch-state.json")), launchData.count < 65_536,
            let launch = try? JSONSerialization.jsonObject(with: launchData) as? [String: Any] {
@@ -934,10 +939,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
            let heartbeat = state["heartbeat"] as? Double,
            (0...15).contains(Date().timeIntervalSince1970 - heartbeat) {
             live = true
-            if let manual = state["manual_approval"] as? [String: Any] {
-                manualApprovalConnected = manual["connected"] as? Bool == true
-                if manualApprovalConnected { manualApprovalStatus = "人工批准监听已连接" }
-            }
+            let connection = CueCodexConnection(watcher: state)
+            codexConnectionState = connection.state; codexConnectionSummary = connection.summary
+            manualApprovalConnected = connection.attentionConnected
+            manualApprovalStatus = connection.attentionConnected ? "Codex 批准监听已自动连接" : connection.summary
             let count = state["watched_threads"] as? Int ?? 0
             let taskRows = state["running_tasks"] as? [[String: Any]] ?? []
             let detailRows = state["task_details"] as? [String: [String: Any]] ?? [:]
@@ -963,11 +968,11 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         if let recoveryData = try? JSONSerialization.data(withJSONObject: recoveryRows, options: [.sortedKeys]) { nextRunningSnapshot.append(recoveryData) }
         let runningChanged = runningTaskSnapshot != nextRunningSnapshot
         runningTasks = nextRunningTasks; interruptedTasks = nextInterruptedTasks; taskDetails = nextTaskDetails; runningTaskSnapshot = nextRunningSnapshot
-        if watcherHealthText != message || runningChanged {
+        if watcherHealthText != message || runningChanged || previousConnection != codexConnectionState + codexConnectionSummary {
             watcherHealthText = message
             if statusItem != nil { refreshMenu() }
         }
-        if previousManual != manualApprovalConnected { settingsPanel?.rebuild(); batchController?.refreshConnection() }
+        if previousManual != manualApprovalConnected || previousConnection != codexConnectionState + codexConnectionSummary { settingsPanel?.rebuild(); batchController?.refreshConnection() }
         settingsPanel?.updateHealth()
     }
 
@@ -1099,6 +1104,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
 
     @objc func connectManualApproval() {
+        // Retry the existing desktop connection. Never restart Codex, alter its
+        // launch environment or require the user to leave running work.
+        try? Data(String(Date().timeIntervalSince1970).utf8).write(to: home.appendingPathComponent("desktop-reconnect.request"), options: .atomic)
+        if watcherProcess?.isRunning != true { startWatcher() }
+        updateWatcherHealth(); batchController?.refreshConnection(); writeStatus()
+    }
+
+    @objc func connectLegacyManualApproval() {
         guard approvalLauncher?.isRunning != true else { return }
         let alert = NSAlert()
         alert.messageText = "接通 Codex 提醒、对话与批量设置"
@@ -1354,7 +1367,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
         let height = min(900, (screen?.visibleFrame.height ?? 900) - 52)
         statusPopoverController?.update(status: watcherHealthText, enabled: settings.enabled,
-                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks, interruptedTasks: interruptedTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected)
+                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks, interruptedTasks: interruptedTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected,
+                                       connectionSummary: codexConnectionSummary, connectionState: codexConnectionState, showConnectionAction: codexConnectionState == "unsupported")
         if let controller = statusPopoverController, controller.isViewLoaded { statusPopover?.contentSize = controller.preferredContentSize }
     }
 
@@ -1394,6 +1408,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "menu_usage_summary": menuUsage?.snapshot.summary ?? [:],
             "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
             "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
+            "codex_connection_state": codexConnectionState, "codex_connection_summary": codexConnectionSummary,
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
         if let json = try? JSONSerialization.data(withJSONObject: data, options: [.sortedKeys]) {
             try? json.write(to: home.appendingPathComponent("app-status.json"), options: .atomic)
@@ -1771,7 +1786,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     func soundRuleEditor(in view: NSView) {
         let isPermission = selectedKind == "permission"
         let on = selectedKind == "complete" ? cue.settings.completeEnabled : selectedKind == "input" ? cue.settings.inputEnabled : cue.settings.permissionEnabled
-        let detail = isPermission ? (cue.manualApprovalConnected ? "只在确实等待你人工批准时提醒，自动审查不提醒。" : "需要先接通人工批准监听；可先保存开关和自定义样式。") : (selectedKind == "complete" ? "本轮执行结束时提醒，保留你的每类样式设置。" : "需要回答或选择时提醒。")
+        let detail = isPermission ? (cue.manualApprovalConnected ? "只在确实等待你人工批准时提醒，自动审查不提醒。" : "正在自动恢复批准监听；可先保存开关和自定义样式。") : (selectedKind == "complete" ? "本轮执行结束时提醒，保留你的每类样式设置。" : "需要回答或选择时提醒。")
         toggle(isPermission ? "启用人工批准提醒" : "启用这一类提醒", detail, in: view, y: 17, key: selectedKind + "_enabled", on: on)
         _ = appearancePopup("提示音", values: soundOptions(), selected: cue.settings.soundToken(for: selectedKind), in: view, y: 105, key: "sound")
         _ = button("浏览声音分类…", in: view, frame: NSRect(x: 174, y: 148, width: 314, height: 30), action: #selector(openSoundGallery))
@@ -1903,10 +1918,9 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         healthLabel = label("", in: provider, frame: NSRect(x: 20, y: 53, width: 486, height: 21), size: 12, weight: .semibold)
         label("完成和提问由本机记录监控。人工批准通过独立的只读监听接入；只监听交给你的请求，自动审查不会触发提醒，批准后会撤下提示。", in: provider, frame: NSRect(x: 20, y: 87, width: 486, height: 67), size: 11.5, color: .secondaryLabelColor, lines: 4)
         hookLabel = label("", in: provider, frame: NSRect(x: 20, y: 158, width: 486, height: 21), size: 11, color: .secondaryLabelColor)
-        let connect = button(cue.manualApprovalConnected ? "重新连接人工批准监听…" : "接通人工批准监听…", in: provider, frame: NSRect(x: 16, y: 194, width: 244, height: 31), action: #selector(connectManualApproval))
-        connect.isEnabled = cue.approvalLauncher?.isRunning != true
+        _ = button(cue.codexConnectionState == "connected" ? "刷新 Codex 连接" : "立即重试自动连接", in: provider, frame: NSRect(x: 16, y: 194, width: 244, height: 31), action: #selector(connectManualApproval))
         _ = button("授权读取本机记录…", in: provider, frame: NSRect(x: 269, y: 194, width: 238, height: 31), action: #selector(authorizeHistoryRead))
-        label("首次接通需要在当前任务结束后自行退出并重新打开 Codex。不会强制退出或更改批准策略。", in: provider, frame: NSRect(x: 20, y: 239, width: 486, height: 42), size: 10.5, color: .tertiaryLabelColor, lines: 3)
+        label("自动复用当前 Codex 连接；Codex 退出、重开或连接中断后会自动恢复，无需重启任务或重新授权。", in: provider, frame: NSRect(x: 20, y: 239, width: 486, height: 42), size: 10.5, color: .tertiaryLabelColor, lines: 3)
         let files = card(418, 126)
         label("本机文件", in: files, frame: NSRect(x: 20, y: 15, width: 480, height: 22), size: 13, weight: .semibold)
         label(cue.home.path, in: files, frame: NSRect(x: 20, y: 43, width: 486, height: 27), size: 10.5, color: .secondaryLabelColor, lines: 2)
@@ -2061,6 +2075,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results.merge(CueTaskHoverController.validationReport()) { _, new in new }
     results.merge(CueTaskRecoverySnapshot.validationReport()) { _, new in new }
     results.merge(CueConversationController.validationReport()) { _, new in new }
+    results.merge(CueCodexConnection.validationReport()) { _, new in new }
     func event(_ id: String) -> CueEvent {
         CueEvent(try! JSONSerialization.data(withJSONObject: ["id": id, "kind": "complete", "thread_id": "fixture-chat", "title": "验收样例 · " + id, "created_at": Date().timeIntervalSince1970]))!
     }

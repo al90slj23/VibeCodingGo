@@ -140,10 +140,14 @@ def _snapshot_metadata(state, thread, owner, revision):
             'thread_runtime_status': _status_copy(state.get('threadRuntimeStatus')),
             'requests_pending': pending, 'last_turn': last_turn,
             'model': state.get('latestModel') if isinstance(state.get('latestModel'), str) else None,
-            'reasoning_effort': state.get('latestReasoningEffort') if isinstance(state.get('latestReasoningEffort'), str) else None}
+            'reasoning_effort': state.get('latestReasoningEffort') if isinstance(state.get('latestReasoningEffort'), str) else None,
+            'thread_settings': {key: value for key, value in (state.get('latestThreadSettings') or {}).items()
+                                if key in ('model', 'effort', 'serviceTier') and (value is None or isinstance(value, str))}
+                               if isinstance(state.get('latestThreadSettings'), dict) else {}}
 
 
 class DesktopChannel:
+    method_versions = VERSIONS
     def __init__(self, thread_id, codex_home=None, timeout=8):
         if not _identifier(thread_id):
             raise ControlError('对话标识无效')
@@ -224,12 +228,12 @@ class DesktopChannel:
         return value
 
     def _call(self, method, params, *, target=None, mutation=False):
-        if method not in VERSIONS:
+        if method not in self.method_versions:
             raise ControlError('此本机连接不允许该操作')
         request = str(uuid.uuid4())
         message = {'type': 'request', 'requestId': request,
                    'sourceClientId': self.client_id or 'initializing-client',
-                   'version': VERSIONS[method], 'method': method, 'params': params,
+                   'version': self.method_versions[method], 'method': method, 'params': params,
                    'timeoutMs': int(self.timeout * 1000)}
         if target:
             message['targetClientId'] = target

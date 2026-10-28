@@ -56,6 +56,10 @@ class FakeChannel:
 
 
 class ControlPolicyTests(unittest.TestCase):
+    def setUp(self):
+        desktop = patch('vibecue.codex_control.desktop_run', return_value=None)
+        desktop.start(); self.addCleanup(desktop.stop)
+
     def test_batch_deduplicates_and_changes_only_selected_settings(self):
         channel = FakeChannel()
         result = Controller(channel).apply({'thread_ids': ['one', 'one', 'two'], 'effort': 'max', 'speed': 'fast'})

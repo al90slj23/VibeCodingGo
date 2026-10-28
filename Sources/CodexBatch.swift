@@ -81,7 +81,7 @@ struct CueBatchModel {
     }
 }
 
-final class CueCodexBatchController: NSWindowController {
+final class CueCodexBatchController: NSWindowController, NSWindowDelegate {
     private let targets: [CueBatchTarget]
     private let client: CueCodexControlClient
     private let connectAction: () -> Void
@@ -93,6 +93,8 @@ final class CueCodexBatchController: NSWindowController {
     private let resultText = NSTextView()
     private var models: [CueBatchModel] = []
     private var connected = false, busy = false
+    private var catalogLoading = false
+    private var reconnectTimer: Timer?
     private var applyButton: NSButton!
     private var connectButton: NSButton!
     private var refreshButton: NSButton!
@@ -104,10 +106,23 @@ final class CueCodexBatchController: NSWindowController {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 650), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "Codex 批量设置"; window.isReleasedWhenClosed = false
         super.init(window: window)
-        window.contentView = root; window.center(); build()
+        window.contentView = root; window.delegate = self; window.center(); build()
         if loadAutomatically { reloadCatalog() }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender); startReconnectTimer()
+    }
+    private func startReconnectTimer() {
+        reconnectTimer?.invalidate()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self, self.window?.isVisible == true, self.window?.isMiniaturized != true else { return }
+            self.reloadCatalog(automatic: true)
+        }
+        RunLoop.main.add(timer, forMode: .common); reconnectTimer = timer
+    }
+    func windowWillClose(_ notification: Notification) { reconnectTimer?.invalidate(); reconnectTimer = nil }
+    deinit { reconnectTimer?.invalidate() }
     private func label(_ text: String, x: CGFloat = 24, y: CGFloat, width: CGFloat = 550, size: CGFloat = 12, weight: NSFont.Weight = .regular) {
         let value = NSTextField(wrappingLabelWithString: text)
         value.frame = NSRect(x: x, y: y, width: width, height: 36)
@@ -152,7 +167,7 @@ final class CueCodexBatchController: NSWindowController {
         resultText.font = .systemFont(ofSize: 11); resultText.textContainerInset = NSSize(width: 7, height: 6)
         resultText.autoresizingMask = [.width]; resultText.isVerticallyResizable = true; resultText.textContainer?.widthTracksTextView = true
         results.documentView = resultText; root.addSubview(results)
-        connectButton = NSButton(title: "接通 Codex…", target: self, action: #selector(connect))
+        connectButton = NSButton(title: "重试连接", target: self, action: #selector(connect))
         connectButton.bezelStyle = .rounded
         connectButton.frame = NSRect(x: 24, y: 603, width: 145, height: 30); root.addSubview(connectButton)
         let close = NSButton(title: "关闭", target: self, action: #selector(closeDialog))
@@ -179,26 +194,34 @@ final class CueCodexBatchController: NSWindowController {
     }
     private func selected(_ popup: NSPopUpButton) -> String { popup.selectedItem?.representedObject as? String ?? "" }
     private var selectedModel: CueBatchModel? { models.first { $0.id == selected(model) } }
-    private func reloadCatalog() {
-        guard !busy else { return }; busy = true; updateControls()
+    private func reloadCatalog(automatic: Bool = false) {
+        guard !busy, !catalogLoading else { return }; catalogLoading = true
+        if !automatic { busy = true; updateControls() }
         client.run("catalog") { [weak self] result in
-            guard let self else { return }; self.busy = false
+            guard let self else { return }; self.catalogLoading = false
+            if !automatic { self.busy = false }
             switch result {
-            case .success(let data):
-                self.connected = data["connected"] as? Bool == true
-                self.models = (data["models"] as? [[String: Any]] ?? []).compactMap(CueBatchModel.init)
-                self.fill(self.model, rows: self.models.map { ["id": $0.id, "name": $0.name] }, keep: "保持各对话原模型")
-                self.connection.stringValue = self.connected ? "已接通当前 Codex，可修改并确认所选对话的设置。" : "尚未接通当前 Codex。可先选参数；接通后才能应用。\n接通会等待你主动退出 Codex，再通过 VibeCue 打开。"
-                self.connection.textColor = self.connected ? .systemGreen : .secondaryLabelColor
-                self.status.stringValue = data["source"] as? String == "cache" ? "当前为本机模型缓存；应用前会重新校验实时能力。" : (data["message"] as? String ?? "")
-                self.updateEfforts()
+            case .success(let data): self.applyCatalog(data, preservingWork: automatic)
             case .failure(let error):
-                self.connected = false; self.connection.stringValue = error.localizedDescription
+                self.connected = false; self.connection.stringValue = "自动重连中… \(error.localizedDescription)"
+                self.connection.textColor = .secondaryLabelColor
             }
             self.updateControls()
         }
     }
-    private func updateEfforts() {
+    private func applyCatalog(_ data: [String: Any], preservingWork: Bool = false) {
+        connected = data["connected"] as? Bool == true
+        models = (data["models"] as? [[String: Any]] ?? []).compactMap(CueBatchModel.init)
+        fill(model, rows: models.map { ["id": $0.id, "name": $0.name] }, keep: "保持各对话原模型")
+        connection.stringValue = connected ? "Codex 已自动连接，可修改并确认所选对话的设置。" : "Codex 自动重连中… 可先选参数，连接恢复后才能应用。"
+        connection.textColor = connected ? .systemGreen : .secondaryLabelColor
+        connection.toolTip = data["message"] as? String
+        if !preservingWork { status.stringValue = data["source"] as? String == "cache" ? "当前为本机模型缓存；应用前会重新校验实时能力。" : (data["message"] as? String ?? "") }
+        // A background health check never writes the result text or operation
+        // status. Avoid clearing and restoring NSTextView's mutable storage.
+        updateEfforts(preservingWork: preservingWork)
+    }
+    private func updateEfforts(preservingWork: Bool = false) {
         if let current = selectedModel {
             fill(effort, rows: current.efforts, keep: "保持原强度（仍需与新模型兼容）")
         } else {
@@ -206,14 +229,17 @@ final class CueCodexBatchController: NSWindowController {
             let choices = models.flatMap(\.efforts).filter { seen.insert($0["id"] ?? "").inserted }
             fill(effort, rows: choices, keep: "保持各对话原强度")
         }
-        parametersChanged()
+        refreshParameterDetails(clearResults: !preservingWork)
     }
     @objc private func modelChanged() {
         updateEfforts()
         parametersChanged()
     }
     @objc private func parametersChanged() {
-        if !resultText.string.isEmpty { resultText.string = ""; status.stringValue = "参数已调整，尚未应用。"; status.textColor = .secondaryLabelColor }
+        refreshParameterDetails(clearResults: true)
+    }
+    private func refreshParameterDetails(clearResults: Bool) {
+        if clearResults && !resultText.string.isEmpty { resultText.string = ""; status.stringValue = "参数已调整，尚未应用。"; status.textColor = .secondaryLabelColor }
         if let current = selectedModel {
             speedHint.stringValue = current.fastTier == nil ? "该模型未声明可用闪电档位；开启请求会被拒绝。" : (current.fastDescription.isEmpty ? "使用该模型声明的 Fast 档位；不保证固定倍速。" : current.fastDescription)
             speed.itemArray.first(where: { $0.representedObject as? String == "fast" })?.title = "开启闪电 · \(current.name)"
@@ -223,7 +249,8 @@ final class CueCodexBatchController: NSWindowController {
     private func updateControls() {
         guard applyButton != nil else { return }
         model.isEnabled = !busy; effort.isEnabled = !busy; speed.isEnabled = !busy
-        refreshButton.isEnabled = !busy; connectButton.isEnabled = !busy && !connected
+        refreshButton.isEnabled = !busy && !catalogLoading; connectButton.isEnabled = !busy && !catalogLoading && !connected
+        connectButton.isHidden = connected
         let changes = !selected(model).isEmpty || !selected(effort).isEmpty || selected(speed) != "keep"
         let missingModel = !selected(model).isEmpty && selectedModel == nil
         let invalidEffort = selectedModel.map { current in !selected(effort).isEmpty && !current.efforts.contains { $0["id"] == selected(effort) } } ?? false
@@ -237,7 +264,7 @@ final class CueCodexBatchController: NSWindowController {
     }
     @objc private func refreshCatalog() { reloadCatalog() }
     func refreshConnection() { reloadCatalog() }
-    @objc private func connect() { connectAction() }
+    @objc private func connect() { reloadCatalog() }
     @objc private func closeDialog() { close() }
     @objc private func apply() {
         guard !busy, connected else { return }
@@ -286,6 +313,21 @@ final class CueCodexBatchController: NSWindowController {
         controller.fill(controller.model, rows: [], keep: "保持")
         controller.updateControls()
         results["batch_missing_catalog_model_is_not_silently_replaced"] = controller.selected(controller.model) == model.id && !controller.applyButton.isEnabled
+        let liveCatalog: [String: Any] = ["connected": true, "models": [["id": "fixture-model", "name": "Fixture", "default_effort": "medium", "efforts": [["id":"high","name":"高"],["id":"medium","name":"中"]], "fast_tier": "priority", "service_tiers": [["id":"priority","description":"Fast"]]]], "message": "已复用现有 Codex 对话连接"]
+        controller.applyCatalog(liveCatalog)
+        controller.updateControls()
+        controller.effort.selectItem(at: 1); controller.speed.selectItem(at: 2)
+        controller.resultText.string = "上一批次已经确认的结果"
+        controller.status.stringValue = "已确认 1 项；未重新应用"
+        controller.applyCatalog(liveCatalog, preservingWork: true); controller.updateControls()
+        results["batch_automatic_catalog_refresh_preserves_parameters_and_results"] = controller.selected(controller.model) == model.id && controller.selected(controller.effort) == "high" && controller.selected(controller.speed) == "fast" && controller.resultText.string == "上一批次已经确认的结果" && controller.status.stringValue == "已确认 1 项；未重新应用"
+        results["batch_live_connection_hides_manual_connect_prompt"] = controller.connectButton.isHidden && controller.connection.stringValue.hasPrefix("Codex 已自动连接")
+        controller.applyCatalog(["connected": false, "models": liveCatalog["models"]!, "message": "等待 Codex 恢复"], preservingWork: true); controller.updateControls()
+        results["batch_disconnect_keeps_choices_but_disables_apply_during_auto_recovery"] = controller.connection.stringValue.hasPrefix("Codex 自动重连中") && !controller.connectButton.isHidden && controller.connectButton.title == "重试连接" && !controller.applyButton.isEnabled && controller.resultText.string == "上一批次已经确认的结果"
+        controller.startReconnectTimer()
+        results["batch_visible_connection_retries_use_five_second_timer"] = controller.reconnectTimer?.isValid == true && controller.reconnectTimer?.timeInterval == 5
+        controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        results["batch_closing_window_stops_automatic_recovery_poll"] = controller.reconnectTimer == nil
         return results
     }
     static func captureFixture(to output: URL) -> Bool {
@@ -297,7 +339,7 @@ final class CueCodexBatchController: NSWindowController {
         controller.models = [fixture]
         controller.fill(controller.model, rows: [["id":fixture.id,"name":fixture.name]], keep: "保持各对话原模型")
         controller.model.selectItem(at: 1); controller.modelChanged(); controller.effort.selectItem(at: 1); controller.speed.selectItem(at: 2); controller.parametersChanged()
-        controller.connection.stringValue = "尚未接通当前 Codex。可先选参数；接通后才能应用。\n接通会等待你主动退出 Codex，再通过 VibeCue 打开。"
+        controller.connection.stringValue = "Codex 自动重连中… 可先选参数，连接恢复后才能应用。"
         controller.status.stringValue = "展示样例 · 已按对话去重，参数不会写入真实对话。"
         controller.window?.appearance = NSAppearance(named: .darkAqua)
         controller.root.appearance = controller.window?.appearance

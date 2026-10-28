@@ -1,8 +1,9 @@
 """Read-only incremental observer for local Codex transcript events.
 
-This adapter deliberately never attaches to or resumes a Codex thread, never
-reads credentials, and never writes Codex state. Transcript formats are internal:
-unknown records are ignored and status reports this source explicitly.
+This adapter never resumes or claims ownership of a Codex thread, reads
+credentials, or writes Codex state. Existing desktop owners may be followed by
+a read-only request subscription. Internal formats are bounded and unknown
+records are ignored; each source reports its own connection health.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ from ..events import (vibecue_directory, codex_directory, emit_event, clean_text
 from .approval_status import approval_status
 from .task_details import TaskDetails, bounded_details, bound_status_previews
 from .task_recovery import TaskRecovery, codex_process_snapshot
+from ..desktop_attention import DesktopAttentionService
 
 MAX_READ = 1_048_576
 MAX_RECORD = 2_097_152
@@ -413,6 +415,7 @@ class Watcher:
         self.last_discovery = 0.0
         self.last_status = 0.0
         self.recovery = TaskRecovery(self.vibecue_home, self.started_at)
+        self.desktop = DesktopAttentionService(self.vibecue_home, self.codex_home)
 
     def metadata(self):
         for db in state_databases(self.codex_home):
@@ -507,6 +510,13 @@ class Watcher:
                     if len(self.watched) <= 256:
                         break
         self.last_discovery = time.monotonic()
+        # Follow live known chats first; these are existing desktop owners only.
+        # Subscription discovery never resumes a thread or changes ownership.
+        now = time.time()
+        recent = [pair for pair in self.watched.values()
+                  if max(pair[1].last_activity, pair[1].metadata.updated_at) >= now - ACTIVITY_TTL]
+        prioritized = sorted(recent, key=lambda pair: (pair[1].activity_state == 'running', pair[1].last_activity, pair[1].metadata.updated_at), reverse=True)
+        self.desktop.set_threads([pair[1].metadata.thread_id for pair in prioritized])
 
     def poll_once(self):
         if time.monotonic() - self.last_discovery >= 3:
@@ -530,6 +540,12 @@ class Watcher:
 
     def write_status(self):
         approvals = approval_status(self.vibecue_home)
+        self.desktop.set_stdio_connected(approvals['connected'])
+        desktop = self.desktop.snapshot()
+        if not approvals['connected'] and desktop['connected'] and desktop['capabilities']['attention']:
+            approvals = {'connected': True, 'status': 'connected', 'source': 'codex-desktop-owner-stream',
+                         'live_sources': 1, 'pending_count': desktop['pending_count'],
+                         'pending_thread_ids': desktop['pending_thread_ids'], 'last_seen': desktop['last_seen']}
         waiting_approval = set(approvals.get('pending_thread_ids', []))
         now = time.time()
         tasks = []
@@ -571,9 +587,10 @@ class Watcher:
             'task_recovery_error': self.recovery.error,
             'task_details': bounded_details(detail_rows),
             'source': 'local-transcripts', 'provider': 'codex',
-            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'durable-interrupted-task-recovery', 'per-turn-usage', 'visible-conversation-preview'],
-            'permission_status': 'connected' if approvals['connected'] else 'requires-codex-bridge-launch',
+            'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'durable-interrupted-task-recovery', 'per-turn-usage', 'visible-conversation-preview', 'auto-desktop-connection', 'desktop-attention-stream'],
+            'permission_status': 'connected' if approvals['connected'] else 'auto-reconnecting',
             'manual_approval': approvals,
+            'desktop_connection': desktop,
             'pending_deliveries': sum(len(i.pending) for _, i in self.watched.values()),
             'dropped_deliveries': sum(i.dropped_deliveries for _, i in self.watched.values()),
             'read_error_count': sum(bool(tail.read_error) for tail, _ in self.watched.values()),
@@ -619,6 +636,7 @@ class Watcher:
             self.running = True
             try:
                 self.discover(initial=True)
+                self.desktop.start()
                 self.write_status()
                 while not self.stopping:
                     parent = os.environ.get('VIBECUE_PARENT_PID', '')
@@ -638,6 +656,7 @@ class Watcher:
                     time.sleep(self.interval)
             finally:
                 self.running = False
+                self.desktop.stop()
                 self.write_status()
                 fcntl.flock(lock, fcntl.LOCK_UN)
 

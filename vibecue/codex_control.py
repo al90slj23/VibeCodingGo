@@ -1,9 +1,9 @@
 """Explicit, local Codex thread settings control; never sends conversation input.
 
-Only an opt-in desktop-owned relay can apply settings. A catalog cache is useful
-for preparing a batch while disconnected, but is never treated as proof that a
-change reached Codex. No authentication file is opened; full turns are never
-requested, and conversation text is never exposed or persisted by this module.
+An existing desktop owner IPC or opt-in stdio relay can apply settings. A model
+cache is never treated as proof that a change reached Codex: updates require an
+owner acknowledgement and settings readback. No authentication file is opened;
+conversation text is never exposed or persisted by this module.
 """
 from collections import OrderedDict
 import argparse
@@ -315,12 +315,18 @@ def run(operation, params=None, home=None, codex_home=None):
                 return socket_call(connection, operation, {}, timeout=min(15,deadline-time.monotonic()))
             except ControlError:
                 continue
+        desktop = desktop_run(operation, params, home, codex_home, deadline)
+        if desktop is not None:
+            return desktop
         return {'schema_version': SCHEMA_VERSION, 'connected': False, 'models': cached_catalog(codex_home),
                 'message': '尚未连接 Codex 控制通道；当前为本机模型缓存。请通过 VibeCue 接通后再应用。'}
     if operation not in ('apply', 'inspect'):
         raise ControlError('不支持的批量操作')
     identifiers = unique_threads(params.get('thread_ids'))
     if not live:
+        desktop = desktop_run(operation, params, home, codex_home, deadline)
+        if desktop is not None:
+            return desktop
         return {'schema_version': SCHEMA_VERSION, 'connected': False,
                 'results': [{'thread_id': identifier, 'status': 'failed', 'verified': False,
                              'message': '尚未连接 Codex 控制通道，没有修改此对话。'} for identifier in identifiers],
@@ -350,6 +356,12 @@ def run(operation, params=None, home=None, codex_home=None):
     return {'schema_version': SCHEMA_VERSION, 'connected': True, 'results': results,
             'summary': {'selected': len(identifiers), **{key: sum(row.get('status') == key for row in results)
                                                     for key in ('verified', 'unverified', 'failed')}}}
+
+
+def desktop_run(operation, params, home=None, codex_home=None, deadline=None):
+    # Lazy import preserves the low-level error types shared by both transports.
+    from .desktop_control import run as desktop_operation
+    return desktop_operation(operation, params, home=home, codex_home=codex_home, deadline=deadline)
 
 
 def main(argv=None):
