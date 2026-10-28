@@ -848,7 +848,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             nextRunningSnapshot = (try? JSONSerialization.data(withJSONObject: taskRows, options: [.sortedKeys])) ?? Data()
             let errors = state["read_error_count"] as? Int ?? 0
             if errors > 0 {
-                message = "需要授权读取记录 · \(errors) 个文件无法读取"
+                let cursors = state["cursors"] as? [String: [String: Any]] ?? [:]
+                let denied = cursors.values.contains { ($0["read_error"] as? String ?? "").contains("PermissionError") }
+                message = denied ? "需要授权读取记录 · \(errors) 个文件无法读取" : "部分记录暂时无法读取 · \(errors) 个文件"
             } else if count == 0 {
                 message = "尚未找到可监控的本机对话"
             } else {

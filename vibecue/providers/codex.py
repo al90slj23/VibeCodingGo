@@ -423,6 +423,18 @@ class Watcher:
 
     def discover(self, initial=False):
         discovered = self.metadata()
+        discovered_ids = {metadata.thread_id for metadata in discovered}
+        # Archived/moved rollouts can disappear after they leave the metadata
+        # window. Drop only proven-missing paths; absent metadata alone is not
+        # enough, and PermissionError must remain visible in health diagnostics.
+        for tid, (tail, _) in list(self.watched.items()):
+            if tid not in discovered_ids:
+                try:
+                    tail.path.stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    del self.watched[tid]
+                except OSError:
+                    pass
         for metadata in discovered:
             tid = metadata.thread_id
             if tid in self.watched:

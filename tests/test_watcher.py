@@ -458,6 +458,63 @@ class MetadataAndSpoolTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['title'], '標題')
 
+    def test_archived_missing_rollout_is_retired_and_moved_path_can_be_rediscovered(self):
+        path = self.home / 'old.jsonl'
+        path.write_bytes(line(record('event_msg', {'type': 'task_started', 'turn_id': 'live'})))
+        entries = [ThreadMetadata('main', path, '对话', 'vscode')]
+        events = []
+        watcher = Watcher(self.home, self.home / 'vibecue', emit=lambda **event: events.append(event))
+        watcher.metadata = lambda: entries
+        watcher.discover(initial=True)
+        path.unlink()
+        entries.clear()  # The archived conversation left active metadata.
+        watcher.discover()
+        self.assertNotIn('main', watcher.watched)
+        moved = self.home / 'moved.jsonl'
+        moved.write_bytes(line(record('event_msg', {'type': 'task_started', 'turn_id': 'resumed'})))
+        entries.append(ThreadMetadata('main', moved, '恢复的对话', 'vscode'))
+        watcher.discover()
+        self.assertEqual(watcher.watched['main'][0].path, moved)
+        self.assertEqual(watcher.watched['main'][1].running_task()['turn_id'], 'resumed')
+        self.assertEqual(events, [])
+
+    def test_missing_metadata_does_not_retire_existing_older_rollout(self):
+        path = self.home / 'older.jsonl'
+        path.write_bytes(line(record('event_msg', {'type': 'task_started', 'turn_id': 'live'})))
+        entries = [ThreadMetadata('older', path, '较早任务', 'vscode')]
+        watcher = Watcher(self.home, self.home / 'vibecue', emit=lambda **event: None)
+        watcher.metadata = lambda: entries
+        watcher.discover(initial=True)
+        entries.clear()  # Outside the latest metadata window, but still valid.
+        watcher.discover()
+        self.assertIn('older', watcher.watched)
+        self.assertIsNotNone(watcher.watched['older'][1].running_task())
+
+    def test_metadata_disappearance_does_not_hide_permission_failures(self):
+        path = self.home / 'protected.jsonl'
+        path.write_bytes(b'')
+        entries = [ThreadMetadata('protected', path, '权限问题', 'vscode')]
+        watcher = Watcher(self.home, self.home / 'vibecue', emit=lambda **event: None)
+        watcher.metadata = lambda: entries
+        watcher.discover(initial=True)
+        tail, _ = watcher.watched['protected']
+        tail.read_error = 'PermissionError: errno=13 Permission denied'
+        entries.clear()
+        with patch.object(Path, 'stat', side_effect=PermissionError(13, 'Permission denied')):
+            watcher.discover()
+        self.assertIn('protected', watcher.watched)
+        self.assertIn('PermissionError', watcher.watched['protected'][0].read_error)
+
+    def test_metadata_active_missing_rollout_is_kept_for_diagnostics(self):
+        path = self.home / 'active.jsonl'
+        path.write_bytes(b'')
+        watcher = Watcher(self.home, self.home / 'vibecue', emit=lambda **event: None)
+        watcher.metadata = lambda: [ThreadMetadata('active', path, '仍活跃', 'vscode')]
+        watcher.discover(initial=True)
+        path.unlink()
+        watcher.discover()
+        self.assertIn('active', watcher.watched)
+
 
 if __name__ == '__main__':
     unittest.main()
