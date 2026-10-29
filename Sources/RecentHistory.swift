@@ -128,11 +128,15 @@ struct CueRecentRecord {
     var resolved = false
     var manualPinned = false
     var notificationCount = 1
+    // Notification acknowledgement is separate from manual unread / later work.
+    // Reopening a task must never resurrect already viewed notification counts.
+    var notificationAcknowledged: Bool
     let conversationKey: String
     let canOpen: Bool
-    init(event: CueEvent, openedAt: Date? = nil, resolved: Bool = false, manualPinned: Bool = false, notificationCount: Int = 1) {
+    init(event: CueEvent, openedAt: Date? = nil, resolved: Bool = false, manualPinned: Bool = false, notificationCount: Int = 1, notificationAcknowledged: Bool? = nil) {
         self.event = event; self.openedAt = openedAt; self.resolved = resolved
         self.manualPinned = manualPinned; self.notificationCount = notificationCount
+        self.notificationAcknowledged = openedAt != nil || notificationAcknowledged == true
         let valid = CueIdentifier.isValid(event.threadID)
         conversationKey = event.provider + ":" + (valid ? "thread:" + event.threadID : "event:" + event.id)
         canOpen = event.provider == "codex" && valid
@@ -152,7 +156,8 @@ struct CueRecentRecord {
             latest.openedAt = group.contains(where: { !$0.isOpened }) ? nil : group.compactMap(\.openedAt).max()
             latest.manualPinned = group.contains(where: \.manualPinned)
             var ids = Set<String>()
-            latest.notificationCount = group.filter { ids.insert($0.event.id).inserted }.reduce(0) { $0 + $1.notificationCount }
+            latest.notificationCount = group.filter { ids.insert($0.event.id).inserted && !$0.notificationAcknowledged }.reduce(0) { $0 + $1.notificationCount }
+            latest.notificationAcknowledged = group.allSatisfy(\.notificationAcknowledged)
             return latest
         }
     }
@@ -217,6 +222,7 @@ final class CueRecentHistory {
         let removed = followups.markHandled(threadID: threadID)
         for index in records.indices where records[index].event.threadID == threadID && records[index].event.provider == "codex" {
             records[index].openedAt = records[index].openedAt ?? Date()
+            records[index].notificationAcknowledged = true
         }
         normalize(); save(); return removed
     }
@@ -241,7 +247,9 @@ final class CueRecentHistory {
     @discardableResult func markOpened(id: String, didOpen: Bool) -> Bool {
         guard didOpen, let record = displayRecord(for: id), record.canOpen else { return false }
         let date = Date()
-        for index in records.indices where records[index].conversationKey == record.conversationKey { records[index].openedAt = date }
+        for index in records.indices where records[index].conversationKey == record.conversationKey {
+            records[index].openedAt = date; records[index].notificationAcknowledged = true
+        }
         if record.event.provider == "codex" { _ = followups.setUnread(threadID: record.event.threadID, unread: false) }
         normalize(); save(); return true
     }
@@ -315,7 +323,7 @@ final class CueRecentHistory {
 
     private func save() {
         let rows = records.map { record -> [String: Any] in
-            var row: [String: Any] = ["event": eventJSON(record.event), "resolved": record.resolved, "manual_pinned": record.manualPinned]
+            var row: [String: Any] = ["event": eventJSON(record.event), "resolved": record.resolved, "manual_pinned": record.manualPinned, "notification_acknowledged": record.notificationAcknowledged]
             if let date = record.openedAt { row["opened_at"] = date.timeIntervalSince1970 }
             return row
         }
@@ -342,7 +350,7 @@ final class CueRecentHistory {
                       let data = try? JSONSerialization.data(withJSONObject: raw), let event = CueEvent(data),
                       !event.isPreview, ids.insert(event.id).inserted else { return nil }
                 let opened = (row["opened_at"] as? Double).flatMap { $0.isFinite && $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
-                return CueRecentRecord(event: event, openedAt: opened, resolved: row["resolved"] as? Bool ?? false, manualPinned: row["manual_pinned"] as? Bool ?? false)
+                return CueRecentRecord(event: event, openedAt: opened, resolved: row["resolved"] as? Bool ?? false, manualPinned: row["manual_pinned"] as? Bool ?? false, notificationAcknowledged: row["notification_acknowledged"] as? Bool)
             }
             normalize()
             lastError = ""
@@ -470,14 +478,15 @@ final class CueRecentHistory {
         grouped.setPinned(id: first.id, pinned: true); grouped.markOpened(id: latest.id, didOpen: true)
         let reopened = CueRecentHistory(home: root.appendingPathComponent("grouped"))
         results["opening_conversation_marks_every_prior_reminder_opened"] = reopened.records.allSatisfy(\.isOpened) && reopened.unopenedCount == 0 && reopened.displayRecords.first?.manualPinned == true
-        results["conversation_badge_and_manual_pin_survive_restart"] = reopened.notificationCount(threadID: "single-chat") == 2 && reopened.displayRecords.count == 1 && reopened.pinnedCount == 1
+        results["cleared_notification_badge_and_manual_pin_survive_restart"] = reopened.notificationCount(threadID: "single-chat") == 0 && reopened.displayRecords.count == 1 && reopened.pinnedCount == 1
         reopened.markUnread(id: first.id)
         results["unread_operation_targets_whole_chat_from_any_old_event"] = reopened.records.allSatisfy { !$0.isOpened } && reopened.unopenedCount == 1
+        results["manual_unread_does_not_restore_acknowledged_notification_totals"] = reopened.notificationCount(threadID: "single-chat") == 0 && CueRecentHistory(home: root.appendingPathComponent("grouped")).notificationCount(threadID: "single-chat") == 0
         reopened.resolve(id: first.id)
         results["approval_resolution_stays_exact_event_scoped_after_grouping"] = reopened.records.first { $0.event.id == first.id }?.resolved == true && reopened.displayRecords.first?.resolved == false
         reopened.setPinned(id: latest.id, pinned: false); reopened.markOpened(id: first.id, didOpen: true)
         reopened.append(event(802, thread: "single-chat"))
-        results["new_reminder_updates_existing_chat_and_restores_one_unread"] = reopened.displayRecords.count == 1 && reopened.notificationCount(threadID: "single-chat") == 3 && reopened.unopenedCount == 1 && reopened.displayRecords.first?.event.id == "event-802"
+        results["new_reminder_updates_existing_chat_and_restores_one_unread"] = reopened.displayRecords.count == 1 && reopened.notificationCount(threadID: "single-chat") == 1 && reopened.unopenedCount == 1 && reopened.displayRecords.first?.event.id == "event-802"
         reopened.append(event(803, thread: "other-chat")); reopened.remove(id: first.id)
         results["deleting_row_removes_its_entire_group_without_old_rows_reappearing"] = reopened.records.count == 1 && reopened.displayRecords.first?.event.threadID == "other-chat" && reopened.notificationCount(threadID: "single-chat") == 0
         let capacity = CueRecentHistory(home: root.appendingPathComponent("group-capacity"))
@@ -486,7 +495,7 @@ final class CueRecentHistory {
             capacity.append(event(10001 + number * 2, thread: "capacity-\(number)"))
             capacity.markOpened(id: "event-\(10001 + number * 2)", didOpen: true)
         }
-        results["fifty_history_slots_count_chats_instead_of_notification_events"] = capacity.ordinaryCount == 50 && capacity.displayRecords.count == 50 && capacity.records.count == 100 && capacity.displayRecords.allSatisfy { $0.notificationCount == 2 }
+        results["fifty_history_slots_count_chats_instead_of_notification_events"] = capacity.ordinaryCount == 50 && capacity.displayRecords.count == 50 && capacity.records.count == 100 && capacity.displayRecords.allSatisfy { $0.notificationCount == 0 }
         let syntheticRead = CueRecentHistory(home: root.appendingPathComponent("synthetic-read"))
         syntheticRead.append(event(860, thread: "synthetic-thread")); syntheticRead.append(event(861, thread: "synthetic-thread"))
         let syntheticOpen = CueEvent(runningThreadID: "synthetic-thread", title: "运行样例", date: Date())
@@ -495,6 +504,30 @@ final class CueRecentHistory {
         syntheticRead.append(event(862, thread: "synthetic-thread"))
         let unchanged = syntheticRead.unopenedCount == 1 && !syntheticRead.markConversationOpened(event: syntheticOpen, didOpen: false)
         results["failed_synthetic_codex_handoff_keeps_conversation_unread"] = unchanged && syntheticRead.unopenedCount == 1
+        results["failed_open_preserves_only_new_pending_notification_count"] = syntheticRead.notificationCount(threadID: "synthetic-thread") == 1
+        syntheticRead.append(event(863, thread: "synthetic-thread"))
+        results["new_notifications_accumulate_from_zero_after_review"] = syntheticRead.notificationCount(threadID: "synthetic-thread") == 2 && syntheticRead.displayRecords.count == 1
+        syntheticRead.beginReview(event: syntheticOpen)
+        let afterAcknowledgement = CueRecentHistory(home: root.appendingPathComponent("synthetic-read"))
+        results["review_clears_all_pending_counts_and_persists_acknowledgement"] = afterAcknowledgement.notificationCount(threadID: "synthetic-thread") == 0 && afterAcknowledgement.records.count == 4 && afterAcknowledgement.records.allSatisfy(\.notificationAcknowledged)
+        afterAcknowledgement.markThreadUnread(event: syntheticOpen)
+        afterAcknowledgement.append(event(864, thread: "synthetic-thread"))
+        results["new_alert_after_manual_unread_counts_only_new_event"] = afterAcknowledgement.notificationCount(threadID: "synthetic-thread") == 1 && afterAcknowledgement.unopenedCount == 1
+        afterAcknowledgement.markThreadHandled(threadID: "synthetic-thread")
+        results["mark_handled_acknowledges_pending_notification_without_deleting_provenance"] = afterAcknowledgement.notificationCount(threadID: "synthetic-thread") == 0 && afterAcknowledgement.records.count == 5
+        let notificationLegacyHome = root.appendingPathComponent("legacy-notification-counts")
+        let notificationLegacy = CueRecentHistory(home: notificationLegacyHome)
+        notificationLegacy.append(event(870, thread: "legacy-read")); notificationLegacy.markOpened(id: "event-870", didOpen: true)
+        notificationLegacy.append(event(871, thread: "legacy-pending"))
+        if let data = try? Data(contentsOf: notificationLegacy.file), var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], var rows = json["records"] as? [[String: Any]] {
+            for index in rows.indices { rows[index].removeValue(forKey: "notification_acknowledged") }
+            json["records"] = rows
+            try? JSONSerialization.data(withJSONObject: json).write(to: notificationLegacy.file, options: .atomic)
+        }
+        let migrated = CueRecentHistory(home: notificationLegacyHome)
+        results["legacy_history_migrates_pending_badges_from_opened_state_without_losing_rows"] = migrated.notificationCount(threadID: "legacy-read") == 0 && migrated.notificationCount(threadID: "legacy-pending") == 1 && migrated.records.count == 2
+        let duplicateRead = CueRecentRecord(event: event(875, thread: "duplicate-alert"), openedAt: Date())
+        results["regrouping_does_not_revive_read_or_duplicate_notification_counts"] = CueRecentRecord.conversations([duplicateRead, duplicateRead]).first?.notificationCount == 0 && CueRecentRecord.conversations(migrated.displayRecords).first { $0.event.threadID == "legacy-pending" }?.notificationCount == 1
 
         return results
     }
@@ -1687,25 +1720,32 @@ final class CueStatusPopoverController: NSViewController {
         uniqueHistory.append(uniqueEvent("unique-new", thread: "unique-chat", date: 3001))
         let mixed = CueStatusListSnapshot(records: uniqueHistory.records, runningTasks: [CueRunningTask(raw: ["thread_id": "unique-chat", "title": "合并样例", "started_at": 2999.0, "last_activity": 3002.0])!], followups: uniqueHistory.followups.records)
         results["same_chat_never_appears_in_both_pinned_and_history_sections"] = mixed.rowCount == 1 && mixed.pinned.count == 1 && mixed.running.isEmpty && mixed.ordinary.isEmpty
+        let duplicateLive = CueRunningTask(raw: ["thread_id":"unique-chat", "title":"同一个对话", "started_at":2999.0, "last_activity":3002.0])!
+        let duplicateLost = CueRunningTask(raw: ["thread_id":"unique-chat", "title":"同一个对话", "started_at":2999.0, "last_activity":3001.0, "status":"interrupted"])!
+        let duplicateFollowup = CueThreadFollowup(threadID: "unique-chat", title: "同一个对话", createdAt: Date(), reviewedAt: Date(), pinned: false)
+        let allSources = CueStatusListSnapshot(records: uniqueHistory.records, runningTasks: [duplicateLive, duplicateLive], interruptedTasks: [duplicateLost], followups: [duplicateFollowup])
+        results["same_chat_across_all_five_sources_still_has_one_visible_row"] = allSources.rowCount == 1 && allSources.pinned.count == 1 && allSources.activeCount == 1 && allSources.followups.isEmpty && allSources.interrupted.isEmpty && allSources.ordinary.isEmpty
         let uniquePanel = CueStatusPopoverController(history: uniqueHistory, actions: actions)
         _ = uniquePanel.view
         let badgeRow = uniquePanel.recentDocument?.subviews.compactMap { $0 as? CueRecentRowButton }.first
         let badge = badgeRow?.subviews.first { $0.identifier?.rawValue == "notification-count:unique-chat" } as? NSTextField
-        results["merged_notification_count_is_visible_as_a_numeric_badge"] = badge?.stringValue == "2" && badge?.isHidden == false && (badge?.frame.minX ?? 0) >= (badgeRow?.subviews.first { $0.identifier?.rawValue == "row-title" }?.frame.maxX ?? 1)
+        results["pending_notification_count_is_visible_as_a_numeric_badge"] = badge?.stringValue == "1" && badge?.isHidden == false && (badge?.frame.minX ?? 0) >= (badgeRow?.subviews.first { $0.identifier?.rawValue == "row-title" }?.frame.maxX ?? 1)
         uniquePanel.toggleBatchMode()
         let frozenRow = uniquePanel.recentDocument?.subviews.compactMap { $0 as? CueRecentRowButton }.first
         let frozenBadge = frozenRow?.subviews.first { $0.identifier?.rawValue == "notification-count:unique-chat" } as? NSTextField
         uniqueHistory.append(uniqueEvent("unique-newest", thread: "unique-chat", date: 3003))
         uniquePanel.update(status: "本机监控中", enabled: true, soundEnabled: false, paused: false)
-        results["frozen_list_updates_latest_event_and_badge_without_duplicate_rows"] = frozenRow?.record.event.id == "unique-newest" && frozenBadge?.stringValue == "3" && uniquePanel.recentDocument?.subviews.compactMap { $0 as? CueRecentRowButton }.count == 1
+        results["frozen_list_updates_latest_event_and_badge_without_duplicate_rows"] = frozenRow?.record.event.id == "unique-newest" && frozenBadge?.stringValue == "2" && uniquePanel.recentDocument?.subviews.compactMap { $0 as? CueRecentRowButton }.count == 1
         uniqueHistory.markOpened(id: original.id, didOpen: true)
+        uniquePanel.update(status: "已查看，保留同一行", enabled: true, soundEnabled: false, paused: false)
+        results["opening_chat_clears_badge_in_place_even_when_batch_freezes_rows"] = frozenBadge?.isHidden == true && frozenBadge?.stringValue == "0" && frozenRow === uniquePanel.recentDocument?.subviews.compactMap { $0 as? CueRecentRowButton }.first
         let liveUnique = CueRunningTask(raw: ["thread_id": "unique-chat", "title": "合并样例", "started_at": 2999.0, "last_activity": 3004.0])!
         let liveUniquePanel = CueStatusPopoverController(history: uniqueHistory, actions: actions)
         _ = liveUniquePanel.view
         liveUniquePanel.update(status: "本机监控中", enabled: true, soundEnabled: false, paused: false, runningTasks: [liveUnique])
         let liveUniqueRow = liveUniquePanel.recentDocument?.subviews.compactMap { $0 as? CueRunningRowButton }.first
         let liveBadge = liveUniqueRow?.subviews.first { $0.identifier?.rawValue == "notification-count:unique-chat" } as? NSTextField
-        results["notification_badge_remains_visible_when_chat_moves_to_running"] = liveUniqueRow != nil && liveBadge?.stringValue == "3" && liveBadge?.isHidden == false
+        results["opened_notification_badge_is_hidden_when_chat_moves_to_running"] = liveUniqueRow != nil && liveBadge?.stringValue == "0" && liveBadge?.isHidden == true
         let cacheTitle = "拼音缓存 \(UUID().uuidString) 12"
         let cacheRaw: [String: Any] = ["thread_id": "title-cache", "title": cacheTitle, "started_at": 1000.0, "last_activity": 1001.0]
         let firstCached = CueRunningTask(raw: cacheRaw)!
@@ -2065,12 +2105,12 @@ final class CueStatusPopoverController: NSViewController {
             switch field.identifier?.rawValue {
             case "row-title":
                 field.frame = layout.heading
-                if reminders > 1 { field.frame.size.width = max(32, layout.heading.width - badgeWidth - 6) }
+                if reminders > 0 { field.frame.size.width = max(32, layout.heading.width - badgeWidth - 6) }
             case "notification-count:" + threadID:
-                field.stringValue = badgeText; field.isHidden = reminders <= 1
+                field.stringValue = badgeText; field.isHidden = reminders == 0
                 field.frame = NSRect(x: layout.heading.maxX - badgeWidth, y: 8, width: badgeWidth, height: 17)
-                field.toolTip = "本机已记录 \(reminders) 次提醒（不是未读数）"
-                field.setAccessibilityLabel("已记录 \(reminders) 次提醒")
+                field.toolTip = "尚未查看的通知 \(reminders) 条；打开对话后清零"
+                field.setAccessibilityLabel(reminders > 0 ? "\(reminders) 条未查看通知" : "无未查看通知")
             case "row-metadata": field.frame = layout.metadata
             case "row-state": field.frame = layout.state
             case "task-metrics:" + threadID: field.stringValue = line; field.frame = layout.model; field.toolTip = detail.settingsTooltip
@@ -2106,7 +2146,7 @@ final class CueStatusPopoverController: NSViewController {
                 field.toolTip = value.tooltip
             }
         }
-        row.setAccessibilityHelp("已记录 \(reminders) 次提醒。" + line + "，" + detail.speedSelectionLine + "，" + elapsed + "。本轮 " + turn.tokenLine + "，" + turn.costLine + "。历史累计 " + detail.historyUsage.tokenLine + "，" + detail.historyUsage.costLine + "。悬停查看详情；点击打开对应对话。")
+        row.setAccessibilityHelp("尚未查看的通知 \(reminders) 条。" + line + "，" + detail.speedSelectionLine + "，" + elapsed + "。本轮 " + turn.tokenLine + "，" + turn.costLine + "。历史累计 " + detail.historyUsage.tokenLine + "，" + detail.historyUsage.costLine + "。悬停查看详情；点击打开对应对话。")
         configureQuickActions(in: row)
         configureSideChats(in: row, threadID: threadID, title: (row as? CueRecentRowButton)?.record.event.title ?? (row as? CueRunningRowButton)?.followup?.title ?? (row as? CueRunningRowButton)?.task.title ?? "Codex 对话")
     }

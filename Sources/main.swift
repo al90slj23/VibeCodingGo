@@ -1302,12 +1302,12 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             }
             func countSuffix(_ id: String) -> String {
                 let count = recentHistory.notificationCount(threadID: id)
-                return count > 1 ? " · \(count) 次" : ""
+                return count > 0 ? " · \(count) 条未查看" : ""
             }
             func reminder(_ record: CueRecentRecord) {
                 let event = record.event
                 let isRunning = runningTasks.contains { $0.threadID == event.threadID && event.provider == "codex" }
-                let title = "\(record.isOpened ? "↗" : "●") \(event.title.prefix(52))\(isRunning ? " · 运行中" : "")" + (record.notificationCount > 1 ? " · \(record.notificationCount) 次" : "")
+                let title = "\(record.isOpened ? "↗" : "●") \(event.title.prefix(52))\(isRunning ? " · 运行中" : "")" + (record.notificationCount > 0 ? " · \(record.notificationCount) 条未查看" : "")
                 let item = NSMenuItem(title: title, action: #selector(openRecent(_:)), keyEquivalent: "")
                 item.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: record.isOpened ? NSColor.secondaryLabelColor : NSColor.systemBlue, .font: NSFont.systemFont(ofSize: 13, weight: record.isOpened ? .regular : .semibold)])
                 item.target = self; item.representedObject = event.id; item.isEnabled = record.canOpen
@@ -2515,8 +2515,17 @@ if CommandLine.arguments.contains("--recent-self-test") {
     cue.enqueue(event("first")); cue.enqueue(event("second"))
     cue.openConversationURL = { _ in false }
     results["rejected_url_handoff_stays_unopened"] = !cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 1
+    results["failed_codex_open_keeps_all_pending_notifications"] = cue.recentHistory.notificationCount(threadID: "fixture-chat") == 2
     cue.openConversationURL = { _ in true }
     results["successful_handoff_marks_the_whole_conversation_opened"] = cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 0 && cue.recentHistory.records.first(where: { $0.event.id == "second" })?.isOpened == true
+    results["successful_codex_open_clears_the_entire_chat_badge"] = cue.recentHistory.notificationCount(threadID: "fixture-chat") == 0
+    cue.recentHistory.append(event("after-view"))
+    results["notification_after_codex_open_restarts_at_one_without_another_row"] = cue.recentHistory.notificationCount(threadID: "fixture-chat") == 1 && cue.recentHistory.displayRecords.count == 1
+    let syntheticTarget = CueEvent(runningThreadID: "fixture-chat", title: "同一运行任务", date: Date())
+    cue.openConversationURL = { _ in false }
+    results["failed_running_shortcut_does_not_clear_new_notification"] = !cue.open(event: syntheticTarget) && cue.recentHistory.notificationCount(threadID: "fixture-chat") == 1
+    cue.openConversationURL = { _ in true }
+    results["successful_running_shortcut_clears_real_chat_notification_group"] = cue.open(event: syntheticTarget) && cue.recentHistory.notificationCount(threadID: "fixture-chat") == 0
     let inputRaw: [String: Any] = ["id":"mcp-input-fixture", "kind":"input", "thread_id":"fixture-chat", "title":"浏览器确认样例", "source":"codex client approval stream", "created_at":Date().timeIntervalSince1970]
     let inputEvent = CueEvent(try! JSONSerialization.data(withJSONObject: inputRaw))!
     cue.current = inputEvent; cue.pending = [inputEvent]; cue.recentHistory.append(inputEvent)
