@@ -131,12 +131,16 @@ fn write_private(path: &Path, value: &Value) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::subscription::{CredentialStatus, QuotaTier};
+    use crate::services::subscription::CredentialStatus;
     fn quota() -> SubscriptionQuota {
-        SubscriptionQuota { tool:"codex_oauth".into(),credential_status:CredentialStatus::Valid,
-            credential_message:Some("private upstream text".into()),success:true,
-            tiers:vec![QuotaTier{name:"seven_day".into(),utilization:22.0,resets_at:None,used_value_usd:None,max_value_usd:None}],
-            extra_usage:None,reset_credits:None,credits_balance:None,error:Some("secret response".into()),queried_at:Some(1000000) }
+        let mut value = SubscriptionQuota::not_found("codex_oauth");
+        value.credential_status = CredentialStatus::Valid;
+        value.credential_message = Some("private upstream text".into());
+        value.success = true;
+        value.tiers = vec![serde_json::from_value(json!({"name":"seven_day","utilization":22.0,"resetsAt":null})).unwrap()];
+        value.error = Some("secret response".into());
+        value.queried_at = Some(1000000);
+        value
     }
     #[test] fn exports_only_identity_and_quota_whitelist() {
         let value=record("local-one",Some("workspace-one"),"one@example.com",Some(&quota()),"");

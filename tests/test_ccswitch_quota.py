@@ -3,8 +3,9 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from vibecue.ccswitch_quota import SOURCE, read_all_accounts
+from vibecue.ccswitch_quota import HISTORY_NAME, SOURCE, read_all_accounts
 
 
 def record(identifier='workspace-one', email='one@example.com', **values):
@@ -133,9 +134,172 @@ class CCSwitchQuotaTests(unittest.TestCase):
         self.assertTrue(value['identities'][0]['account_key'].startswith('ccswitch:'))
 
     def test_invalid_numeric_values_not_accepted(self):
-        for value in [None,True,-1,float('nan')]:
+        for value in [None,True,-1,float('nan'),float('inf'),10**1000]:
             self.write([record(tiers=[{'name':'seven_day','utilization':value}])])
             self.assertEqual(self.read()['accounts'],[])
+
+
+class QuotaHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.file=Path(self.tmp.name)/'export.json'
+        self.home=Path(self.tmp.name)/'private-vibecue'
+
+    write=CCSwitchQuotaTests.write
+
+    def read(self,now=1001):return read_all_accounts(self.file,now=now,home=self.home)
+
+    def cached(self):return json.loads((self.home/HISTORY_NAME).read_text())
+
+    def test_omitting_home_remains_read_only(self):
+        self.write();read_all_accounts(self.file,now=1001)
+        self.assertEqual(list(Path(self.tmp.name).iterdir()),[self.file])
+
+    def test_missing_export_keeps_both_last_successes_private_and_nonlive(self):
+        self.write();self.read();self.file.unlink()
+        value=self.read(now=1300)
+        self.assertEqual(value['bridge_status'],'unavailable')
+        self.assertEqual(value['accounts'],[])
+        self.assertEqual(value['configured_count'],2)
+        self.assertEqual(len(value['errors']),2)
+        self.assertEqual(len(value['history']),2)
+        self.assertTrue(all(row['is_live'] is False and row['status']=='last_read' for row in value['history']))
+        self.assertEqual(value['history'][0]['observed_at'],1000)
+        self.assertEqual(value['history'][0]['buckets'][0]['windows'][0]['remaining_percent'],78)
+        cache=self.home/HISTORY_NAME
+        self.assertEqual(cache.stat().st_mode & 0o777,0o600)
+        self.assertEqual({path.name for path in self.home.iterdir()},{HISTORY_NAME,'ccswitch-quota-history.lock'})
+
+    def test_failed_new_export_does_not_destroy_previous_numeric_success(self):
+        self.write();self.read()
+        self.write([record(observed_at=1060),record('workspace-two','two@example.com',success=False,tiers=[],error_code='query_timeout')],generated_at=1060)
+        value=self.read(now=1061)
+        self.assertEqual(len(value['accounts']),1)
+        self.assertEqual(len(value['history']),1)
+        self.assertEqual(value['history'][0]['email'],'two@example.com')
+        self.assertEqual(value['history'][0]['observed_at'],1000)
+        self.assertIn('超时',value['errors'][0]['message'])
+        self.assertEqual(len(self.cached()['accounts']),2)
+
+    def test_stale_success_can_be_retained_then_survive_export_removal(self):
+        self.write();first=self.read(now=2000);self.file.unlink()
+        second=self.read(now=2001)
+        self.assertEqual(len(first['history']),2)
+        self.assertEqual([row['observed_at'] for row in second['history']],[1000,1000])
+        self.assertEqual(second['accounts'],[])
+
+    def test_fresh_complete_configuration_deletion_is_persisted(self):
+        self.write();self.read()
+        self.write([record(observed_at=1060)],generated_at=1060)
+        self.assertEqual(self.read(now=1061)['configured_count'],1)
+        self.file.unlink()
+        value=self.read(now=1300)
+        self.assertEqual(value['configured_count'],1)
+        self.assertEqual([row['email'] for row in value['history']],['one@example.com'])
+        self.assertEqual(len(self.cached()['accounts']),1)
+
+    def test_fresh_empty_configuration_removes_all_and_never_revives_them(self):
+        self.write();self.read()
+        self.write([],generated_at=1060);value=self.read(now=1061)
+        self.assertTrue(value['configuration_complete'])
+        self.assertEqual(self.cached()['accounts'],[])
+        self.file.unlink();value=self.read(now=1300)
+        self.assertEqual((value['configured_count'],value['history'],value['errors']),(0,[],[]))
+
+    def test_partial_invalid_account_list_is_not_a_deletion_instruction(self):
+        self.write();self.read()
+        self.write([record(observed_at=1060),None],generated_at=1060)
+        value=self.read(now=1061)
+        self.assertFalse(value['configuration_complete'])
+        self.assertEqual(value['configured_count'],2)
+        self.assertEqual([row['email'] for row in value['history']],['two@example.com'])
+
+    def test_unknown_export_schema_keeps_history_and_does_not_replace_cache(self):
+        self.write();self.read()
+        previous=(self.home/HISTORY_NAME).read_bytes()
+        self.write([],schema_version=2,generated_at=1060)
+        value=self.read(now=1061)
+        self.assertEqual(value['bridge_status'],'invalid')
+        self.assertEqual(len(value['history']),2)
+        self.assertEqual((self.home/HISTORY_NAME).read_bytes(),previous)
+
+    def test_oversized_numeric_field_is_invalid_but_keeps_saved_history(self):
+        self.write();self.read()
+        self.write([],generated_at=10**1000)
+        value=self.read(now=1061)
+        self.assertEqual(value['bridge_status'],'invalid')
+        self.assertEqual(len(value['history']),2)
+
+    def test_older_complete_configuration_cannot_resurrect_removed_account(self):
+        self.write();self.read()
+        self.write([record(observed_at=1060)],generated_at=1060);self.read(now=1061)
+        self.write(generated_at=1000)
+        value=self.read(now=1062)
+        self.assertEqual(value['bridge_status'],'stale')
+        self.assertEqual(value['accounts'],[])
+        self.assertEqual(value['configured_count'],1)
+        self.assertEqual([row['email'] for row in value['history']],['one@example.com'])
+        self.assertEqual(self.cached()['configuration_observed_at'],1060)
+
+    def test_older_individual_read_does_not_replace_newer_success(self):
+        self.write([record(observed_at=1050)],generated_at=1050);self.read(now=1051)
+        self.write([record(observed_at=1000,tiers=[{'name':'seven_day','utilization':99}])],generated_at=1060)
+        value=self.read(now=1061)
+        self.assertEqual(value['accounts'],[])
+        self.assertEqual(value['history'][0]['observed_at'],1050)
+        self.assertEqual(value['history'][0]['buckets'][0]['windows'][0]['remaining_percent'],78)
+        self.assertEqual(self.cached()['accounts'][0]['observed_at'],1050)
+
+    def test_rebound_local_identity_never_receives_the_previous_users_quota(self):
+        self.write([record(ccswitch_account_id='same-local')]);self.read()
+        self.write([record('another-workspace','other@example.com',ccswitch_account_id='same-local',
+                           success=False,tiers=[],error_code='query_failed')],generated_at=1060)
+        value=self.read(now=1061)
+        self.assertEqual(value['history'],[])
+        self.assertEqual(value['identities'][0]['email'],'other@example.com')
+        self.assertEqual(self.cached()['accounts'],[])
+
+    def test_same_workspace_users_remain_separate_in_durable_history(self):
+        self.write([record('same-workspace','one@example.com',ccswitch_account_id='user-one'),
+                    record('same-workspace','two@example.com',ccswitch_account_id='user-two')])
+        self.read();self.file.unlink();value=self.read(now=1300)
+        self.assertEqual({row['account_key'] for row in value['history']},{'ccswitch:user-one','ccswitch:user-two'})
+        self.assertEqual(len(value['history']),2)
+
+    def test_only_identity_and_numeric_whitelist_reaches_history_or_output(self):
+        self.write([record(access_token='private-access',refresh_token='private-refresh',
+                           tiers=[{'name':'seven_day','utilization':22,'token':'private-nested'}])],token='private-top')
+        self.read();cache=self.home/HISTORY_NAME
+        self.assertNotIn('private-',cache.read_text())
+        data=json.loads(cache.read_text())
+        data['secret']='private-top'
+        data['accounts'][0]['access_token']='private-access'
+        data['accounts'][0]['buckets'][0]['windows'][0]['remaining_percent']=999
+        cache.write_text(json.dumps(data));cache.chmod(0o600);self.file.unlink()
+        value=self.read(now=1300)
+        self.assertNotIn('private-',json.dumps(value))
+        self.assertEqual(value['history'][0]['buckets'][0]['windows'][0]['remaining_percent'],78)
+
+    def test_symlink_history_is_not_followed_or_written_through(self):
+        self.write();self.read()
+        cache=self.home/HISTORY_NAME
+        target=self.home/'unrelated.json';target.write_text('unrelated original')
+        cache.unlink();cache.symlink_to(target)
+        value=self.read()
+        self.assertEqual(len(value['accounts']),2)
+        self.assertEqual(target.read_text(),'unrelated original')
+        self.assertFalse(cache.is_symlink())
+        self.assertEqual(cache.stat().st_mode & 0o777,0o600)
+
+    def test_failed_save_retains_current_and_historical_results_without_raw_error(self):
+        self.write();self.read()
+        self.write([record(observed_at=1060),record('workspace-two','two@example.com',success=False,tiers=[])],generated_at=1060)
+        with patch('vibecue.ccswitch_quota._save_history',side_effect=OSError('secret raw path')):
+            value=self.read(now=1061)
+        self.assertEqual(len(value['accounts']),1)
+        self.assertEqual(len(value['history']),1)
+        self.assertIn('history_cache_error',value)
+        self.assertNotIn('secret raw path',json.dumps(value))
 
 
 if __name__=='__main__':unittest.main()

@@ -116,9 +116,14 @@ final class CueCCAccountsController: NSWindowController {
         refreshButton.isEnabled = fixture == nil && !monitor.refreshing
         refreshButton.title = monitor.refreshing && fixture == nil ? "读取中…" : "刷新"
         message.stringValue = data["message"] as? String ?? "正在读取账号的订阅额度…"
+        let maintenance = data["ccswitch_maintenance"] as? [String: Any] ?? [:]
+        if maintenance["enabled"] as? Bool == true, maintenance["recovering"] as? Bool == true {
+            message.stringValue = maintenance["message"] as? String ?? "正在自动恢复额度共享，上次额度已保留。"
+        }
         let rows = data["accounts"] as? [[String: Any]] ?? []
         let liveCount = rows.filter { Self.isLive($0) }.count
         status.stringValue = rows.isEmpty ? "复用已有登录，无需在 VibeCue 重新授权。" : "已显示 \(rows.count) 个账号 · \(liveCount) 个实时更新。"
+        if maintenance["enabled"] as? Bool == true, maintenance["phase"] as? String == "healthy" { status.stringValue += " 升级自动维护已开启。" }
         renderAccounts()
     }
     @discardableResult private func label(_ value: String, x: CGFloat, y: CGFloat, width: CGFloat, size: CGFloat = 11, weight: NSFont.Weight = .regular, color: NSColor = .labelColor, in parent: NSView) -> NSTextField {
@@ -195,7 +200,7 @@ final class CueCCAccountsController: NSWindowController {
     @objc private func refresh() { monitor.refresh(force: true) }
     @objc private func showInfo() {
         let alert = NSAlert(); alert.messageText = "订阅额度的来源"
-        alert.informativeText = "当前登录账号由 Codex 官方接口读取。CC Switch 账号通过本机额度共享读取，授权和刷新始终由 CC Switch 自己管理，只共享账号名称、额度数字和更新时间。\n\n无需在 VibeCue 重新授权，也不会切换账号。CC Switch 需要运行并启用额度共享；读取失败或数据过期时会明确标记。\n\n每周剩余比例与 API 参考费用是两种不同数据，不能互相换算。"; alert.addButton(withTitle: "知道了"); alert.runModal()
+        alert.informativeText = "当前登录账号由 Codex 官方接口读取。CC Switch 账号通过本机额度共享读取，授权和刷新始终由 CC Switch 自己管理，只共享账号名称、额度数字和更新时间。\n\nCC Switch 升级后自动检测变化，核对新版接口、构建并验证共享模块，再等待后台空闲时恢复；不会降级或强制结束应用。若新版结构暂不兼容，会保留官方新版及上次额度，后台稍后重试。\n\n无需重新授权或切换账号。读取失败和过期值会明确标记。订阅额度与 API 参考费用不能互相换算。"; alert.addButton(withTitle: "知道了"); alert.runModal()
     }
     @objc private func openCCSwitch() {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.ccswitch.desktop") else { message.stringValue = "未找到 CC Switch，请从应用程序中打开。"; return }
@@ -220,7 +225,11 @@ final class CueCCAccountsController: NSWindowController {
         historical[1]["is_live"] = true; historical[1]["status"] = "last_read"
         let older = CueCCAccountsController(home: home, fixture: ["accounts": historical])
         let oldLabels = older.quotaDocument.subviews.flatMap(\.subviews).compactMap { ($0 as? NSTextField)?.stringValue }
+        var repairingData = fixtureData()
+        repairingData["ccswitch_maintenance"] = ["enabled": true, "recovering": true, "phase": "building", "message": "正在自动恢复新版额度共享，上次额度已保留。"]
+        let repairing = CueCCAccountsController(home: home, fixture: repairingData)
         return ["quota_ui_distinguishes_live_and_previous_account": labels.contains("CC Switch · 实时读取") && oldLabels.contains("上次读取 · 非实时") && oldLabels.contains("本周上次剩余 42%"),
+                "quota_ui_explains_automatic_upgrade_recovery": repairing.message.stringValue.contains("自动恢复") && repairing.message.stringValue.contains("上次额度"),
                 "quota_ui_shows_two_live_accounts_without_switching": labels.contains("当前登录 · 实时读取") && labels.contains("CC Switch · 实时读取") && controller.status.stringValue.contains("2 个实时更新"),
                 "quota_ui_failed_read_clears_the_live_badge": !Self.isLive(historical[1]) && !oldLabels.contains("CC Switch · 实时读取"),
                 "quota_ui_shows_week_remaining_and_local_reset_time": labels.contains("本周剩余 78%") && labels.contains("本周剩余 42%") && labels.contains(where: { $0.hasPrefix("重置 ") }),

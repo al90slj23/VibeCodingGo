@@ -496,9 +496,31 @@ def main(argv=None):
     signal.signal(signal.SIGTERM,cancelled)
     try:
         store=QuotaStore()
+        from .ccswitch_maintenance import Maintenance
+        maintenance=Maintenance(home=store.home)
+        maintenance_failed=False
+        if args.command=='refresh':
+            try:maintenance.ensure()
+            except (OSError,ValueError,TypeError,RuntimeError):maintenance_failed=True
         result=store.refresh(force=args.force) if args.command=='refresh' else store.status()
         from .ccswitch_quota import read_all_accounts
-        result=merge_shared_accounts(result,read_all_accounts())
+        shared=read_all_accounts(home=store.home)
+        try:
+            if maintenance_failed:raise RuntimeError()
+            integration=maintenance.status()
+        except (OSError,ValueError,TypeError,RuntimeError):
+            integration={'enabled':True,'recovering':True,'automatic':True,'phase':'waiting_retry',
+                         'message':'自动维护暂未完成，上次额度已保留；稍后会自动重试。'}
+        if integration['enabled'] and integration['recovering']:
+            # The file may still be young but belong to the replaced process.
+            # Keep its values visible as history throughout version recovery.
+            for row in shared['accounts']:
+                shared['history'].append(dict(row,is_live=False,status='last_read'))
+                shared['errors'].append({'account_key':row['account_key'],'label':row['label'],'message':integration['message']})
+            shared['accounts']=[]
+        result=merge_shared_accounts(result,shared)
+        result['ccswitch_maintenance']=integration
+        if shared.get('history_cache_error'):result['ccswitch_history_cache_error']=shared['history_cache_error']
         print(json.dumps(result,ensure_ascii=False,separators=(',',':')))
         return 0
     except KeyboardInterrupt:

@@ -16,5 +16,7 @@ fi
 if [[ -d "$PROJECT_ROOT/assets/Conversation" ]]; then
   /usr/bin/ditto "$PROJECT_ROOT/assets/Conversation" "$APP_DIR/Contents/Resources/Conversation"
 fi
+mkdir -p "$APP_DIR/Contents/Resources/CCSwitchIntegration"
+cp "$PROJECT_ROOT/integrations/ccswitch/vibecue_quota.rs" "$APP_DIR/Contents/Resources/CCSwitchIntegration/vibecue_quota.rs"
 /usr/bin/codesign --force --sign - "$APP_DIR"
 printf '%s\n' "$APP_DIR"

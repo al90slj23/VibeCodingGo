@@ -2128,6 +2128,17 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--ccswitch-system-action"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    let data = FileHandle.standardInput.readData(ofLength: 8193)
+    guard data.count <= 8192, let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        print("{\"status\":\"invalid_request\",\"reason\":\"invalid_payload\"}"); exit(2)
+    }
+    let result = CueCCSwitchMaintenance.run(action: CommandLine.arguments[index + 1], payload: payload)
+    print(String(data: try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--recent-self-test") {
     _ = NSApplication.shared
     let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-recent-integration-" + UUID().uuidString)
@@ -2142,6 +2153,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results.merge(CueConversationController.validationReport()) { _, new in new }
     results.merge(CueEditingMenu.validationReport()) { _, new in new }
     results.merge(CueCCAccountsController.validationReport()) { _, new in new }
+    results.merge(CueCCSwitchMaintenance.validationReport()) { _, new in new }
     results.merge(CueCodexConnection.validationReport()) { _, new in new }
     func event(_ id: String) -> CueEvent {
         CueEvent(try! JSONSerialization.data(withJSONObject: ["id": id, "kind": "complete", "thread_id": "fixture-chat", "title": "验收样例 · " + id, "created_at": Date().timeIntervalSince1970]))!

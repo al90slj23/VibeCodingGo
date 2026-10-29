@@ -196,10 +196,18 @@ def install(start=True, with_hooks=True, user_home=None):
         private_write(agents / (job['Label'] + '.plist'), plistlib.dumps(job))
     # Preserve config.toml and the existing computer-use notify command verbatim.
     hooks = install_hooks(user_home / '.codex', control, home) if with_hooks else previous.get('hooks')
-    record = {'version': '0.19.1', 'app': str(app), 'home': str(home), 'hooks': hooks,
+    record = {'version': '0.20.0', 'app': str(app), 'home': str(home), 'hooks': hooks,
               'source_dir': str(PROJECT),
               'labels': list(LABELS), 'installed_at': datetime.now(timezone.utc).isoformat()}
     json_write(home / 'install.json', record)
+    # Only migrate machines that already opted into the verified local bridge.
+    # No CC Switch auth/config files are opened by this bootstrap.
+    if (home / 'ccswitch-quota-install.json').is_file():
+        sys.path.insert(0, str(PROJECT))
+        from vibecue.ccswitch_maintenance import configure_existing
+        configure_existing(home, PROJECT / 'build/ccswitch-maintenance',
+                           seed_app=PROJECT / 'build/ccswitch-bridge-target/release/bundle/macos/CC Switch.app',
+                           template_file=app / 'Contents/Resources/CCSwitchIntegration/vibecue_quota.rs')
     if start:
         for label in LABELS:
             subprocess.run(['/bin/launchctl', 'bootstrap', domain, str(agents / (label + '.plist'))], check=True)
