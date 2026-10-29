@@ -37,6 +37,10 @@ final class CueCollectorScheduler {
     static func lane(module: String, arguments: [String]) -> Lane {
         let command = arguments.first ?? ""
         if module == "vibecue.engineering_tools" { return .engineering }
+        if module == "vibecue.engineering_maintenance" {
+            if ["maintain", "check"].contains(command) { return .maintenance }
+            return command == "configure" ? .interactive : .read
+        }
         if module == "vibecue.codex_chat" { return command == "status" ? .status : .interactive }
         if module == "vibecue.codex_control" { return command == "apply" ? .control : .status }
         if module == "vibecue.usage", command == "sync" { return .maintenance }
@@ -150,6 +154,7 @@ final class CueCollectorScheduler {
         results["engineering_close_removes_its_queued_work_without_touching_other_owners"] = toolDiscards == 2 && engineering.metrics["queued"] == 0 && engineering.metrics["active"] == 3
         toolDone.forEach { $0() }
         results["engineering_finished_work_releases_budget_and_classifies_all_tools"] = engineering.metrics["active"] == 0 && ["environment", "api", "logs"].allSatisfy { lane(module: "vibecue.engineering_tools", arguments: [$0]) == .engineering }
+        results["engineering_update_processes_use_background_budget_and_keep_status_read_only"] = lane(module:"vibecue.engineering_maintenance",arguments:["maintain"]) == .maintenance && lane(module:"vibecue.engineering_maintenance",arguments:["check"]) == .maintenance && lane(module:"vibecue.engineering_maintenance",arguments:["status"]) == .read && lane(module:"vibecue.engineering_maintenance",arguments:["configure"]) == .interactive
         return results
     }
 }

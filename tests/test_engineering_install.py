@@ -10,9 +10,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-SPEC = importlib.util.spec_from_file_location('engineering_install', Path(__file__).resolve().parents[1] / 'scripts/install-engineering-tools.py')
-installer = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(installer)
+from vibecue import engineering_install as installer
 
 
 def tar_bytes(name, *, member=None, link=False, duplicate=False):
@@ -117,6 +115,16 @@ class InstallTests(unittest.TestCase):
         second = installer.install(self.home, downloader=lambda *_: self.fail('downloaded'))
         self.assertEqual(first['tools'], second['tools'])
         self.assertTrue((root / 'bin/hurl').is_symlink())
+
+    def test_explicit_bootstrap_respects_an_active_engineering_use_lease(self):
+        first=self.install();root=self.home/'engineering-tools';before=(root/'manifest.json').read_bytes()
+        with installer.tool_use_lock(self.home,nonblocking=True) as acquired:
+            self.assertTrue(acquired)
+            with self.assertRaisesRegex(installer.InstallError,'工程任务正在使用工具'):
+                self.install()
+        self.assertEqual((root/'manifest.json').read_bytes(),before)
+        for name,entry in first['tools'].items():
+            self.assertEqual(os.readlink(root/'bin'/name),'../'+entry['binary'])
 
     def test_user_regular_file_is_not_overwritten(self):
         root = self.home / 'engineering-tools'; (root / 'bin').mkdir(parents=True)

@@ -396,22 +396,27 @@ def main(argv=None):
     parser.add_argument('command',choices=('environment','api','logs','capabilities'))
     args=parser.parse_args(argv)
     runtime=Runtime(timeout=40)
+    from .engineering_install import tool_use_lock, InstallError as ToolInstallError
     with runtime.signals():
         try:
             data=sys.stdin.buffer.read(MAX_INPUT+1)
             if len(data)>MAX_INPUT:raise EngineeringError('工程工具输入超过 256 KiB 上限。')
             payload=json.loads(data) if data.strip() else {}
             if not isinstance(payload,dict):raise EngineeringError('工程工具输入必须是 JSON 对象。')
-            if args.command=='api':
-                from . import engineering_api
-                result=engineering_api.run(payload,runtime=runtime)
-            else:result={'environment':environment,'logs':logs,'capabilities':capabilities}[args.command](payload,runtime=runtime)
+            configured_home=os.environ.get('VIBECUE_HOME','')
+            home=Path(configured_home) if os.path.isabs(configured_home) else Path.home()/'Library/Application Support/VibeCue'
+            with tool_use_lock(home,nonblocking=True) as acquired:
+                if not acquired:raise EngineeringError('工程工具正在切换版本，请稍后重试。')
+                if args.command=='api':
+                    from . import engineering_api
+                    result=engineering_api.run(payload,runtime=runtime)
+                else:result={'environment':environment,'logs':logs,'capabilities':capabilities}[args.command](payload,runtime=runtime)
             result.setdefault('schema_version',SCHEMA_VERSION);result.setdefault('kind',args.command)
             print(json.dumps(result,ensure_ascii=False,separators=(',',':'),allow_nan=False))
             return 0
-        except (EngineeringError,ValueError,TypeError,OSError,RecursionError) as error:
+        except (EngineeringError,ToolInstallError,ValueError,TypeError,OSError,RecursionError) as error:
             result=response(args.command,'工程工具')
-            message=str(error) if isinstance(error,EngineeringError) else '输入无效或文件暂不可读，请检查所选内容后重试。'
+            message=str(error) if isinstance(error,(EngineeringError,ToolInstallError)) else '输入无效或文件暂不可读，请检查所选内容后重试。'
             result.update(status='cancelled' if runtime.cancelled else 'error',summary=message)
             print(json.dumps(result,ensure_ascii=False,separators=(',',':')))
             return 0

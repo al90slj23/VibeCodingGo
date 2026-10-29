@@ -63,3 +63,10 @@ The Python module imports the HTTP adapter only for an API command. The one-shot
 Input bounds are 256 KiB. Log reads are at most five files, 512 KiB each and 2 MiB combined, with no absolute-line-number rescan or continuous file watch. Only a bounded redacted tail reaches optional lnav, through private temporary files that are removed. HTTP previews/transport and Hurl collections have independent size/count/time limits. Missing optional engines produce honest capability/fallback output, not a fabricated successful engine result.
 
 Native geometry has an explicit identity (root size, kind, API mode, busy state and actual scroll viewports); unchanged layouts do not rewrite frames or TextKit sizes. Report changes and real viewport changes invalidate it without a timer. Counters report requests, applied passes and geometry writes. Native report preparation runs on utility work and caps the whole report at 96 KiB. Hidden/minimized/occluded completions can update cache but do not apply TextKit. Restoring visibility consumes that cache without relaunching a request. `performance.engineering` carries counts and state only. Future modules must retain these idle-zero and input/resource-bound properties; opening a tab is not authorization to start its work.
+
+
+## 工程工具自动更新（0.31.0）
+
+使用既有 CueActivityScheduler 的一个内存截止检查，启动延后两分钟。未到期、已有工作或工程/维护通道忙碌时不启动进程。到期复用 maintenance 槽和后台 QoS，单次总预算 145 秒，原生终止兜底 180 秒，子进程有输出和执行上限。
+
+状态页只读小型元数据，哈希和兼容测试在后台维护中执行。配置和维护状态各自有单调版本，页面与调度缓存拒绝旧回包。候选准备不占用运行使用锁；只有链接/清单提交取短暂独占锁，忙碌则缓存候选延期。没有新增独立定时器、工具守护服务或主线程目录扫描。

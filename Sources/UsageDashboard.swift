@@ -37,6 +37,7 @@ final class CueUsageClient {
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
                 process.arguments = ["-m", module] + arguments
                 process.currentDirectoryURL = runtime
+                if module == "vibecue.engineering_maintenance" { process.qualityOfService = .background }
                 let inherited = ProcessInfo.processInfo.environment
                 process.environment = Self.childEnvironment(inherited: inherited, module: module, home: home, runtime: runtime)
                 process.standardOutput = output; process.standardError = errors
@@ -46,7 +47,7 @@ final class CueUsageClient {
                 if self.stopped { self.lock.unlock(); throw Self.error("用量采集已停止。") }
                 do {
                     try process.run(); self.active[id] = process
-                    if module == "vibecue.engineering_tools" { self.engineeringProcesses.insert(id) }
+                    if Self.isEngineeringProcess(module) { self.engineeringProcesses.insert(id) }
                     self.lock.unlock()
                 }
                 catch { self.lock.unlock(); throw error }
@@ -64,9 +65,9 @@ final class CueUsageClient {
                 }
                 let timeout = DispatchWorkItem {
                     if process.isRunning { process.terminate() }
-                    if module == "vibecue.engineering_tools" { Self.ensureEngineeringTermination(process) }
+                    if Self.isEngineeringProcess(module) { Self.ensureEngineeringTermination(process) }
                 }
-                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + (arguments.first == "sync" ? 1800 : 60), execute: timeout)
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.executionTimeout(module: module, arguments: arguments), execute: timeout)
                 let outputLimit = module == "vibecue.usage_money" ? 25_165_824 : 8_388_608
                 var bytes = Data(), exceeded = false
                 while true {
@@ -88,6 +89,14 @@ final class CueUsageClient {
         }
     }
 
+    static func isEngineeringProcess(_ module: String) -> Bool {
+        ["vibecue.engineering_tools", "vibecue.engineering_maintenance"].contains(module)
+    }
+    static func executionTimeout(module: String, arguments: [String]) -> TimeInterval {
+        if module == "vibecue.engineering_maintenance", ["maintain", "check"].contains(arguments.first ?? "") { return 180 }
+        return arguments.first == "sync" ? 1800 : 60
+    }
+
     /// Explicit cancellation of a finite engineering read/request cannot leave
     /// a signal-ignoring Python worker holding its only resource slot forever.
     /// Other collectors retain their existing receipt and cancellation rules.
@@ -101,7 +110,7 @@ final class CueUsageClient {
     static func childEnvironment(inherited: [String: String], module: String, home: URL, runtime: URL) -> [String: String] {
         var environment: [String: String] = [:]
         var allowed = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "OPENCODE_DB", "VIBECUE_CC_SWITCH_QUOTA_FILE"]
-        if ["vibecue.network_tests", "vibecue.engineering_tools"].contains(module) {
+        if ["vibecue.network_tests", "vibecue.engineering_tools", "vibecue.engineering_maintenance"].contains(module) {
             allowed += ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]
         }
         for key in allowed { if let value = inherited[key] { environment[key] = value } }
@@ -119,7 +128,10 @@ final class CueUsageClient {
         let network = childEnvironment(inherited: fixture, module: "vibecue.network_tests", home: home, runtime: runtime)
         let usage = childEnvironment(inherited: fixture, module: "vibecue.usage", home: home, runtime: runtime)
         let engineering = childEnvironment(inherited: fixture, module: "vibecue.engineering_tools", home: home, runtime: runtime)
-        return ["network_transport_inherits_existing_proxy_and_bypass_configuration": network["HTTPS_PROXY"] == fixture["HTTPS_PROXY"] && network["all_proxy"] == fixture["all_proxy"] && network["NO_PROXY"] == "localhost",
+        let updater = childEnvironment(inherited: fixture, module: "vibecue.engineering_maintenance", home: home, runtime: runtime)
+        return ["engineering_update_workers_reuse_proxy_without_api_credentials": updater["HTTPS_PROXY"] == fixture["HTTPS_PROXY"] && updater["OPENAI_API_KEY"] == nil && updater["AUTHORIZATION"] == nil && updater["VIBECUE_HOME"] == home.path,
+                "engineering_update_deadlines_are_finite_without_changing_chat_or_sync": executionTimeout(module:"vibecue.engineering_maintenance",arguments:["check"]) == 180 && executionTimeout(module:"vibecue.engineering_maintenance",arguments:["status"]) == 60 && executionTimeout(module:"vibecue.codex_chat",arguments:["send"]) == 60 && executionTimeout(module:"vibecue.usage",arguments:["sync"]) == 1800,
+                "network_transport_inherits_existing_proxy_and_bypass_configuration": network["HTTPS_PROXY"] == fixture["HTTPS_PROXY"] && network["all_proxy"] == fixture["all_proxy"] && network["NO_PROXY"] == "localhost",
                 "network_transport_never_inherits_unrelated_api_credentials": network["OPENAI_API_KEY"] == nil && network["AUTHORIZATION"] == nil,
                 "engineering_transport_reuses_proxy_without_inheriting_api_credentials": engineering["HTTPS_PROXY"] == fixture["HTTPS_PROXY"] && engineering["OPENAI_API_KEY"] == nil && engineering["AUTHORIZATION"] == nil,
                 "engineering_tool_discovery_uses_only_absolute_path_entries": engineering["PATH"]?.split(separator: ":").allSatisfy { $0.hasPrefix("/") } == true && engineering["PATH"]?.contains("/opt/homebrew/bin") == true,

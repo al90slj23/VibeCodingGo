@@ -309,6 +309,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var networkTests: CueNetworkTestsController?
     var accountQuotaMonitor: CueAccountQuotaMonitor?
     private var menuUsage: CueMenuBarUsageMonitor?
+    var engineeringMaintenance: CueEngineeringMaintenanceMonitor?
     private var recoveryClient: CueUsageClient?
     private var conversationClient: CueUsageClient?
     private var conversationWindows: [String: CueConversationController] = [:]
@@ -418,6 +419,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         usageDashboard?.usageDidChange = { [weak menuUsage] in menuUsage?.refresh() }
         menuUsage.start()
         usageDashboard?.startBackgroundSync()
+        let engineeringMaintenance = CueEngineeringMaintenanceMonitor(home: home)
+        engineeringMaintenance.didUpdate = { [weak self] data in self?.settingsPanel?.engineeringSettingsController?.updateSnapshot(data) }
+        self.engineeringMaintenance = engineeringMaintenance; engineeringMaintenance.start()
         accountQuotaMonitor = CueAccountQuotaMonitor.shared(home: home)
         _ = accountQuotaMonitor?.observe { [weak self] in self?.writeStatus() }
         accountQuotaMonitor?.start()
@@ -1244,6 +1248,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         command("环境体检…", #selector(openEngineeringEnvironment), in: engineeringMenu)
         command("接口调试…", #selector(openEngineeringAPI), in: engineeringMenu)
         command("日志诊断…", #selector(openEngineeringLogs), in: engineeringMenu)
+        command("工具设置…", #selector(openEngineeringSettings), in: engineeringMenu)
         let panel = NSMenuItem(title: "打开工作台…", action: #selector(openWorkbench), keyEquivalent: ",")
         panel.target = self; menu.addItem(panel)
         let usage = NSMenuItem(title: "用量统计与请求日志…", action: #selector(openUsage), keyEquivalent: "u")
@@ -1381,6 +1386,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     @objc func openEngineeringEnvironment() { openWorkspacePage(.engineeringEnvironment) }
     @objc func openEngineeringAPI() { openWorkspacePage(.engineeringAPI) }
     @objc func openEngineeringLogs() { openWorkspacePage(.engineeringLogs) }
+    @objc func openEngineeringSettings() { openWorkspacePage(.engineeringSettings) }
     @objc func openCodingSettings() { openWorkspacePage(.codexSettings) }
     @objc func openTestSettings() { openWorkspacePage(.testSettings) }
     @objc func openGeneralSettings() { openWorkspacePage(.general) }
@@ -1528,7 +1534,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
             "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
             "codex_connection_state": codexConnectionState, "codex_connection_summary": codexConnectionSummary,
-            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "engineering": settingsPanel?.engineeringController?.performanceSnapshot ?? ["created": false], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
+            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "engineering": settingsPanel?.engineeringController?.performanceSnapshot ?? ["created": false], "engineering_updates": engineeringMaintenance?.performanceSnapshot ?? ["created": false], "engineering_settings": settingsPanel?.engineeringSettingsController?.performanceSnapshot ?? ["created": false], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
         let destination = home.appendingPathComponent("app-status.json")
         let write = {
@@ -1555,6 +1561,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         menuUsage?.stop()
         accountQuotaMonitor?.stop()
         usageDashboard?.stopBackgroundSync()
+        engineeringMaintenance?.stop()
+        settingsPanel?.engineeringSettingsController?.stop()
         settingsPanel?.engineeringController?.stop()
         conversationWindows.values.forEach { $0.stop() }; conversationClient?.stop(); recoveryClient?.stop()
         approvalLauncher?.terminate()
@@ -1612,6 +1620,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     var scheduleController: CueUsageScheduleController?
     var pricesController: CuePriceSourcesController?
     var engineeringController: CueEngineeringToolsController?
+    var engineeringSettingsController: CueEngineeringSettingsController?
     private var layingOut = false
     var healthLabel: NSTextField?
     var threadLabel: NSTextField?
@@ -1738,6 +1747,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .priceSources: pricesController?.deactivateEmbedded()
         case .networkTests, .networkIP, .networkDomain, .networkTrace, .networkPing, .networkHTTP, .networkSpeed: cue.networkTests?.stopEmbeddedWork()
         case .engineeringEnvironment, .engineeringAPI, .engineeringLogs: _ = engineeringController?.deactivateEmbedded()
+        case .engineeringSettings: _ = engineeringSettingsController?.deactivateEmbedded()
         default: break
         }
         return true
@@ -1752,6 +1762,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .usageSchedule: scheduleController?.activateEmbedded()
         case .priceSources: pricesController?.activateEmbedded()
         case .engineeringEnvironment, .engineeringAPI, .engineeringLogs: engineeringController?.activateEmbedded()
+        case .engineeringSettings: engineeringSettingsController?.activateEmbedded()
         default: break
         }
     }
@@ -1765,6 +1776,15 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         cue.populateTaskController(taskController, maximumHeight: max(430, pageScroll.contentSize.height))
     }
     private func embeddedPage(_ route: CueWorkspacePage) -> NSView? {
+        if route == .engineeringSettings {
+            if engineeringSettingsController == nil {
+                let controller = CueEngineeringSettingsController(home: cue.home)
+                controller.didChange = { [weak self] data in _ = self?.cue.engineeringMaintenance?.consumeSnapshot(data) }
+                if let data = cue.engineeringMaintenance?.snapshot { controller.updateSnapshot(data) }
+                engineeringSettingsController = controller
+            }
+            return engineeringSettingsController?.embeddedContentView()
+        }
         if let kind = route.engineeringKind {
             if engineeringController == nil { engineeringController = CueEngineeringToolsController(home: cue.home) }
             engineeringController?.selectKind(kind)
@@ -1820,7 +1840,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .usageSchedule: minimum = NSSize(width: 620, height: 385); fixed = true
         case .accountQuota: minimum = NSSize(width: 640, height: 420)
         case .codingTasks: minimum = NSSize(width: 680, height: 430)
-        case .engineeringEnvironment, .engineeringAPI, .engineeringLogs: minimum = NSSize(width: 860, height: 600)
+        case .engineeringEnvironment, .engineeringAPI, .engineeringLogs, .engineeringSettings: minimum = NSSize(width: 860, height: 600)
         default: if route.networkKind != nil { minimum = NSSize(width: 760, height: 430) }
         }
         let size = NSSize(width: max(minimum.width, pageScroll.contentSize.width), height: max(minimum.height, pageScroll.contentSize.height))
@@ -2447,10 +2467,11 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     func windowDidDeminiaturize(_ notification: Notification) { refreshVisibleEngineeringReport() }
     func windowDidChangeOcclusionState(_ notification: Notification) { refreshVisibleEngineeringReport() }
     private func refreshVisibleEngineeringReport() {
-        guard CueWorkspacePage.canonical(page).engineeringKind != nil,
+        guard (CueWorkspacePage.canonical(page).engineeringKind != nil || CueWorkspacePage.canonical(page) == .engineeringSettings),
               window?.isVisible == true, window?.isMiniaturized == false,
               window?.occlusionState.contains(.visible) == true else { return }
-        engineeringController?.activateEmbedded()
+        if CueWorkspacePage.canonical(page) == .engineeringSettings { engineeringSettingsController?.activateEmbedded() }
+        else { engineeringController?.activateEmbedded() }
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         window?.makeFirstResponder(nil)
@@ -2463,7 +2484,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     static func engineeringNavigationValidationReport() -> [String: Bool] {
         let cue = CueController(); cue.presentsWindows = false
         let controller = CueSettingsController(cue: cue)
-        let lazy = controller.engineeringController == nil && controller.primary.segmentCount == 4
+        let lazy = controller.engineeringController == nil && controller.engineeringSettingsController == nil && controller.primary.segmentCount == 4
         _ = controller.selectPage(CueWorkspacePage.engineeringEnvironment.rawValue)
         let tools = controller.engineeringController, firstView = controller.embeddedView
         _ = controller.selectPage(CueWorkspacePage.engineeringAPI.rawValue)
@@ -2472,12 +2493,15 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         let logs = controller.embeddedView === firstView && controller.secondary.selectedSegment == 2 && tools?.performanceSnapshot["selected_kind"] as? String == "logs"
         _ = controller.selectPage(CueWorkspacePage.workspace.rawValue)
         controller.primary.selectedSegment = 3; controller.changeModule(controller.primary)
-        let restored = controller.page == CueWorkspacePage.engineeringLogs.rawValue && controller.secondary.segmentCount == 3
+        let restored = controller.page == CueWorkspacePage.engineeringLogs.rawValue && controller.secondary.segmentCount == 4
         let idle = tools?.performanceSnapshot["requests_started"] as? Int == 0 && tools?.performanceSnapshot["client_created"] as? Bool == false && cue.usageDashboard == nil && cue.networkTests == nil
         controller.root.setFrameSize(NSSize(width: 960, height: 720)); controller.layoutWorkspace()
         let fits = controller.homeButton.frame.maxX <= controller.primary.frame.minX && controller.primary.frame.maxX <= controller.generalButton.frame.minX && controller.primary.frame.maxX <= 960
-        tools?.stop()
-        return ["engineering_workspace_does_not_construct_tools_before_navigation": lazy,
+        _ = controller.selectPage(CueWorkspacePage.engineeringSettings.rawValue)
+        let settingsEmbedded = controller.engineeringSettingsController?.window == nil && controller.embeddedView === controller.engineeringSettingsController?.embeddedContentView() && controller.secondary.selectedSegment == 3 && controller.engineeringSettingsController?.performanceSnapshot["update_requests"] as? Int == 0 && controller.engineeringSettingsController?.performanceSnapshot["clients_created"] as? Int == 0
+        controller.engineeringSettingsController?.stop(); tools?.stop()
+        return ["engineering_settings_share_workbench_without_eager_update_or_extra_window": settingsEmbedded,
+                "engineering_workspace_does_not_construct_tools_before_navigation": lazy,
                 "engineering_three_tabs_share_one_workbench_view_and_controller": api && logs,
                 "engineering_primary_tag_restores_its_selected_secondary_tag": restored,
                 "engineering_navigation_never_starts_collectors_or_other_modules": idle,
@@ -2509,6 +2533,9 @@ if CommandLine.arguments.contains("--ui-performance-measure") {
     checks.merge(CueWatcherProjectionReader.validationReport()) { _, new in new }
     checks.merge(CueWorkPipelineChecks.validationReport()) { _, new in new }
     checks.merge(CueEngineeringToolsController.validationReport()) { _, new in new }
+    checks.merge(CueEngineeringSettingsController.validationReport()) { _, new in new }
+    checks.merge(CueEngineeringMaintenanceMonitor.validationReport()) { _, new in new }
+    checks.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
     checks.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
     let measurement = CueStatusPopoverController.performanceMeasurement()
     checks["unchanged_list_does_not_rebuild"] = measurement["diff_rebuilds"] as? Int == 0
@@ -2530,6 +2557,9 @@ if let index = CommandLine.arguments.firstIndex(of: "--capture-engineering-fixtu
 if CommandLine.arguments.contains("--engineering-self-test") {
     _ = NSApplication.shared
     var results = CueEngineeringToolsController.validationReport()
+    results.merge(CueEngineeringSettingsController.validationReport()) { _, new in new }
+    results.merge(CueEngineeringMaintenanceMonitor.validationReport()) { _, new in new }
+    results.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
     results.merge(CueWorkspacePage.validationReport()) { _, new in new }
     results.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
@@ -2548,6 +2578,8 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results.merge(CueWatcherProjectionReader.validationReport()) { _, new in new }
     results.merge(CueWorkspacePage.validationReport()) { _, new in new }
     results.merge(CueEngineeringToolsController.validationReport()) { _, new in new }
+    results.merge(CueEngineeringSettingsController.validationReport()) { _, new in new }
+    results.merge(CueEngineeringMaintenanceMonitor.validationReport()) { _, new in new }
     results.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
     results.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
     results.merge(CueNetworkTestsController.validationReport()) { _, new in new }
