@@ -21,6 +21,7 @@ struct CueTaskDetail {
     private let recordedReasoningEffort: String
     private let recordedServiceTier: String
     private let selectedModel: String
+    private let selectedModelStatus: String
     private let selectedReasoningEffort: String
     private let selectedServiceTier: String
     private let selectedSpeedStatus: String
@@ -30,7 +31,7 @@ struct CueTaskDetail {
     private let currentSettingsVerifiedAt: Date?
     private let currentSettingsExpiresAt: Date?
     private let currentSettingsMessage: String
-    var model: String { currentSettingsReadable ? selectedModel : recordedModel }
+    var model: String { currentSettingsReadable ? (["default", "unknown"].contains(selectedModelStatus) ? "" : selectedModel) : recordedModel }
     var reasoningEffort: String { currentSettingsReadable ? selectedReasoningEffort : recordedReasoningEffort }
     var serviceTier: String { currentSettingsReadable ? selectedServiceTier : recordedServiceTier }
     let totalTokens: Int64?
@@ -64,6 +65,7 @@ struct CueTaskDetail {
         currentSettingsExpiresAt = Self.date(selected["expires_at"])
         currentSettingsMessage = Self.label(selected["message"] ?? selected["reason"], limit: 240)
         selectedModel = Self.label(selected["model"], limit: 180)
+        selectedModelStatus = Self.label(selected["model_status"], limit: 40)
         selectedReasoningEffort = Self.label(selected["reasoning_effort"], limit: 40)
         selectedServiceTier = Self.label(selected["service_tier"], limit: 40)
         selectedSpeedStatus = Self.label(selected["speed_status"], limit: 40)
@@ -145,9 +147,10 @@ struct CueTaskDetail {
         if let observed = currentSettingsObservedAt, !(-10...45).contains(Date().timeIntervalSince(observed)) { return false }
         return true
     }
-    private static func modelFields(model: String, effort: String, tier: String, speedStatus: String = "", complete: Bool = false) -> [String] {
+    private static func modelFields(model: String, effort: String, tier: String, modelStatus: String = "", speedStatus: String = "", complete: Bool = false) -> [String] {
         var fields: [String] = []
-        if !model.isEmpty, model != "unknown" { fields.append(model) }
+        if modelStatus == "default" { fields.append("模型跟随默认") }
+        else if modelStatus != "unknown", !model.isEmpty, model != "unknown" { fields.append(model) }
         else if complete { fields.append("模型未提供") }
         let effortNames = ["none": "无推理", "minimal": "极低强度", "low": "低强度", "medium": "中等强度", "high": "高强度", "xhigh": "特高强度", "max": "最高强度", "ultra": "Ultra 强度", "default": "默认强度"]
         if !effort.isEmpty, effort != "unknown" { fields.append(effortNames[effort] ?? effort) }
@@ -169,7 +172,7 @@ struct CueTaskDetail {
     }
     var secondaryLine: String {
         if currentSettingsReadable {
-            return (["当前"] + Self.modelFields(model: selectedModel, effort: selectedReasoningEffort, tier: selectedServiceTier, speedStatus: selectedSpeedStatus, complete: true)).joined(separator: " · ")
+            return (["当前"] + Self.modelFields(model: selectedModel, effort: selectedReasoningEffort, tier: selectedServiceTier, modelStatus: selectedModelStatus, speedStatus: selectedSpeedStatus, complete: true)).joined(separator: " · ")
         }
         let recorded = recordedSettingsLine
         if !recorded.isEmpty {
@@ -191,6 +194,7 @@ struct CueTaskDetail {
                 lines.append("连接核对时间：" + formatter.string(from: verified))
             }
             if currentSettingsStatus == "partial" { lines.append("Codex 尚未提供的字段保持未知，不用历史值补齐。") }
+            if selectedModelStatus == "default" { lines.append("没有显式模型覆盖，跟随 Codex 的默认选择；未推断实际默认模型。") }
             if selectedSpeedStatus == "default", selectedServiceTier.isEmpty { lines.append("没有显式速度覆盖，跟随 Codex 的默认选择；未推断为标准或闪电。") }
         } else {
             lines.append("当前选择暂不可核实；记录值仅表示已读到的本轮或上次执行设置。")
@@ -512,6 +516,10 @@ final class CueTaskHoverController: NSObject {
         let selected = CueTaskDetail(raw: ["status": "running", "model": "old-model", "reasoning_effort": "low", "service_tier": "default", "current_settings": selection, "total_tokens": 12345, "tokens_status": "partial"])
         var inherited = selection; inherited["service_tier"] = NSNull(); inherited["speed_status"] = "default"; inherited["reasoning_effort"] = "default"
         let inheritedDetail = CueTaskDetail(raw: ["current_settings": inherited])
+        var defaultModel = inherited; defaultModel["status"] = "partial"; defaultModel["model"] = NSNull(); defaultModel["model_status"] = "default"
+        let defaultModelDetail = CueTaskDetail(raw: ["model": "old-model", "current_settings": defaultModel])
+        var clearedSelection = selection; clearedSelection["status"] = "partial"; clearedSelection["model"] = NSNull(); clearedSelection["model_status"] = "unknown"; clearedSelection["reasoning_effort"] = NSNull(); clearedSelection["service_tier"] = NSNull(); clearedSelection["speed_status"] = "unknown"
+        let clearedSelectionDetail = CueTaskDetail(raw: ["model": "old-model", "reasoning_effort": "ultra", "service_tier": "priority", "current_settings": clearedSelection])
         var incomplete = selection; incomplete["status"] = "partial"; incomplete.removeValue(forKey: "reasoning_effort"); incomplete.removeValue(forKey: "service_tier")
         let incompleteDetail = CueTaskDetail(raw: ["model": "old-model", "reasoning_effort": "low", "service_tier": "fast", "current_settings": incomplete])
         var expired = selection; expired["observed_at"] = Date().addingTimeInterval(-120).timeIntervalSince1970
@@ -538,6 +546,8 @@ final class CueTaskHoverController: NSObject {
                        "task_detail_current_settings_do_not_change_numeric_usage": selected.totalTokens == 12345 && selected.tokensStatus == "partial",
                        "task_detail_current_fast_state_is_explicit": selected.secondaryLine.contains("闪电 Fast") && selected.secondaryLine.contains("Ultra 强度"),
                        "task_detail_null_speed_override_follows_default_without_guessing": inheritedDetail.secondaryLine.contains("速度跟随默认") && inheritedDetail.secondaryLine.contains("默认强度") && !inheritedDetail.secondaryLine.contains("标准速度") && !inheritedDetail.secondaryLine.contains("闪电"),
+                       "task_detail_null_model_override_follows_default_without_guessing": defaultModelDetail.model.isEmpty && defaultModelDetail.secondaryLine.contains("模型跟随默认") && !defaultModelDetail.secondaryLine.contains("模型未提供") && !defaultModelDetail.secondaryLine.contains("old-model") && defaultModelDetail.settingsTooltip.contains("未推断实际默认模型"),
+                       "task_detail_null_clear_removes_previous_model_effort_and_fast": clearedSelectionDetail.model.isEmpty && clearedSelectionDetail.reasoningEffort.isEmpty && clearedSelectionDetail.serviceTier.isEmpty && clearedSelectionDetail.secondaryLine.contains("模型未提供") && clearedSelectionDetail.secondaryLine.contains("强度未提供") && clearedSelectionDetail.secondaryLine.contains("速度未提供") && !clearedSelectionDetail.secondaryLine.contains("old-model") && !clearedSelectionDetail.secondaryLine.contains("current-model") && !clearedSelectionDetail.secondaryLine.contains("Ultra") && !clearedSelectionDetail.secondaryLine.contains("Fast"),
                        "task_detail_historical_null_normalization_never_proves_standard_speed": historicalDefault.secondaryLine.contains("速度跟随默认") && !historicalDefault.secondaryLine.contains("标准速度") && explicitDefaultDetail.secondaryLine.contains("标准速度"),
                        "task_detail_partial_current_settings_never_mix_historical_values": incompleteDetail.secondaryLine.contains("强度未提供") && incompleteDetail.secondaryLine.contains("速度未提供") && !incompleteDetail.secondaryLine.contains("低强度") && !incompleteDetail.secondaryLine.contains("Fast"),
                        "task_detail_expired_settings_are_not_presented_as_current": expiredDetail.secondaryLine.hasPrefix("当前不可读 · 上次记录") && !expiredDetail.secondaryLine.contains("current-model"),

@@ -62,6 +62,7 @@ private struct CueStatusListSnapshot {
     let activeThreadIDs: Set<String>
     let activeCount: Int
     let recoveryByThread: [String: CueRunningTask]
+    let deferredCount: Int
     var rowCount: Int { pinned.count + pinnedFollowups.count + running.count + interrupted.count + followups.count + ordinary.count }
     var sectionCount: Int { [!pinned.isEmpty || !pinnedFollowups.isEmpty, !running.isEmpty, !interrupted.isEmpty, !followups.isEmpty, !ordinary.isEmpty].filter { $0 }.count }
 
@@ -74,6 +75,7 @@ private struct CueStatusListSnapshot {
         let active = latestByThread.values.sorted(by: CueRunningTask.titleAscending)
         let activeIDs = Set(active.map(\.threadID))
         activeThreadIDs = activeIDs; activeCount = active.count
+        deferredCount = Set(followups.map(\.threadID)).subtracting(activeIDs).count
         pinned = records.filter(\.isPinned)
         let alertPinnedThreadIDs = Set(pinned.filter { $0.event.provider == "codex" }.map { $0.event.threadID })
         pinnedFollowups = followups.filter { $0.isPinned && !alertPinnedThreadIDs.contains($0.threadID) }
@@ -453,14 +455,14 @@ private final class CueRecentRowButton: NSButton {
                 switch field.identifier?.rawValue {
                 case "row-title": field.stringValue = record.event.title; field.textColor = record.isOpened ? .secondaryLabelColor : .labelColor
                 case "row-metadata": field.stringValue = "\(isRunning ? "上次提醒：" : "")\(kind) · \(date.string(from: record.event.date))\(record.isPinned ? " · 置顶" : "")"
-                case "row-state": field.stringValue = recovery?.recoveryLabel ?? (pending && record.isOpened ? (isRunning ? "运行中 · 待续" : "待续 · 置顶") : isRunning ? (record.isOpened ? "运行中 · 已打开" : "运行中 · 未读") : record.isOpened ? (record.manualPinned ? "已打开 · 置顶" : "已打开") : record.canOpen ? "未读 · 置顶" : "不可跳转"); field.textColor = recovery != nil ? .systemOrange : isRunning ? .systemGreen : pending && record.isOpened ? .systemPurple : tint
+                case "row-state": field.stringValue = recovery?.recoveryLabel ?? (isRunning ? (record.isOpened ? "运行中 · 已打开" : "运行中 · 未读") : pending && record.isOpened ? "待续 · 置顶" : record.isOpened ? (record.manualPinned ? "已打开 · 置顶" : "已打开") : record.canOpen ? "未读 · 置顶" : "不可跳转"); field.textColor = recovery != nil ? .systemOrange : isRunning ? .systemGreen : pending && record.isOpened ? .systemPurple : tint
                 default: break
                 }
             } else if let icon = view as? NSImageView, icon.identifier?.rawValue == "row-icon" {
                 icon.image = NSImage(systemSymbolName: record.isOpened ? (record.manualPinned ? "pin.fill" : "arrow.up.forward.app") : "circle.fill", accessibilityDescription: nil); icon.contentTintColor = tint
             }
         }
-        let state = pending && record.isOpened ? "待续" : record.isOpened ? "已查看" : "未读"
+        let state = pending && record.isOpened && !isRunning ? "待续" : record.isOpened ? "已查看" : "未读"
         setAccessibilityLabel("\(isRunning ? "当前正在运行，" : "")\(state)，\(record.isPinned ? "已置顶，" : "")\(kind)，\(record.event.title)，\(date.string(from: record.event.date))")
         if let recovery { toolTip = "\(record.event.title)\n\(recovery.recoveryLabel)：\(recovery.recoveryReason)\n打开对话不会自动清除此标记；继续运行后自动更新。" }
         needsDisplay = true
@@ -560,7 +562,7 @@ private final class CueRunningRowButton: NSButton {
     }
     func refreshFollowup(_ followup: CueThreadFollowup, running: Bool, recovery: CueRunningTask?) {
         self.followup = followup; live = running
-        let state = running ? (followup.unread ? "运行中 · 未读" : "运行中 · 待续") : recovery != nil ? (followup.unread ? "中断 · 未读" : "中断 · 待续") : followup.unread ? "未读 · 待续" : "待续"
+        let state = running ? (followup.unread ? "运行中 · 未读" : "运行中") : recovery != nil ? (followup.unread ? "中断 · 未读" : "中断 · 待续") : followup.unread ? "未读 · 待续" : "待续"
         let tint: NSColor = followup.unread ? .systemBlue : running ? .systemGreen : recovery != nil ? .systemOrange : .systemPurple
         let date = DateFormatter(); date.locale = Locale(identifier: "zh_CN"); date.dateFormat = Calendar.current.isDateInToday(followup.reviewedAt) ? "HH:mm" : "MM-dd HH:mm"
         for view in subviews {
@@ -776,7 +778,7 @@ final class CueStatusPopoverController: NSViewController {
         sound.identifier = NSUserInterfaceItemIdentifier("setting-sound")
         button(paused ? "恢复提醒" : "暂停 30 分钟", NSRect(x: panelWidth - 229, y: 116, width: 204, height: 30), #selector(pause)).identifier = NSUserInterfaceItemIdentifier("pause-button")
         label("任务与提醒", NSRect(x: 22, y: 163, width: 130, height: 23), size: 13, weight: .semibold)
-        label(batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(snapshot.activeCount) 运行 · \(snapshot.recoveryByThread.count) 中断 · \(history.followups.records.count) 待续 · 历史 \(history.ordinaryCount)/50", NSRect(x: 155, y: 165, width: panelWidth - 290, height: 20), size: 11, color: history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("task-counts")
+        label(batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(snapshot.activeCount) 运行 · \(snapshot.recoveryByThread.count) 中断 · \(snapshot.deferredCount) 待续 · 历史 \(history.ordinaryCount)/50", NSRect(x: 155, y: 165, width: panelWidth - 290, height: 20), size: 11, color: history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("task-counts")
         button(batchMode ? "退出批量" : "批量模式", NSRect(x: panelWidth - 122, y: 157, width: 98, height: 29), #selector(toggleBatchMode))
         if batchMode {
             let pinnedIDs = Set(frozenPinnedTargets.map(\.threadID))
@@ -923,7 +925,7 @@ final class CueStatusPopoverController: NSViewController {
                 switch field.identifier?.rawValue {
                 case "monitor-status": field.stringValue = status
                 case "task-counts":
-                    field.stringValue = batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(latest.activeCount) 运行 · \(latest.recoveryByThread.count) 中断 · \(history.followups.records.count) 待续 · 历史 \(history.ordinaryCount)/50"
+                    field.stringValue = batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(latest.activeCount) 运行 · \(latest.recoveryByThread.count) 中断 · \(latest.deferredCount) 待续 · 历史 \(history.ordinaryCount)/50"
                     field.textColor = history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor
                 case "panel-footer":
                     field.stringValue = footerText; field.textColor = footerColor
@@ -1149,6 +1151,7 @@ final class CueStatusPopoverController: NSViewController {
         followHistory.followups.setPinned(threadID: "follow-one", pinned: true)
         let pinnedSnapshot = CueStatusListSnapshot(records: [], runningTasks: [running("follow-one")], interruptedTasks: [], followups: followHistory.followups.records)
         results["pinned_followup_deduplicates_live_running_row"] = pinnedSnapshot.pinnedFollowups.count == 1 && pinnedSnapshot.running.isEmpty && pinnedSnapshot.followups.isEmpty
+        results["coordinated_running_chat_is_not_counted_as_deferred_and_keeps_bookmark"] = pinnedSnapshot.deferredCount == 0 && followHistory.followups.contains("follow-one")
         let visible = followRows?.first
         visible?.updateTrackingAreas()
         results["inactive_status_popover_rows_receive_hover_tracking"] = visible?.trackingAreas.contains(where: { $0.options.contains(.activeAlways) }) == true

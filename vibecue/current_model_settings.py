@@ -43,6 +43,15 @@ def _thread_settings(value):
     return result
 
 
+def _selection(*candidates):
+    """Use the first supplied selection, including null or invalid overrides.
+
+    Null means the desktop follows its default. It must not reveal an older
+    runtime model underneath that override. Missing keys alone allow fallback.
+    """
+    return next((container[key] for container, key in candidates if key in container), _INVALID)
+
+
 def unavailable_settings(*, reason='unavailable'):
     """No old value accompanies an unavailable result and can look current."""
     messages = {'not_resumed':'此对话尚未在 Codex 就绪，无法确认当前设置',
@@ -77,6 +86,16 @@ class ModelSettingsProjection:
         self.invalidated = False
 
     def apply(self, change):
+        try:
+            self._apply(change)
+        except ControlError:
+            # A rejected event breaks the proof that this owner projection is
+            # current. Heartbeats and later deltas cannot repair a missing
+            # snapshot or an unknown partial batch.
+            self.invalidate()
+            raise
+
+    def _apply(self, change):
         if not isinstance(change, dict):
             raise ControlError('模型设置更新无效')
         revision = change.get('revision')
@@ -98,6 +117,10 @@ class ModelSettingsProjection:
             readiness = _scalar(state.get('resumeState'), 40)
             self.resume_state = readiness if isinstance(readiness, str) else None
         elif kind == 'patches':
+            if self.invalidated:
+                raise ControlError('模型设置需要重新取得完整快照')
+            if not self._fresh(self.clock()):
+                raise ControlError('模型设置观察已过期，需要重新取得完整快照')
             if self.revision is None or change.get('baseRevision') != self.revision or revision <= self.revision:
                 raise ControlError('模型设置订阅出现版本缺口')
             patches = change.get('patches')
@@ -166,35 +189,45 @@ class ModelSettingsProjection:
                 target[key] = _scalar(value, 180 if path[1] == 'model' else 40)
 
     def mark_live(self, now=None):
+        now = self.clock() if now is None else now
         if self.revision is not None and not self.invalidated:
-            self.verified_at = self.clock() if now is None else now
+            if not self._fresh(now):
+                self.invalidate()
+                return
+            self.verified_at = now
 
     def invalidate(self):
         self.invalidated = True
         self.values.clear(); self.settings.clear()
 
+    def _fresh(self, now):
+        return (self.verified_at is not None and
+                self.verified_at - 5 <= now <= self.verified_at + self.ttl)
+
     def snapshot(self, now=None):
         now = self.clock() if now is None else now
-        if (self.invalidated or self.revision is None or self.verified_at is None or
-                now < self.verified_at - 5 or now > self.verified_at + self.ttl):
+        if self.invalidated or self.revision is None or not self._fresh(now):
             return unavailable_settings(reason='stale' if self.revision is not None else 'not_observed')
         if self.resume_state != 'resumed':
             return unavailable_settings(reason='Codex 对话尚未就绪' if self.resume_state else '尚未核实 Codex 对话的就绪状态')
         # Explicit next-turn selections survive running-turn runtime updates.
         # Runtime latest* fields must therefore only fill absent selections.
-        candidates = (self.settings.get('model'), self.settings.get('collaboration_model'),
-                      self.values.get('collaboration_model'), self.values.get('latestModel'))
-        model = None if self.settings.get('model') is _INVALID else next((value for value in candidates if isinstance(value, str)), None)
-        effort = self.settings.get('effort', self.settings.get('collaboration_effort',
-                 self.values.get('collaboration_effort', self.values.get('latestReasoningEffort', _INVALID))))
+        model = _selection((self.settings, 'model'), (self.settings, 'collaboration_model'),
+                           (self.values, 'collaboration_model'), (self.values, 'latestModel'))
+        model_status = 'default' if model is None else 'explicit' if isinstance(model, str) else 'unknown'
+        model = model if isinstance(model, str) else None
+        effort = _selection((self.settings, 'effort'), (self.settings, 'collaboration_effort'),
+                            (self.values, 'collaboration_effort'), (self.values, 'latestReasoningEffort'))
         effort = 'default' if effort is None else effort if isinstance(effort, str) else None
         tier = self.settings.get('serviceTier', _INVALID)
         speed_status = 'default' if tier is None else 'explicit' if isinstance(tier, str) else 'unknown'
         tier = tier if isinstance(tier, str) else None
         known = sum((model is not None, effort is not None, speed_status == 'explicit'))
-        return {'status': 'current' if known == 3 else 'partial' if known else 'unavailable',
+        has_default = model_status == 'default' or speed_status == 'default'
+        return {'status': 'current' if known == 3 else 'partial' if known or has_default else 'unavailable',
                 'source': SOURCE, 'thread_id': self.thread_id,
                 'owner_client_id': self.owner, 'revision': self.revision,
-                'model': model, 'reasoning_effort': effort, 'service_tier': tier,
+                'model': model, 'model_status': model_status,
+                'reasoning_effort': effort, 'service_tier': tier,
                 'speed_status': speed_status, 'observed_at': self.observed_at,
                 'verified_at': self.verified_at, 'expires_at': self.verified_at + self.ttl}

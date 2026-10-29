@@ -165,8 +165,24 @@ class TodaySummaryTests(unittest.TestCase):
         self.assertTrue(result['available'])
         self.assertNotIn('MUST-NOT-READ', json.dumps(result))
         self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), before)
-        self.assertEqual(set(self.home.iterdir()), files)
+        # SQLite can create its WAL coordination files even for mode=ro when
+        # the database is writable by its owner. These are engine sidecars,
+        # not application writes; immutable=1 would hide live committed WAL.
+        sidecars = {self.home / 'usage.sqlite3-wal', self.home / 'usage.sqlite3-shm'}
+        self.assertEqual(set(self.home.iterdir()) - sidecars, files - sidecars)
         self.assertFalse(any('SELECT *' in statement.upper() for statement in statements))
+
+    def test_readonly_summary_includes_live_committed_wal(self):
+        conn = self.ledger()
+        self.addCleanup(conn.close)
+        conn.execute('PRAGMA wal_autocheckpoint=0')
+        usage.write_request(conn, 'live-wal', self.now, 'codex', 'known', 'thread', [10, 2, 8, 0])
+        conn.commit()
+        self.assertTrue((self.home / 'usage.sqlite3-wal').exists())
+        result = self.summary()
+        self.assertTrue(result['available'])
+        self.assertEqual(result['summary']['requests'], 1)
+        self.assertEqual(result['summary']['total_tokens'], 20)
 
     def test_cli_emits_summary_command_and_invalid_cache_stays_unknown(self):
         (self.home / 'usage.sqlite3').write_bytes(b'not a database')

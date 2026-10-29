@@ -147,6 +147,13 @@ _JS_BLOCKING_INPUT = re.compile(r'\bawait\s+tools\.(?:functions__)?request_user_
 _INPUT_NAMES = frozenset(('request_user_input', 'request_user_input_async'))
 
 
+def local_turn_id(payload):
+    attribution = payload.get('turn_attribution')
+    # App-tool dispatch keeps the sender's root_turn_id on the receiving chat.
+    # That root is coordination provenance, never the receiver's active turn.
+    return str(payload.get('turn_id') or (attribution.get('turn_id') if isinstance(attribution, dict) else '') or '')
+
+
 class Interpreter:
     def __init__(self, metadata, emit, started_at=0):
         self.metadata = metadata
@@ -166,7 +173,11 @@ class Interpreter:
         self.activity_watermark = 0.0
         self.activity_terminal_at = 0.0
         self.activity_terminal_kind = ''
+        self.activity_terminal_turn_id = ''
         self.activity_work_at = 0.0
+        self.retired_turns = deque(maxlen=128)
+        self.runtime_state = None
+        self.runtime_only = False
         self.blocking_calls = set()
         self.context_readable = True
         self.details = TaskDetails()
@@ -183,7 +194,11 @@ class Interpreter:
         self.activity_started_at = self.last_activity = 0.0
         self.activity_watermark = self.activity_terminal_at = 0.0
         self.activity_terminal_kind = ''
+        self.activity_terminal_turn_id = ''
         self.activity_work_at = 0.0
+        self.retired_turns.clear()
+        self.runtime_state = None
+        self.runtime_only = False
         self.blocking_calls.clear()
         self.context_readable = False
         self.details.reset()
@@ -205,11 +220,13 @@ class Interpreter:
                         payload = item.get('payload', {})
                         if not isinstance(payload, dict):
                             continue
+                        if not self._accept_record(item):
+                            continue
                         self._observe_activity(item)
                         if self.main and is_main_source(self.metadata.source):
                             self.details.observe(item, record_time(item))
                         if record_time(item) is not None:
-                            turn_id = payload.get('turn_id') or payload.get('root_turn_id')
+                            turn_id = local_turn_id(payload)
                             if turn_id:
                                 self.turn_id = str(turn_id)
                     except (ValueError, TypeError):
@@ -217,6 +234,25 @@ class Interpreter:
             self.context_readable = True
         except OSError:
             pass
+
+    def _accept_record(self, item):
+        payload = item.get('payload')
+        if not isinstance(payload, dict) or item.get('type') == 'session_meta':
+            return True
+        timestamp = record_time(item)
+        if timestamp is not None and timestamp < self.activity_watermark:
+            return False
+        turn = local_turn_id(payload)
+        category, event_type = item.get('type'), payload.get('type')
+        if turn and turn in self.retired_turns:
+            return False
+        terminal = ((category == 'event_msg' and event_type in ('task_complete', 'task_completed', 'turn_aborted', 'task_aborted')) or
+                    (category == 'response_item' and event_type == 'message' and payload.get('role') == 'assistant' and payload.get('phase') == 'final_answer'))
+        if terminal and turn and self.activity_turn_id and turn != self.activity_turn_id and self.activity_state in ('running', 'waiting'):
+            return False
+        if category == 'turn_context' and self.activity_terminal_at and (not turn or turn == self.activity_terminal_turn_id):
+            return False  # A settings/context refresh cannot restart a finished turn.
+        return True
 
     def _observe_activity(self, item):
         payload = item.get('payload')
@@ -235,19 +271,27 @@ class Interpreter:
         timestamp = record_time(item)
         if timestamp is None or timestamp < self.activity_watermark:
             return
-        turn = str(payload.get('turn_id') or payload.get('root_turn_id') or '')
+        turn = local_turn_id(payload)
         starts = category == 'turn_context' or (category == 'event_msg' and event_type == 'task_started')
         ends = category == 'event_msg' and event_type in ('task_complete', 'task_completed', 'turn_aborted', 'task_aborted')
         final = category == 'response_item' and event_type == 'message' and payload.get('role') == 'assistant' and payload.get('phase') == 'final_answer'
         if ends or final:
-            if turn and self.activity_turn_id and turn != self.activity_turn_id:
-                return
+            self.activity_turn_id = turn or self.activity_turn_id
             self.activity_state = 'idle'
             self.activity_watermark = self.activity_terminal_at = timestamp
             self.activity_terminal_kind = event_type if ends else 'final_answer'
+            self.activity_terminal_turn_id = self.activity_turn_id
             self.blocking_calls.clear()
             return
         if starts:
+            same_turn = bool(turn and turn == self.activity_turn_id)
+            self.runtime_only = False
+            if same_turn and self.activity_state in ('running', 'waiting'):
+                # Running-turn steering/context refresh does not resolve an
+                # outstanding question or restart the current task's clock.
+                return
+            if turn and self.activity_turn_id and turn != self.activity_turn_id:
+                self.retired_turns.append(self.activity_turn_id)
             if self.activity_state == 'idle' or (turn and turn != self.activity_turn_id):
                 self.activity_started_at = timestamp
             self.activity_turn_id = turn or self.activity_turn_id or self.turn_id
@@ -287,6 +331,7 @@ class Interpreter:
         self.activity_turn_id = turn or self.activity_turn_id or self.turn_id
         self.activity_watermark = self.last_activity = timestamp
         self.activity_work_at = timestamp
+        self.runtime_only = False
         if blocking:
             self.activity_state = 'waiting'
             if call_id:
@@ -297,7 +342,8 @@ class Interpreter:
 
     def running_task(self, now=None):
         now = time.time() if now is None else now
-        if (self.activity_state != 'running' or not self.main or not self.context_readable or
+        if (self.activity_state != 'running' or not self.main or (not self.context_readable and not self.runtime_state) or
+                (self.runtime_only and not self.runtime_state) or
                 not is_main_source(self.metadata.source) or not -60 <= now - self.last_activity <= ACTIVITY_TTL):
             return None
         task = {'thread_id': self.metadata.thread_id, 'title': self.metadata.title,
@@ -311,8 +357,70 @@ class Interpreter:
     def detail_snapshot(self, now=None):
         if not self.main or not is_main_source(self.metadata.source):
             return None
-        return self.details.snapshot(self.metadata.thread_id, self.metadata.title, self.activity_state,
-                                     time.time() if now is None else now)
+        now = time.time() if now is None else now
+        detail = self.details.snapshot(self.metadata.thread_id, self.metadata.title, self.activity_state, now)
+        if detail and self.activity_turn_id and detail.get('turn_id') != self.activity_turn_id:
+            # A native start can arrive before its transcript. Never attach the
+            # previous turn's completed timer or usage totals to this new task.
+            detail.update(turn_id=self.activity_turn_id, started_at=self.activity_started_at,
+                          finished_at=None, status=self.activity_state, elapsed_status='partial',
+                          elapsed_seconds=max(0, now - self.activity_started_at),
+                          tokens_status='unknown', total_tokens=None, request_count=None,
+                          input_tokens=None, output_tokens=None, cache_read_tokens=None,
+                          cache_creation_tokens=None)
+        if detail and self.runtime_state and self.runtime_state['state'] in ('complete', 'aborted'):
+            detail.update(status=self.runtime_state['state'], finished_at=self.activity_terminal_at,
+                          elapsed_seconds=max(0, self.activity_terminal_at - (detail.get('started_at') or self.activity_terminal_at)))
+        return detail
+
+    def observe_runtime(self, state, now):
+        """Use owner state without emitting alerts or advancing file cursors.
+
+        A missing/disconnected snapshot supplies no terminal evidence. Completed
+        old turns cannot close a newer transcript turn or retained interruption.
+        """
+        self.runtime_state = None
+        if not isinstance(state, dict) or state.get('authoritative') is not True:
+            return
+        if (state.get('thread_id') != self.metadata.thread_id or
+                not isinstance(state.get('expires_at'), (int, float)) or state['expires_at'] < now or
+                not isinstance(state.get('observed_at'), (int, float)) or state['observed_at'] > now + 5):
+            return
+        turn, status = state.get('turn_id'), state.get('state')
+        if not isinstance(turn, str) or not turn or turn in self.retired_turns:
+            return
+        if status not in ('running', 'waiting', 'complete', 'aborted'):
+            return
+        same = turn == self.activity_turn_id
+        if status in ('complete', 'aborted'):
+            if not same:
+                return
+            # A snapshot of a long-completed chat has no authority to invent a
+            # new completion timestamp after a Codex restart.
+            finished = state.get('finished_at') or self.activity_terminal_at or state['observed_at']
+            self.activity_state = 'idle'
+            self.activity_terminal_at = finished
+            self.activity_terminal_kind = 'task_complete' if status == 'complete' else 'turn_aborted'
+            self.activity_terminal_turn_id = turn
+            self.blocking_calls.clear()
+        else:
+            if same and self.activity_terminal_turn_id == turn:
+                return  # An in-flight older active snapshot cannot undo final.
+            if same and status != self.activity_state and state['observed_at'] < self.activity_watermark:
+                return  # A previously observed native wait/run cannot undo newer work/input.
+            if not same:
+                if self.activity_turn_id:
+                    self.retired_turns.append(self.activity_turn_id)
+                self.activity_turn_id = self.turn_id = turn
+                self.activity_started_at = state.get('started_at') or state['observed_at']
+                self.activity_work_at = state['observed_at']
+                self.last_final = ''
+                self.runtime_only = True
+            self.activity_state = status
+            self.last_activity = max(self.last_activity, state.get('verified_at') or state['observed_at'])
+            if status == 'running':
+                self.blocking_calls.clear()
+        self.runtime_state = state
 
     def _discard_pending(self, dropped=False):
         _, event = self.pending.popleft()
@@ -360,6 +468,8 @@ class Interpreter:
         payload = item.get('payload') or {}
         if not isinstance(payload, dict):
             return
+        if not self._accept_record(item):
+            return
         category = item.get('type')
         event_type = payload.get('type')
         self._observe_activity(item)
@@ -370,11 +480,13 @@ class Interpreter:
         if not self.main:
             return
         if category == 'turn_context' or (category == 'event_msg' and event_type == 'task_started'):
-            self.turn_id = str(payload.get('turn_id') or payload.get('root_turn_id') or '')
-            self.last_final = ''
+            turn = local_turn_id(payload)
+            if turn and turn != self.turn_id:
+                self.turn_id = turn
+                self.last_final = ''
             return
         if category == 'event_msg' and event_type in ('task_complete', 'task_completed'):
-            self.turn_id = str(payload.get('turn_id') or payload.get('root_turn_id') or self.turn_id)
+            self.turn_id = local_turn_id(payload) or self.turn_id
             text = payload.get('last_agent_message') or payload.get('last_assistant_message') or self.last_final
             kind, message = classify_final_message(text)
             self.send(kind, message, completion_event_id(self.metadata.thread_id, self.turn_id))
@@ -389,7 +501,7 @@ class Interpreter:
             return
         if category != 'response_item':
             return
-        name = str(payload.get('name', '')).split('.')[-1]
+        name = str(payload.get('name', '')).split('.')[-1].removeprefix('functions__')
         call_id = str(payload.get('call_id') or payload.get('id') or '')
         if event_type == 'function_call' and name in _INPUT_NAMES:
             self.send('input', '有问题需要你回答',
@@ -563,6 +675,9 @@ class Watcher:
         approvals = approval_status(self.vibecue_home)
         self.desktop.set_stdio_connected(approvals['connected'])
         desktop = self.desktop.snapshot()
+        current_runtime = self.desktop.current_runtime()
+        if not isinstance(current_runtime, dict):
+            current_runtime = {}
         current_settings = self.desktop.current_settings()
         if not isinstance(current_settings, dict):
             current_settings = {}
@@ -575,29 +690,49 @@ class Watcher:
         tasks = []
         detail_rows = []
         observations = []
+        task_states = {}
         for tid, (tail, interpreter) in self.watched.items():
+            interpreter.observe_runtime(current_runtime.get(tid), now)
             task = interpreter.running_task(now)
-            if task and not tail.read_error and tid not in waiting_approval:
+            readable = (not bool(tail.read_error) and interpreter.context_readable) or bool(interpreter.runtime_state)
+            if task and readable and tid not in waiting_approval:
                 task['last_work_at'] = interpreter.activity_work_at
             else:
                 task = None
             observations.append({'thread_id': tid, 'task': task,
                                  'state': interpreter.activity_state,
                                  'watermark': interpreter.activity_watermark,
-                                 'terminal_at': interpreter.activity_terminal_at,
+                                 'terminal_at': max(interpreter.activity_terminal_at,
+                                                    interpreter.runtime_state['observed_at'] if interpreter.runtime_state and interpreter.runtime_state['state'] in ('complete', 'aborted') else 0),
+                                 'terminal_turn_id': interpreter.activity_terminal_turn_id,
                                  'terminal_kind': interpreter.activity_terminal_kind,
-                                 'source_readable': not bool(tail.read_error) and interpreter.context_readable,
+                                 'source_readable': readable,
                                  'source_kind': 'cli' if interpreter.metadata.source in ('cli', 'exec') else 'desktop',
                                  'transcript_path': str(interpreter.metadata.path)})
+            runtime = interpreter.runtime_state or {}
+            state_name = 'waiting' if tid in waiting_approval else interpreter.activity_state
+            if state_name == 'idle' and interpreter.activity_terminal_kind:
+                state_name = 'aborted' if interpreter.activity_terminal_kind in ('turn_aborted', 'task_aborted') else 'complete'
+            task_states[tid] = {'thread_id': tid, 'turn_id': interpreter.activity_turn_id,
+                                'state': state_name,
+                                'work_at': interpreter.activity_work_at, 'started_at': interpreter.activity_started_at,
+                                'source': runtime.get('source', 'local-transcripts'),
+                                'observed_at': runtime.get('observed_at', interpreter.activity_watermark),
+                                'expires_at': runtime.get('expires_at'),
+                                'authoritative': bool(runtime) or (readable and (state_name not in ('running', 'waiting') or
+                                                                              -60 <= now - interpreter.last_activity <= ACTIVITY_TTL))}
             detail = interpreter.detail_snapshot(now)
             if detail:
                 detail['current_settings'] = current_settings.get(tid, unavailable_settings(reason='尚未取得此对话的 Codex 当前设置'))
-                detail['source_readable'] = not bool(tail.read_error) and interpreter.context_readable
+                detail['source_readable'] = readable
                 if tid in waiting_approval:
                     detail['status'] = 'waiting'
                 detail_rows.append(detail)
         tasks, interrupted = self.recovery.reconcile(observations, codex_process_snapshot(now), now,
                                                      waiting=waiting_approval)
+        for row in interrupted:
+            if row['thread_id'] in task_states:
+                task_states[row['thread_id']].update(state=row['status'], authoritative=False)
         details_by_id = {row['thread_id']: row for row in detail_rows}
         for row in interrupted:
             detail = details_by_id.get(row['thread_id'])
@@ -612,6 +747,7 @@ class Watcher:
             'task_recovery_error': self.recovery.error,
             'task_details': bounded_details(detail_rows),
             'current_model_settings': current_settings,
+            'current_task_states': task_states,
             'source': 'local-transcripts', 'provider': 'codex',
             'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'durable-interrupted-task-recovery', 'per-turn-usage', 'visible-conversation-preview', 'auto-desktop-connection', 'desktop-attention-stream', 'current-model-settings'],
             'permission_status': 'connected' if approvals['connected'] else 'auto-reconnecting',

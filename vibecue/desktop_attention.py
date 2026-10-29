@@ -16,6 +16,7 @@ import time
 
 from .codex_control import ControlError, THREAD_ID
 from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable
+from .codex_runtime import RuntimeProjection
 from .current_model_settings import ModelSettingsProjection, unavailable_settings
 from .events import emit_event, emit_resolution, event_identifier, input_event_id
 from .providers.approval_bridge import APPROVAL_METHODS, INPUT_METHODS, SETTLE_SECONDS
@@ -60,6 +61,7 @@ class AttentionProjection:
         self.revision = None
         self.requests = []
         self.settings = ModelSettingsProjection(thread, owner)
+        self.runtime = RuntimeProjection(thread, owner)
 
     def apply(self, change):
         if not isinstance(change, dict):
@@ -85,6 +87,7 @@ class AttentionProjection:
         else:
             raise ControlError('对话订阅更新类型尚未核对')
         self.settings.apply(change)
+        self.runtime.apply(change)
         self.revision = revision
 
     def _patch(self, patch):
@@ -158,11 +161,15 @@ class DesktopAttentionMonitor:
 
     def update(self, projection):
         observed = set()
+        runtime = projection.runtime.snapshot()
         for request in projection.requests:
             method = request.get('method')
             if method not in REQUEST_METHODS or 'id' not in request or request.get('completed') is True:
                 continue
             params = request.get('params', {})
+            if runtime.get('authoritative') and (runtime['state'] in ('complete', 'aborted') or
+                    (params.get('turnId') and params['turnId'] != runtime.get('turn_id'))):
+                continue
             thread = params.get('threadId') or params.get('conversationId')
             if thread and thread != projection.thread:
                 continue
@@ -194,6 +201,10 @@ class DesktopAttentionMonitor:
         for key in list(self.pending):
             if thread is None or key[0] == thread:
                 self._forget(key)
+
+    def settled_pending(self):
+        return [pending for pending in self.pending.values()
+                if self.clock() - pending.observed >= SETTLE_SECONDS]
 
     def flush(self):
         if not self.emit_enabled:
@@ -337,7 +348,7 @@ class DesktopAttentionService:
             health = dict(self._health, capabilities=dict(self._health['capabilities']))
             if self._thread and self._thread.is_alive():
                 health['last_seen'] = time.time()  # Live helper health, even during retry backoff.
-            pending = list(self.monitor.pending.values())
+            pending = self.monitor.settled_pending()
             health.update(pending_count=len(pending), pending_thread_ids=sorted({item.thread for item in pending}),
                           live_sources=1 if health['connected'] else 0, source='codex-desktop-owner-stream',
                           subscribed_threads=sum(projection.revision is not None for projection in self.projections.values()),
@@ -358,6 +369,26 @@ class DesktopAttentionService:
                 else:
                     reason = self.unavailable_reasons.get(thread) or ('此对话的 Codex 快照暂不可读' if self.quarantine_until.get(thread, 0) > time.monotonic() else '正在读取此对话的 Codex 当前设置')
                     result[thread] = unavailable_settings(reason=reason)
+            return result
+
+    def current_runtime(self):
+        """Export only current, owner-bound turn states on a live connection."""
+        with self._lock:
+            if not self._health['connected']:
+                return {}
+            waiting = {pending.thread for pending in self.monitor.settled_pending()}
+            result = {}
+            for thread, projection in self.projections.items():
+                if projection.revision is None:
+                    continue
+                state = projection.runtime.snapshot()
+                # Approval review can resolve automatically in milliseconds.
+                # Only a surviving protocol request is a human wait.
+                if state.get('state') == 'waiting' and thread not in waiting:
+                    state = dict(state, state='running')
+                elif state.get('state') in ('running', 'waiting') and thread in waiting:
+                    state = dict(state, state='waiting')
+                result[thread] = state
             return result
 
     def _on_message(self, message):
@@ -412,7 +443,8 @@ class DesktopAttentionService:
         for thread in existing:
             projection = self.projections[thread]
             missing_snapshot = projection.revision is None and time.monotonic() - self.subscribed_at.get(thread, 0) > 5
-            if thread not in desired or missing_snapshot:
+            invalidated = projection.settings.invalidated or projection.runtime.invalidated
+            if thread not in desired or missing_snapshot or invalidated:
                 with self._lock:
                     projection = self.projections.pop(thread)
                     if missing_snapshot:
@@ -420,6 +452,8 @@ class DesktopAttentionService:
                 self._follow(thread, projection.owner, False)
                 with self._lock:
                     self.monitor.gap(thread)
+                    if invalidated:
+                        self.next_discovery.pop(thread, None)
         # Do not send another discovery while a full initial snapshot is in
         # flight: this keeps size/gap attribution local to one candidate.
         if any(projection.revision is None for projection in self.projections.values()):
@@ -497,6 +531,7 @@ class DesktopAttentionService:
                             # Preserve the original setting observation time.
                             for projection in self.projections.values():
                                 projection.settings.mark_live()
+                                projection.runtime.mark_live()
                             self._health['last_seen'] = time.time()
             except (ControlError, OSError, ValueError, TypeError, RecursionError, OverflowError) as error:
                 message = str(error) if isinstance(error, ControlError) else 'Codex 连接暂不可用，正在自动重试'

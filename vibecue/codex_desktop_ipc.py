@@ -19,6 +19,7 @@ import uuid
 
 from .codex_control import ControlError, UnconfirmedUpdate, THREAD_ID
 from .events import codex_directory
+from .codex_runtime import latest_turn, status_metadata
 
 
 MAX_FRAME = 8 * 1024 * 1024
@@ -105,41 +106,13 @@ def _uuid(value):
 
 
 def _status_copy(value):
-    if not isinstance(value, dict):
-        return {}
-    result = {}
-    if isinstance(value.get('type'), str):
-        result['type'] = value['type'][:40]
-    flags = value.get('activeFlags')
-    if isinstance(flags, list) and len(flags) <= 20 and all(isinstance(item, str) and len(item) <= 80 for item in flags):
-        result['activeFlags'] = list(flags)
-    elif value.get('type') == 'active' or 'activeFlags' in value:
-        result['activeFlags'] = None
-    return result
+    return status_metadata(value)
 
 
 def _snapshot_metadata(state, thread, owner, revision):
     if not isinstance(state, dict) or state.get('id') not in (None, thread):
         raise ControlError('Codex 返回的对话与所选项不一致')
-    turns = state.get('turns') if isinstance(state.get('turns'), list) else []
-    last = next((row for row in reversed(turns) if isinstance(row, dict)), {})
-    canonical = state.get('turnHistory')
-    if isinstance(canonical, dict) and canonical.get('kind') == 'canonical':
-        history = canonical.get('history')
-        if isinstance(history, dict):
-            entities, islands = history.get('entitiesByKey'), history.get('islands')
-            if isinstance(entities, dict) and isinstance(islands, list):
-                last = {}
-                for island in reversed(islands):
-                    if not isinstance(island, dict) or not isinstance(island.get('entries'), list):
-                        continue
-                    for entry in reversed(island['entries']):
-                        key = entry.get('value') if isinstance(entry, dict) else None
-                        row = entities.get(key) if isinstance(key, str) else None
-                        if isinstance(row, dict):
-                            last = row; break
-                    if last:
-                        break
+    last = latest_turn(state)
     last_turn = {key: str(last[key])[:160] for key in ('turnId', 'status') if isinstance(last.get(key), str)}
     requests = state.get('requests')
     pending = not isinstance(requests, list) or any(not isinstance(row, dict) or row.get('completed') is not True for row in requests)

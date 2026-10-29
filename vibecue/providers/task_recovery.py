@@ -258,7 +258,9 @@ class TaskRecovery:
             watermark = finite(observation.get('watermark'))
             terminal = finite(observation.get('terminal_at'))
             terminal_kind = observation.get('terminal_kind')
-            if row and ((observation.get('state') == 'idle' and terminal >= row['last_activity'] and terminal and terminal_kind not in ('turn_aborted', 'task_aborted')) or
+            terminal_turn = observation.get('terminal_turn_id')
+            matching_terminal = not terminal_turn or not row or terminal_turn == row['turn_id']
+            if row and ((observation.get('state') == 'idle' and matching_terminal and terminal >= row['last_activity'] and terminal and terminal_kind not in ('turn_aborted', 'task_aborted')) or
                         (observation.get('state') == 'waiting' and watermark >= row['last_activity']) or tid in waiting):
                 self.records.pop(tid, None)
                 continue
@@ -268,7 +270,7 @@ class TaskRecovery:
             runtime_known = runtime.get('available') is True
             lost = bool(old_ids and runtime_known and old_ids.isdisjoint(owner_ids))
             changed = bool(old_ids and runtime_known and old_ids != owner_ids)
-            if row and observation.get('state') == 'idle' and terminal and terminal >= row['last_activity'] and terminal_kind in ('turn_aborted', 'task_aborted'):
+            if row and observation.get('state') == 'idle' and matching_terminal and terminal and terminal >= row['last_activity'] and terminal_kind in ('turn_aborted', 'task_aborted'):
                 row['last_seen_at'] = min(row['last_seen_at'], terminal)
                 self._interrupt(row, 'interrupted', 'previous_turn_aborted', terminal)
                 continue

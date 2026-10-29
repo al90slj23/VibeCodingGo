@@ -24,15 +24,17 @@ import time
 import uuid
 
 from .events import vibecue_directory, codex_directory
-from . import usage_opencode
+from . import usage_opencode, usage_ccswitch
 
 SCHEMA_VERSION = 1
 CODEX_IMPORT_VERSION = 4
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 TOKEN_COLUMNS = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens')
-APPS = {'codex': 'Codex', 'claude': 'Claude Code', 'opencode': 'OpenCode'}
+APPS = dict(usage_ccswitch.APP_NAMES)
 SOURCES = {'codex_session': 'Codex · 本地会话', 'claude_session': 'Claude Code · 本地会话',
-           'opencode_session': 'OpenCode · 本地会话'}
+           'opencode_session': 'OpenCode · 本地会话', 'ccswitch:proxy': 'CC Switch · 代理请求',
+           'ccswitch:session_log': 'CC Switch · 会话日志', 'ccswitch:gemini_session': 'CC Switch · Gemini 会话',
+           'ccswitch:archive': 'CC Switch · 归档日汇总'}
 
 
 def stamp(value):
@@ -113,7 +115,7 @@ def source_roots(home):
     result = []
     seen = set()
     for app in APPS:
-        for root in roots[app + '_roots']:
+        for root in roots.get(app + '_roots', []):
             path = Path(root).expanduser().resolve()
             # Accept a tool configuration root as well as its log directory.
             if app == 'codex' and (path / 'sessions').is_dir():
@@ -156,6 +158,12 @@ def connect(home):
       CREATE INDEX IF NOT EXISTS usage_models ON usage_requests(app, model, timestamp);
       CREATE INDEX IF NOT EXISTS usage_sources ON usage_requests(source, timestamp);
       CREATE INDEX IF NOT EXISTS usage_threads ON usage_requests(app, thread_id);
+      CREATE INDEX IF NOT EXISTS usage_dates ON usage_requests(date);
+      CREATE TABLE IF NOT EXISTS usage_archived_daily (
+        id TEXT PRIMARY KEY,timestamp REAL NOT NULL,app TEXT NOT NULL,source TEXT NOT NULL,
+        model TEXT NOT NULL,date TEXT NOT NULL,request_count INTEGER NOT NULL,
+        input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cache_read_tokens INTEGER NOT NULL,
+        cache_creation_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,provider_id TEXT,provider_name TEXT);
       CREATE TABLE IF NOT EXISTS usage_codex_sessions (
         id TEXT PRIMARY KEY, created REAL, parent TEXT, complete INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS usage_codex_snapshots (
@@ -172,6 +180,12 @@ def connect(home):
       CREATE INDEX IF NOT EXISTS usage_codex_timeline_order
         ON usage_codex_timeline(session_id,timestamp,position);
     ''')
+    usage_ccswitch.ensure_schema(conn)
+    # Most detail rows are session mirrors with synthetic provider IDs. A
+    # partial index keeps real provider grouping independent of that volume.
+    conn.execute("""CREATE INDEX IF NOT EXISTS usage_details_real_provider
+      ON usage_request_details(provider_id,request_id)
+      WHERE provider_id IS NOT NULL AND provider_id<>'' AND substr(provider_id,1,1)<>'_'""")
     conn.commit()
     return conn
 
@@ -808,10 +822,12 @@ def sync(home=None):
                     report['files_scanned'] += 1
                     if time.monotonic()-last_progress>.5:
                         set_meta(conn,'sync',report);conn.commit();last_progress=time.monotonic()
+                report['ccswitch'] = usage_ccswitch.sync(conn)
+                conn.commit()
                 for app in APPS:
                     count = sum(1 for a,p in files if a==app)
                     requests = conn.execute('SELECT COUNT(*) FROM usage_requests WHERE app=?',(app,)).fetchone()[0]
-                    report['coverage'].append({'app':app,'name':APPS[app],'available':app_available[app],
+                    report['coverage'].append({'app':app,'name':APPS[app],'available':app_available[app] or requests > 0,
                                                'files':count,'requests':requests})
                 if report['compressed_skipped']:
                     report['warnings'].append('部分 .zst 压缩日志未导入：本机未找到 zstd 解码器')
@@ -841,90 +857,318 @@ def sync(home=None):
     return query(home)
 
 
-def query(home=None, period='all', app='all', model='all', source='all', page=1,page_size=50,view='logs',now=None):
+TOTAL_COLUMNS = ('requests',) + TOKEN_COLUMNS + ('total_tokens',)
+REAL_PROVIDER = "d.provider_id IS NOT NULL AND d.provider_id<>'' AND substr(d.provider_id,1,1)<>'_'"
+
+
+def _usage_totals(rows):
+    result = {key: sum(row[key] for row in rows) for key in TOTAL_COLUMNS}
+    cacheable = result['input_tokens'] + result['cache_read_tokens'] + result['cache_creation_tokens']
+    result['cache_hit_rate'] = result['cache_read_tokens'] / cacheable if cacheable else 0
+    result['tokens'] = result['total_tokens']
+    return result
+
+
+def _date_argument(value):
+    try:
+        parsed = datetime.strptime(value, '%Y-%m-%d')
+        if parsed.date().isoformat() != value:
+            raise ValueError
+        return parsed
+    except (ValueError, TypeError):
+        raise ValueError('日期需要是 YYYY-MM-DD') from None
+
+
+def _selection(period, now, start_date, end_date):
+    current = datetime.fromtimestamp(now)
+    midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    start, exclusive = None, None
+    if period == 'today':
+        start = midnight.timestamp()
+    elif period == 'yesterday':
+        start, exclusive = (midnight - timedelta(days=1)).timestamp(), midnight.timestamp()
+    elif period in ('1d', '7d', '30d', '90d'):
+        start = now - int(period[:-1]) * 86400
+    elif period == 'month':
+        start = midnight.replace(day=1).timestamp()
+    elif period == 'year':
+        start = midnight.replace(month=1, day=1).timestamp()
+    elif period == 'custom':
+        first, last = _date_argument(start_date), _date_argument(end_date)
+        if first > last:
+            raise ValueError('开始日期不能晚于结束日期')
+        start, exclusive = first.timestamp(), (last + timedelta(days=1)).timestamp()
+    elif period != 'all':
+        raise ValueError('无效的日期范围')
+    return current, start, exclusive
+
+
+def _filter_clauses(app, model, source, provider, status):
+    clauses, params = [], []
+    for field, value in [('app', app), ('model', model), ('source', source)]:
+        if value and value != 'all':
+            clauses.append('r.' + field + '=?'); params.append(value)
+    if provider and provider != 'all':
+        parts = provider.split('|', 1)
+        if len(parts) != 2 or not all(parts):
+            raise ValueError('供应商标识无效')
+        provider_app, identity = parts
+        clauses.append('r.app=?'); params.append(provider_app)
+        if identity.startswith('source:'):
+            clauses.append('r.source=?'); params.append(identity[len('source:'):])
+            clauses.append('NOT EXISTS (SELECT 1 FROM usage_request_details d WHERE d.request_id=r.id AND ' + REAL_PROVIDER + ')')
+        else:
+            clauses.append('EXISTS (SELECT 1 FROM usage_request_details d WHERE d.request_id=r.id AND ' + REAL_PROVIDER + ' AND d.provider_id=?)')
+            params.append(identity)
+    if status and status != 'all':
+        if status == 'unknown':
+            clauses.append('NOT EXISTS (SELECT 1 FROM usage_request_details d WHERE d.request_id=r.id AND d.status_code IS NOT NULL)')
+        else:
+            condition = {'success': 'd.status_code BETWEEN 200 AND 299',
+                         'error': 'd.status_code BETWEEN 400 AND 599',
+                         'failed': 'd.status_code BETWEEN 400 AND 599'}.get(status)
+            if condition is None:
+                if not isinstance(status, str) or not status.isascii() or not status.isdigit() or not 100 <= int(status) <= 599:
+                    raise ValueError('无效的请求状态')
+                condition = 'd.status_code=?'; params.append(int(status))
+            clauses.append('EXISTS (SELECT 1 FROM usage_request_details d WHERE d.request_id=r.id AND ' + condition + ')')
+    return clauses, params
+
+
+def _where(clauses):
+    return ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+
+
+def _provider_groups(conn, price_groups, clauses, params, sums):
+    # Fold ordinary app/source/model aggregates, then move only rows carrying a
+    # real provider ID out of their source fallback. No full-ledger LEFT JOIN.
+    residual = {(r['app'], r['source'], r['model']): dict(r) for r in price_groups}
+    actual = [dict(row) for row in conn.execute(
+        'SELECT r.app,r.source,r.model,d.provider_id,MAX(d.provider_name) AS provider_name,COUNT(*) AS requests,' + sums +
+        ' FROM usage_request_details d INDEXED BY usage_details_real_provider JOIN usage_requests r ON r.id=d.request_id' +
+        _where([REAL_PROVIDER] + clauses) + ' GROUP BY r.app,r.source,r.model,d.provider_id', params)]
+    groups = []
+    for row in actual:
+        remaining = residual[(row['app'], row['source'], row['model'])]
+        for key in TOTAL_COLUMNS:
+            remaining[key] -= row[key]
+        row['provider_key'] = row['app'] + '|' + row['provider_id']
+        row['provider_name'] = row['provider_name'] or row['provider_id']
+        groups.append(row)
+    for row in residual.values():
+        if not row['requests']:
+            continue
+        row['provider_key'] = row['app'] + '|source:' + row['source']
+        row['provider_id'] = None
+        row['provider_name'] = '会话日志' if row['source'].endswith('_session') else '未记录'
+        groups.append(row)
+    return groups
+
+
+def _fold_groups(rows, columns):
+    folded = {}
+    for row in rows:
+        key = tuple(row[column] for column in columns)
+        target = folded.setdefault(key, dict(zip(columns, key), **{column: 0 for column in TOTAL_COLUMNS}))
+        for column in TOTAL_COLUMNS:
+            target[column] += row[column]
+    return sorted(folded.values(), key=lambda row: (-row['total_tokens'],) + tuple(str(row[column]) for column in columns))
+
+
+def _archived_groups(conn, app, model, source, provider, status, now):
+    # These are known daily residual totals, never fabricated request rows.
+    if status not in ('all', 'unknown', None, ''):
+        return []
+    clauses, params = ['r.timestamp<=?'], [now]
+    for field, value in [('app', app), ('model', model), ('source', source)]:
+        if value and value != 'all':
+            clauses.append('r.' + field + '=?'); params.append(value)
+    rows = []
+    for raw in conn.execute('SELECT r.* FROM usage_archived_daily r' + _where(clauses), params):
+        row = dict(raw, requests=raw['request_count'])
+        real = row.get('provider_id') and not row['provider_id'].startswith('_')
+        row['provider_key'] = row['app'] + '|' + (row['provider_id'] if real else 'source:' + row['source'])
+        row['provider_id'] = row['provider_id'] if real else None
+        row['provider_name'] = (row.get('provider_name') or row['provider_id']) if real else ('会话日志' if row['source'].endswith('_session') else '未记录')
+        if provider and provider != 'all' and provider != row['provider_key']:
+            continue
+        rows.append(row)
+    return rows
+
+
+def query(home=None, period='all', app='all', model='all', source='all', page=1, page_size=50,
+          view='logs', now=None, heatmap_weeks=53, start_date=None, end_date=None,
+          provider='all', status='all'):
     home = vibecue_directory(home)
     now = time.time() if now is None else float(now)
-    end = datetime.fromtimestamp(now)
-    start = None
-    if period=='today':
-        start = end.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
-    elif period in ('7d','30d'):
-        start = now-int(period[:-1])*86400
-    clauses, params = [],[]
-    for field,value in [('app',app),('model',model),('source',source)]:
-        if value and value!='all':
-            clauses.append(field+'=?');params.append(value)
-    base_clauses,base_params = list(clauses),list(params)
+    if not math.isfinite(now):
+        raise ValueError('无效的查询时间')
+    current, start, exclusive = _selection(period, now, start_date, end_date)
+    if view not in ('logs', 'models', 'providers', 'sources'):
+        raise ValueError('无效的用量视图')
+    heatmap_weeks = min(530, max(53, int(heatmap_weeks)))
+    # Calendar sections begin on Monday; expanding by 53 weeks moves the
+    # boundary by an exact 371 days and agrees with the native calendar grid.
+    today = current.date()
+    heat_start = today - timedelta(days=today.weekday() + (heatmap_weeks - 1) * 7)
+    base_clauses, base_params = _filter_clauses(app, model, source, provider, status)
+    clauses, params = list(base_clauses), list(base_params)
     if start is not None:
-        clauses.append('timestamp>=?');params.append(start)
-    clauses.append('timestamp<=?');params.append(now)
-    where = ' WHERE '+' AND '.join(clauses)
-    page = max(1,int(page));page_size=min(200,max(1,int(page_size)))
-    sums = ','.join('COALESCE(SUM('+key+'),0) AS '+key for key in TOKEN_COLUMNS+('total_tokens',))
+        clauses.append('r.timestamp>=?'); params.append(start)
+    if exclusive is not None:
+        clauses.append('r.timestamp<?'); params.append(exclusive)
+    clauses.append('r.timestamp<=?'); params.append(now)
+    where = _where(clauses)
+    page = max(1, int(page)); page_size = min(200, max(1, int(page_size)))
+    sums = ','.join('COALESCE(SUM(r.' + key + '),0) AS ' + key for key in TOKEN_COLUMNS + ('total_tokens',))
     with closing(connect(home)) as conn:
-        # A full-history timestamp upper bound matches almost every row. Its
-        # timestamp index would visit the ledger in random order on disk; one
-        # sequential scan is cheaper. Selective filters keep SQLite's planner.
-        aggregate_table = 'usage_requests NOT INDEXED' if start is None and not base_clauses else 'usage_requests'
-        price_groups = [dict(r) for r in conn.execute(
-            'SELECT app,source,model,COUNT(*) AS requests,'+sums+
-            ' FROM '+aggregate_table+where+' GROUP BY app,source,model', params)]
-        total_columns = ('requests',)+TOKEN_COLUMNS+('total_tokens',)
-        summary = {key:sum(row[key] for row in price_groups) for key in total_columns}
-        cacheable = summary['input_tokens']+summary['cache_read_tokens']+summary['cache_creation_tokens']
-        summary['cache_hit_rate'] = summary['cache_read_tokens']/cacheable if cacheable else 0
-        # The full filtered model/source aggregate already supplies every
-        # token and count needed by the summary and the visible grouping tab.
-        # Fold these small groups rather than rescanning all requests twice.
-        groups={'models':[],'sources':[]}
-        if view in groups:
-            columns = ('model',) if view=='models' else ('source','app')
-            folded = {}
-            for row in price_groups:
-                key = tuple(row[column] for column in columns)
-                target = folded.setdefault(key, dict(zip(columns,key), **{column:0 for column in total_columns}))
-                for column in total_columns:
-                    target[column] += row[column]
-            groups[view] = sorted(folded.values(),key=lambda row:(-row['total_tokens'],)+tuple(row[column] for column in columns))
-        total = summary['requests'] if view=='logs' else len(groups.get(view,[]))
-        pages=max(1,(total+page_size-1)//page_size)
-        page=min(page,pages)
-        logs=[dict(r) for r in conn.execute('SELECT * FROM usage_requests'+where+' ORDER BY timestamp DESC,id LIMIT ? OFFSET ?',
-                 params+[page_size,(page-1)*page_size])] if view=='logs' else []
-        heat_start=(end.date()-timedelta(days=370)).isoformat()
-        heat_clauses=base_clauses+['date>=?','timestamp<=?']
-        heat_params=base_params+[heat_start,now]
-        heat_table = 'usage_requests NOT INDEXED' if not base_clauses else 'usage_requests'
-        days=[dict(r) for r in conn.execute('SELECT date,SUM(total_tokens) AS tokens,COUNT(*) AS requests FROM '+heat_table+' WHERE '+
-               ' AND '.join(heat_clauses)+' GROUP BY date ORDER BY date',heat_params)]
+        # Keep aggregates, provider subtraction and the visible page on one WAL
+        # snapshot while an incremental importer may commit in parallel.
+        conn.execute('BEGIN')
+        table = 'usage_requests r NOT INDEXED' if start is None and not base_clauses else 'usage_requests r'
+        price_groups = [dict(row) for row in conn.execute(
+            'SELECT r.app,r.source,r.model,COUNT(*) AS requests,' + sums +
+            ' FROM ' + table + where + ' GROUP BY r.app,r.source,r.model', params)]
+        provider_groups = _provider_groups(conn, price_groups, clauses, params, sums)
+        log_count = sum(row['requests'] for row in price_groups)
+        archived = _archived_groups(conn, app, model, source, provider, status, now)
+        selected_archived = [row for row in archived if (start is None or row['timestamp'] >= start) and
+                             (exclusive is None or row['timestamp'] < exclusive)]
+        price_groups += selected_archived
+        provider_groups += selected_archived
+        provider_names = {}
+        for row in provider_groups:
+            key = row['provider_key']
+            provider_names[key] = max(provider_names.get(key, ''), row['provider_name'])
+        for row in provider_groups:
+            row['provider_name'] = provider_names[row['provider_key']]
+        groups = {'models': _fold_groups(price_groups, ('model',)),
+                  'sources': _fold_groups(price_groups, ('source', 'app')),
+                  'providers': _fold_groups(provider_groups, ('provider_key', 'app', 'provider_id', 'provider_name'))}
+        for row in groups['providers']:
+            row['id'] = row['provider_key']
+        summary = _usage_totals(price_groups)
+        summary['archived_requests'] = sum(row['requests'] for row in selected_archived)
+        group_counts = dict(logs=log_count, **{key: len(rows) for key, rows in groups.items()})
+        total = group_counts[view]
+        pages = max(1, (total + page_size - 1) // page_size); page = min(page, pages)
+        logs = [dict(row) for row in conn.execute(
+            'SELECT r.* FROM usage_requests r' + where + ' ORDER BY r.timestamp DESC,r.id LIMIT ? OFFSET ?',
+            params + [page_size, (page - 1) * page_size])] if view == 'logs' else []
+        usage_ccswitch.decorate_logs(conn, logs)
+        for row in logs:
+            real = row.get('provider_id') and not row['provider_id'].startswith('_')
+            row['provider_key'] = row['app'] + '|' + (row['provider_id'] if real else 'source:' + row['source'])
+            row['provider_name'] = (row.get('provider_name') or row['provider_id']) if real else ('会话日志' if row['source'].endswith('_session') else '未记录')
+        full_daily = start is None or datetime.fromtimestamp(start).date() < heat_start
+        heat_clauses = base_clauses + ([] if full_daily else ['r.date>=?']) + ['r.timestamp<=?']
+        heat_params = base_params + ([] if full_daily else [heat_start.isoformat()]) + [now]
+        daily_groups = [dict(row) for row in conn.execute(
+            'SELECT r.date,r.app,r.source,r.model,COUNT(*) AS requests,' + sums +
+            ' FROM usage_requests r NOT INDEXED' + _where(heat_clauses) +
+            ' GROUP BY r.date,r.app,r.source,r.model', heat_params)]
+        heat_archived = [row for row in archived if row['date'] >= heat_start.isoformat()]
+        daily_groups += archived if full_daily else heat_archived
+        heat_groups = [row for row in daily_groups if row['date'] >= heat_start.isoformat()]
+        first = conn.execute('SELECT MIN(r.date) FROM usage_requests r' +
+                             _where(base_clauses + ['r.timestamp<=?']), base_params + [now]).fetchone()[0]
+        if archived:
+            first = min([row['date'] for row in archived] + ([first] if first else []))
+        selected_start = datetime.fromtimestamp(start).date().isoformat() if start is not None else first or today.isoformat()
+        selected_end = min(today, (datetime.fromtimestamp(exclusive) - timedelta(microseconds=1)).date()).isoformat() if exclusive is not None else today.isoformat()
+        by_day = {}
+        for row in heat_groups:
+            by_day.setdefault(row['date'], []).append(row)
+        days, day_price_groups = [], []
+        cursor = heat_start
+        while cursor <= today:
+            key = cursor.isoformat(); rows = by_day.get(key, [])
+            day = dict(date=key, **_usage_totals(rows), in_selected_range=selected_start <= key <= selected_end)
+            days.append(day); day_price_groups.append((day, rows))
+            cursor += timedelta(days=1)
+        granularity = 'hour' if period in ('today', 'yesterday', '1d') else 'day'
+        if granularity == 'hour':
+            first_bucket = int(datetime.fromtimestamp(start).replace(minute=0, second=0, microsecond=0).timestamp())
+            trend_groups = [dict(row) for row in conn.execute(
+                'SELECT CAST((r.timestamp-?)/3600 AS INTEGER)*3600+? AS bucket,r.app,r.source,r.model,COUNT(*) AS requests,' + sums +
+                ' FROM usage_requests r' + where + ' GROUP BY bucket,r.app,r.source,r.model', [first_bucket, first_bucket] + params)]
+            by_bucket = {}
+            for row in trend_groups:
+                by_bucket.setdefault(row['bucket'], []).append(row)
+            last_time = min(now, exclusive - .000001) if exclusive is not None else now
+            buckets = range(first_bucket, int(last_time) + 1, 3600)
+        else:
+            # Selected history can extend past the currently expanded heatmap.
+            trend_groups = daily_groups if period not in ('7d', '30d', '90d') else []
+            if period in ('7d', '30d', '90d'):
+                trend_groups = [dict(row) for row in conn.execute(
+                    'SELECT r.date,r.app,r.source,r.model,COUNT(*) AS requests,' + sums +
+                    ' FROM ' + table + where + ' GROUP BY r.date,r.app,r.source,r.model', params)]
+                trend_groups += selected_archived
+            by_bucket = {}
+            for row in trend_groups:
+                if selected_start <= row['date'] <= selected_end:
+                    by_bucket.setdefault(row['date'], []).append(row)
+            cursor = _date_argument(selected_start); last = _date_argument(selected_end)
+            buckets = []
+            while cursor <= last:
+                buckets.append(cursor.date().isoformat()); cursor += timedelta(days=1)
+        trend, trend_price_groups = [], []
+        for bucket in buckets:
+            when = datetime.fromtimestamp(bucket) if granularity == 'hour' else _date_argument(bucket)
+            rows = by_bucket.get(bucket, [])
+            point = dict(date=when.date().isoformat(), timestamp=when.timestamp(),
+                         label=when.strftime('%H:%M' if granularity == 'hour' else '%m-%d'),
+                         **_usage_totals(rows), in_selected_range=True)
+            trend.append(point); trend_price_groups.append((point, rows))
         sources = dict(SOURCES)
-        for source_row in conn.execute('SELECT DISTINCT source FROM usage_requests ORDER BY source'):
-            source_id = source_row[0]
+        fallback_providers = {}
+        for source_row in conn.execute('SELECT DISTINCT app,source FROM usage_requests ORDER BY app,source'):
+            source_id = source_row['source']
             sources.setdefault(source_id, 'OpenCode · ' + source_id[len('opencode_provider:'):] if source_id.startswith('opencode_provider:') else source_id)
-        filters={'apps':[{'id':k,'name':v} for k,v in APPS.items()],
-                 'models':[{'id':r[0],'name':r[0]} for r in conn.execute('SELECT DISTINCT model FROM usage_requests ORDER BY model')],
-                 'sources':[{'id':k,'name':v} for k,v in sources.items()]}
-        metadata=get_meta(conn,'sync',{'running':False,'last_synced_at':None,'errors':[],'warnings':[],'coverage':[]})
-        # A terminated scanner must not leave the UI saying "同步中" forever.
+            key = source_row['app'] + '|source:' + source_id
+            fallback_providers[key] = {'id': key, 'name': APPS.get(source_row['app'], source_row['app']) + ' · ' + ('会话日志' if source_id.endswith('_session') else '未记录')}
+        for row in conn.execute('SELECT r.app,d.provider_id,MAX(d.provider_name) AS name FROM usage_request_details d INDEXED BY usage_details_real_provider JOIN usage_requests r ON r.id=d.request_id WHERE ' + REAL_PROVIDER + ' GROUP BY r.app,d.provider_id'):
+            key = row['app'] + '|' + row['provider_id']
+            fallback_providers[key] = {'id': key, 'name': row['name'] or row['provider_id']}
+        for row in conn.execute('SELECT DISTINCT app,source,model,provider_id,provider_name FROM usage_archived_daily'):
+            sources.setdefault(row['source'], row['source'])
+            real = row['provider_id'] and not row['provider_id'].startswith('_')
+            key = row['app'] + '|' + (row['provider_id'] if real else 'source:' + row['source'])
+            fallback_providers[key] = {'id': key, 'name': row['provider_name'] or row['provider_id'] or '未记录'}
+        filters = {'apps': [{'id': key, 'name': value} for key, value in APPS.items()],
+                   'models': [{'id': r[0], 'name': r[0]} for r in conn.execute('SELECT model FROM usage_requests UNION SELECT model FROM usage_archived_daily ORDER BY model')],
+                   'sources': [{'id': key, 'name': value} for key, value in sources.items()],
+                   'providers': sorted(fallback_providers.values(), key=lambda row: (row['name'], row['id']))}
+        metadata = get_meta(conn, 'sync', {'running': False, 'last_synced_at': None, 'errors': [], 'warnings': [], 'coverage': []})
         if metadata.get('running'):
             try:
-                with (home/'usage-sync.lock').open('a') as check:
+                with (home / 'usage-sync.lock').open('a') as check:
                     try:
-                        fcntl.flock(check,fcntl.LOCK_EX|fcntl.LOCK_NB)
-                        metadata['running']=False
-                        metadata['warnings']=list(metadata.get('warnings',[]))+['上次同步被中断；点击同步可从已提交进度继续']
+                        fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        metadata['running'] = False
+                        metadata['warnings'] = list(metadata.get('warnings', [])) + ['上次同步被中断；点击同步可从已提交进度继续']
                     except BlockingIOError:
                         pass
             except OSError:
                 pass
-        result={'schema_version':SCHEMA_VERSION,'summary':summary,'days':days,'logs':logs,
-                'models':groups['models'][(page-1)*page_size:page*page_size] if view=='models' else groups['models'][:200],
-                'sources':groups['sources'][(page-1)*page_size:page*page_size] if view=='sources' else groups['sources'][:200],
-                'filters':filters,'pagination':{'total':total,'page':page,'page_size':page_size,'pages':pages},
-                'sync':metadata,'supported_apps':list(APPS),'view':view,'range':period,
-                'coverage_note':'读取仍保留的本机会话 usage；费用为 API 单价参考估算，不是订阅账单。'}
+        result = {'schema_version': SCHEMA_VERSION, 'summary': summary, 'days': days, 'logs': logs,
+                  **{key: rows[(page - 1) * page_size:page * page_size] if view == key else [] for key, rows in groups.items()},
+                  'heatmap_summary': dict(_usage_totals(heat_groups), archived_requests=sum(row['requests'] for row in heat_archived)),
+                  'heatmap_range': {'start_date': heat_start.isoformat(), 'end_date': today.isoformat(),
+                                    'selected_start_date': selected_start, 'selected_end_date': selected_end,
+                                    'has_older': bool(first and first < heat_start.isoformat()),
+                                    'available_weeks': max(53, min(530, (today - _date_argument(first).date()).days // 7 + 1)) if first else 53},
+                  'trend_points': trend, 'trend_granularity': granularity, 'group_counts': group_counts,
+                  'archived_requests': summary['archived_requests'],
+                  'trend_archived_requests': summary['archived_requests'] if granularity == 'hour' else 0,
+                  'filters': filters, 'pagination': {'total': total, 'page': page, 'page_size': page_size, 'pages': pages},
+                  'sync': metadata, 'supported_apps': list(APPS), 'view': view, 'range': period,
+                  'coverage_note': '读取仍保留的本机会话 usage；费用为 API 单价参考估算，不是订阅账单。'}
         from . import usage_money
-        usage_money.decorate(home, result, price_groups, now=now)
+        usage_money.decorate(home, result, price_groups, now=now, provider_groups=provider_groups,
+                             series_groups=day_price_groups + trend_price_groups,
+                             heatmap_groups=heat_groups)
         return result
 
 
@@ -1026,13 +1270,18 @@ def today_summary(home=None, now=None, cc_path=None):
 def main(argv=None):
     parser=argparse.ArgumentParser(description='VibeCue 本机历史 Token 用量')
     parser.add_argument('command',choices=('sync','query','today-summary'))
-    parser.add_argument('--range',dest='period',choices=('today','7d','30d','all'),default='all')
+    parser.add_argument('--range',dest='period',choices=('today','yesterday','1d','7d','30d','month','90d','year','custom','all'),default='all')
     parser.add_argument('--app',default='all')
     parser.add_argument('--model',default='all')
     parser.add_argument('--source',default='all')
+    parser.add_argument('--provider',default='all')
+    parser.add_argument('--status',default='all')
+    parser.add_argument('--heatmap-weeks',type=int,default=53)
+    parser.add_argument('--start-date')
+    parser.add_argument('--end-date')
     parser.add_argument('--page',type=int,default=1)
     parser.add_argument('--page-size',type=int,default=50)
-    parser.add_argument('--view',choices=('logs','models','sources'),default='logs')
+    parser.add_argument('--view',choices=('logs','models','providers','sources'),default='logs')
     args=parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -1042,7 +1291,8 @@ def main(argv=None):
             result=today_summary()
         else:
             result=query(period=args.period,app=args.app,model=args.model,source=args.source,
-                         page=args.page,page_size=args.page_size,view=args.view)
+                         page=args.page,page_size=args.page_size,view=args.view,provider=args.provider,status=args.status,
+                         heatmap_weeks=args.heatmap_weeks,start_date=args.start_date,end_date=args.end_date)
         print(json.dumps(result,ensure_ascii=False,separators=(',',':')))
     except (OSError,sqlite3.Error,ValueError) as error:
         print(json.dumps({'error':'本机用量缓存不可用（'+type(error).__name__+'）'},ensure_ascii=False))

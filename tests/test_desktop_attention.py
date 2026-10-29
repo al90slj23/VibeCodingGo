@@ -34,6 +34,7 @@ def change(revision=1, requests=None):
 def projected_json(projection):
     values = dict(vars(projection))
     values['settings'] = projection.settings.snapshot()
+    values['runtime'] = projection.runtime.data
     return json.dumps(values)
 
 

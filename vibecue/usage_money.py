@@ -347,7 +347,8 @@ def folded_cost(rows, prices, rate):
                 'price_sources': sorted(price_sources)}
 
 
-def decorate(home, result, aggregate_groups, cc_path=None, now=None):
+def decorate(home, result, aggregate_groups, cc_path=None, now=None, *, provider_groups=(),
+             series_groups=(), heatmap_groups=None):
     """Decorate a filtered usage query; never performs network I/O.
 
     aggregate_groups: full filtered GROUP BY app,source,model, with requests and
@@ -361,12 +362,28 @@ def decorate(home, result, aggregate_groups, cc_path=None, now=None):
     result['summary'].update(folded_cost(aggregate_groups, prices, rate))
     for row in result.get('logs', []):
         row.update(folded_cost([dict(row, requests=1)], prices, rate))
+        selected = prices.get(row.get('model'))
+        row['price_source_name'] = selected.get('source_name', selected.get('source')) if selected else None
+        for token, component in zip(TOKEN_KEYS, RATE_KEYS):
+            amount, unit = row.get(token, 0), selected.get(component) if selected else None
+            with localcontext() as ctx:
+                ctx.prec = 96
+                usd = Decimal(0) if amount == 0 else (Decimal(amount) * Decimal(str(unit)) / Decimal(1_000_000) if unit is not None else None)
+                row[component + '_cost_usd'] = float(usd) if usd is not None else None
+                row[component + '_cost_cny'] = float(usd * Decimal(str(rate))) if usd is not None and rate is not None else (0.0 if usd == 0 else None)
     for row in result.get('models', []):
         groups = [group for group in aggregate_groups if group.get('model') == row.get('model')]
         row.update(folded_cost(groups, prices, rate))
     for row in result.get('sources', []):
         groups = [group for group in aggregate_groups if group.get('source') == row.get('source') and group.get('app') == row.get('app')]
         row.update(folded_cost(groups, prices, rate))
+    for row in result.get('providers', []):
+        groups = [group for group in provider_groups if group.get('provider_key') == row.get('provider_key')]
+        row.update(folded_cost(groups, prices, rate))
+    for row, groups in series_groups:
+        row.update(folded_cost(groups, prices, rate))
+    if heatmap_groups is not None:
+        result['heatmap_summary'].update(folded_cost(heatmap_groups, prices, rate))
     return result
 
 

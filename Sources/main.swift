@@ -2461,8 +2461,22 @@ if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-dashboard")
     }
     let size = NSSize(width: dimension("--width", fallback: 1120), height: dimension("--height", fallback: 850))
     let currency = CommandLine.arguments.contains("--both-currencies") ? "both" : "CNY"
-    do { try CueUsageDashboardController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light"), size: size, currency: currency); exit(0) }
+    func argument(_ flag: String, fallback: String) -> String {
+        guard let i = CommandLine.arguments.firstIndex(of: flag), CommandLine.arguments.indices.contains(i + 1) else { return fallback }
+        return CommandLine.arguments[i + 1]
+    }
+    do { try CueUsageDashboardController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light"), size: size, currency: currency, historyWeeks: min(530, max(53, Int(argument("--history-weeks", fallback: "53")) ?? 53)), chartStyle: argument("--chart-style", fallback: "heatmap"), metric: argument("--metric", fallback: "tokens"), hourly: CommandLine.arguments.contains("--hourly")); exit(0) }
     catch { print("用量统计窗口截图失败"); exit(1) }
+}
+if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-hover"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do { try CueUsageHeatmap.captureHoverFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
+    catch { print("用量浮窗截图失败"); exit(1) }
+}
+if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-log-details"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do { try CueUsageLogDetailsController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
+    catch { print("请求详情截图失败"); exit(1) }
 }
 if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-preferences"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared

@@ -57,6 +57,49 @@ class ModelSettingsProjectionTests(unittest.TestCase):
         self.assertEqual(result['reasoning_effort'], 'default')
         self.assertEqual(result['status'], 'current')
 
+    def test_explicit_null_model_follows_default_not_old_runtime(self):
+        result = self.snapshot(latestModel='old-runtime',
+            latestCollaborationMode={'settings': {'model': 'old-collaboration'}},
+            latestThreadSettings={'model': None, 'effort': 'high', 'serviceTier': 'priority'})
+        self.assertIsNone(result['model'])
+        self.assertEqual(result['model_status'], 'default')
+        self.assertEqual(result['status'], 'partial')
+
+    def test_null_collaboration_model_does_not_restore_lower_priority_runtime(self):
+        for state in (
+            {'latestCollaborationMode': {'settings': {'model': None}}},
+            {'latestThreadSettings': {'collaborationMode': {'settings': {'model': None}}},
+             'latestCollaborationMode': {'settings': {'model': 'old-collaboration'}}},
+        ):
+            with self.subTest(state=state):
+                result = self.snapshot(latestModel='old-runtime', **state)
+                self.assertIsNone(result['model'])
+                self.assertEqual(result['model_status'], 'default')
+                self.assertEqual(result['status'], 'partial')
+
+    def test_only_null_override_is_partial_default_metadata(self):
+        for field, output in (('model', 'model_status'), ('serviceTier', 'speed_status')):
+            with self.subTest(field=field):
+                result = self.snapshot(latestThreadSettings={field: None})
+                self.assertEqual(result['status'], 'partial')
+                self.assertEqual(result[output], 'default')
+                self.assertIsNone(result['model'])
+                self.assertIsNone(result['service_tier'])
+
+    def test_null_and_malformed_selection_patches_do_not_revive_runtime(self):
+        self.snapshot(latestModel='old-runtime', latestReasoningEffort='low',
+            latestThreadSettings={'model': 'one', 'effort': 'ultra', 'serviceTier': 'priority'})
+        result = self.patches({'op': 'replace', 'path': ['latestThreadSettings', 'model'], 'value': None},
+            {'op': 'replace', 'path': ['latestThreadSettings', 'effort'], 'value': None},
+            {'op': 'replace', 'path': ['latestThreadSettings', 'serviceTier'], 'value': None})
+        self.assertIsNone(result['model'])
+        self.assertEqual((result['model_status'], result['reasoning_effort'], result['speed_status']),
+                         ('default', 'default', 'default'))
+        result = self.patches({'op': 'replace', 'path': ['latestThreadSettings', 'model'], 'value': {'text': 'PRIVATE'}})
+        self.assertIsNone(result['model'])
+        self.assertEqual(result['model_status'], 'unknown')
+        self.assertNotIn('PRIVATE', repr(vars(self.projection)))
+
     def test_null_tier_follows_default_without_claiming_standard_or_fast(self):
         result = self.snapshot(latestThreadSettings={'model': 'one', 'effort': 'high', 'serviceTier': None})
         self.assertIsNone(result['service_tier'])
@@ -133,13 +176,36 @@ class ModelSettingsProjectionTests(unittest.TestCase):
 
     def test_live_idle_subscription_refreshes_validity_without_changing_observed_time(self):
         self.snapshot(latestThreadSettings={'model': 'one', 'effort': 'high', 'serviceTier': 'default'})
-        self.now += 50
-        self.assertEqual(self.projection.snapshot()['status'], 'unavailable')
-        self.projection.mark_live()
+        for _ in range(5):
+            self.now += 10
+            self.projection.mark_live()
         result = self.projection.snapshot()
         self.assertEqual(result['status'], 'current')
         self.assertEqual(result['observed_at'], 1000)
         self.assertEqual(result['expires_at'], 1080)
+
+    def test_heartbeat_cannot_revive_an_expired_or_clock_regressed_projection(self):
+        for offset in (31, -6):
+            with self.subTest(offset=offset):
+                self.now = 1000
+                self.snapshot(latestThreadSettings={'model': 'one', 'effort': 'high', 'serviceTier': 'priority'})
+                self.now += offset
+                self.projection.mark_live()
+                self.assertTrue(self.projection.invalidated)
+                self.assertEqual(self.projection.snapshot()['status'], 'unavailable')
+                self.now = 1001
+                self.projection.mark_live()
+                self.assertEqual(self.projection.snapshot()['status'], 'unavailable')
+                restored = self.snapshot(latestThreadSettings={'model': 'fresh', 'effort': 'low', 'serviceTier': 'default'})
+                self.assertEqual((restored['status'], restored['model']), ('current', 'fresh'))
+
+    def test_expired_incremental_event_requires_full_snapshot(self):
+        self.snapshot(latestThreadSettings={'model': 'old', 'effort': 'high', 'serviceTier': 'priority'})
+        self.now += 31
+        with self.assertRaises(ControlError):
+            self.patches({'op': 'replace', 'path': ['latestThreadSettings', 'model'], 'value': 'new'})
+        self.assertTrue(self.projection.invalidated)
+        self.assertEqual(self.projection.snapshot()['status'], 'unavailable')
 
     def test_expired_snapshot_contains_no_old_current_values(self):
         self.snapshot(latestThreadSettings={'model': 'one', 'effort': 'high', 'serviceTier': 'priority'})
@@ -156,6 +222,16 @@ class ModelSettingsProjectionTests(unittest.TestCase):
         replacement.mark_live()
         self.assertEqual(replacement.snapshot()['status'], 'unavailable')
 
+    def test_invalidation_cannot_be_revived_by_incremental_events(self):
+        self.snapshot(latestThreadSettings={'model': 'one', 'effort': 'high', 'serviceTier': 'priority'})
+        self.projection.invalidate()
+        with self.assertRaises(ControlError):
+            self.patches({'op': 'replace', 'path': ['latestThreadSettings', 'model'], 'value': 'two'})
+        self.assertEqual(self.projection.revision, 10)
+        self.assertEqual(self.projection.snapshot()['status'], 'unavailable')
+        restored = self.snapshot(latestThreadSettings={'model': 'fresh', 'effort': 'low', 'serviceTier': 'default'})
+        self.assertEqual((restored['status'], restored['model']), ('current', 'fresh'))
+
     def test_wrong_thread_and_revision_gaps_are_rejected(self):
         with self.assertRaises(ControlError):
             self.snapshot(id='wrong-thread')
@@ -168,11 +244,26 @@ class ModelSettingsProjectionTests(unittest.TestCase):
         self.assertEqual(self.projection.revision, 10)
 
     def test_invalid_patch_batch_is_atomic(self):
-        before = self.snapshot(latestThreadSettings={'model': 'one', 'effort': 'high', 'serviceTier': 'default'})
+        self.snapshot(latestThreadSettings={'model': 'one', 'effort': 'high', 'serviceTier': 'default'})
         with self.assertRaises(ControlError):
             self.patches({'op': 'replace', 'path': ['latestThreadSettings', 'effort'], 'value': 'max'},
                          {'op': 'replace', 'path': [], 'value': {'body': 'PRIVATE'}})
-        self.assertEqual(self.projection.snapshot(), before)
+        self.assertEqual(self.projection.revision, 10)
+        self.assertEqual(self.projection.snapshot()['status'], 'unavailable')
+        self.assertEqual(self.projection.values, {})
+        self.assertEqual(self.projection.settings, {})
+        self.projection.mark_live()
+        self.assertEqual(self.projection.snapshot()['status'], 'unavailable')
+
+    def test_revision_gap_drops_old_current_values_before_reconnect(self):
+        self.snapshot(latestThreadSettings={'model': 'old', 'effort': 'ultra', 'serviceTier': 'priority'})
+        with self.assertRaises(ControlError):
+            self.projection.apply({'type': 'patches', 'baseRevision': 8, 'revision': 12, 'patches': []})
+        self.projection.mark_live()
+        result = self.projection.snapshot()
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertNotIn('model', result)
+        self.assertNotIn('service_tier', result)
 
     def test_empty_and_disconnected_settings_are_explicitly_unavailable(self):
         self.assertEqual(self.projection.snapshot()['status'], 'unavailable')
