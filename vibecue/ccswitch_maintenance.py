@@ -28,8 +28,8 @@ import uuid
 from .events import vibecue_directory
 
 APP=Path('/Applications/CC Switch.app')
-NATIVE=Path('/Applications/VibeCue.app/Contents/MacOS/VibeCue')
-TEMPLATE=Path('/Applications/VibeCue.app/Contents/Resources/CCSwitchIntegration/vibecue_quota.rs')
+NATIVE=Path('/Applications/VibeCoding Go.app/Contents/MacOS/VCGo')
+TEMPLATE=Path('/Applications/VibeCoding Go.app/Contents/Resources/CCSwitchIntegration/vibecue_quota.rs')
 BUNDLE_ID='com.ccswitch.desktop'
 OFFICIAL_TEAM='R8UR22V2F9'
 VERSION=re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$')
@@ -140,7 +140,7 @@ class OfficialFetch:
         from urllib.parse import urlparse
         parsed=urlparse(url)
         if parsed.scheme!='https' or parsed.hostname not in self.HOSTS:raise MaintenanceError('source_host_invalid')
-        request=urllib.request.Request(url,headers={'User-Agent':'VibeCue-local-quota-maintenance','Accept':'application/vnd.github+json'})
+        request=urllib.request.Request(url,headers={'User-Agent':'VCGo/0.26.0 local-quota-maintenance','Accept':'application/vnd.github+json'})
         try:
             with urllib.request.urlopen(request,timeout=45) as stream:
                 final=urlparse(stream.url)
@@ -255,7 +255,7 @@ class Maintenance:
         if legacy.get('patch_sha256')==INITIAL_PATCH and legacy.get('binary_sha256')==identity['binary_sha256']:
             self.verify_signature(self.app);return True
         # An older local recipe is still an authenticated input for rebuilding
-        # the same official version when VibeCue ships a newer bridge template.
+        # the same official version when VibeCoding Go ships a newer bridge template.
         for path in (self.paths()/'cache').glob('*/manifest.json'):
             value=read_json(path,{})
             if value.get('binary_sha256')==identity['binary_sha256']:

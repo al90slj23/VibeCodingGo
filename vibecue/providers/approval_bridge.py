@@ -615,7 +615,7 @@ def main(argv=None):
         try:
             os.execve(real_cli, [real_cli] + args, environment)
         except OSError:
-            sys.stderr.write('VibeCue 无法启动 Codex。\n')
+            sys.stderr.write('VibeCoding Go 无法启动 Codex。\n')
             return 127
     return run_bridge(real_cli, args)
 

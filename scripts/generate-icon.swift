@@ -1,5 +1,5 @@
 #!/usr/bin/swift
-// Rebuild VibeCue's original code-drawn macOS icon. No remote artwork or fonts.
+// Rebuild VibeCoding Go's original code-drawn macOS icon. No remote artwork or fonts.
 // Run: CLANG_MODULE_CACHE_PATH=/tmp/vibecue-swift-cache swift scripts/generate-icon.swift
 import AppKit
 import Foundation

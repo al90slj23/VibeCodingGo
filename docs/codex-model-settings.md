@@ -5,7 +5,7 @@
 `GPT-6.1 Sol Ultra` 由模型显示名和推理强度组成。`Ultra` 不是速度；
 Fast 由单独的服务档位决定，因此同一模型、同一强度可以使用标准或 Fast。
 
-VibeCue 继续订阅已核对的 owner 状态。`latestThreadSettings` 是 Codex
+VibeCoding Go 继续订阅已核对的 owner 状态。`latestThreadSettings` 是 Codex
 已应用的下一轮设置，不是仅限上一轮的参数。它优先于旧轮次的运行记录。
 专用 `thread-follower-read-model-settings` 只返回模型、强度等字段，不返回速度。
 
@@ -13,7 +13,7 @@ VibeCue 继续订阅已核对的 owner 状态。`latestThreadSettings` 是 Codex
 原始 `priority` 请求值可以保留，而原生图标不一定显示。模型标题本身也不能
 证明 Fast 已关闭。当前共享接口没有读取 renderer 最终速度选择的方法。
 
-VibeCue 显示规则：
+VibeCoding Go 显示规则：
 
 - 模型／强度单独显示，例如 `当前 · GPT-6.1 Sol Ultra`。
 - 速度独立显示，例如 `Fast · 已保存` 或 `标准速度 · 已保存`。

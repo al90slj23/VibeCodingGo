@@ -68,6 +68,19 @@ class FixtureMaintenance(maintenance.Maintenance):
 
 
 class MaintenanceTests(unittest.TestCase):
+    def test_native_helper_uses_the_renamed_application_without_shell_parsing(self):
+        process = Mock(returncode=0, stdout=b'{"status":"not_running"}')
+        with patch.object(maintenance.subprocess, 'run', return_value=process) as run:
+            result = maintenance.native('probe', {'source': 'settings'})
+        self.assertEqual(result, {'status': 'not_running'})
+        self.assertEqual(run.call_args.args[0], [
+            '/Applications/VibeCoding Go.app/Contents/MacOS/VCGo',
+            '--ccswitch-system-action', 'probe'])
+        self.assertEqual(json.loads(run.call_args.kwargs['input']), {'source': 'settings'})
+        self.assertNotIn('shell', run.call_args.kwargs)
+        self.assertEqual(maintenance.TEMPLATE, Path(
+            '/Applications/VibeCoding Go.app/Contents/Resources/CCSwitchIntegration/vibecue_quota.rs'))
+
     def setUp(self):
         temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
         self.root=Path(temporary.name)

@@ -384,7 +384,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                     settings.useNativeRecommendedLook()
                 } catch {
                     appearanceMigrationError = "旧样式备份未完成，已保留当前外观。"
-                    fputs("VibeCue: settings backup unavailable; existing styles retained\n", stderr)
+                    fputs("VibeCoding Go: settings backup unavailable; existing styles retained\n", stderr)
                 }
             }
         }
@@ -393,8 +393,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         recent = recentHistory.events
         seen = recent.map(\.id)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "VibeCue")
-        statusItem.button?.toolTip = "VibeCue — AI Coding Companion"
+        statusItem.button?.image = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "VibeCoding Go")
+        statusItem.button?.toolTip = "VibeCoding Go · VCGo — AI Coding Companion"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(toggleStatusPopover(_:))
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -440,7 +440,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             let kind = args[demoIndex + 1]
             if ["complete", "input", "permission", "error"].contains(kind) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                    self.enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果测试", message: "这是本机示范。正式提醒会显示对话名称。"))
+                    self.enqueue(CueEvent(kind: kind, title: "VibeCoding Go · 提醒效果测试", message: "这是本机示范。正式提醒会显示对话名称。"))
                     if let captureIndex = args.firstIndex(of: "--capture"), args.indices.contains(captureIndex + 1) {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.captureBanner(to: args[captureIndex + 1]) }
                     }
@@ -568,7 +568,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             playChime(kind: kind, name: settings.soundName(for: kind))
             return finish(muted || settings.soundToken(for: kind) == "silent" ? "已保存音效。当前处于静音状态。" : "正在试听：\(lastSound)")
         }
-        let event = CueEvent(kind: kind, title: "VibeCue · 样式预览", message: "这是样式预览。正式提醒会显示具体对话名称。")
+        let event = CueEvent(kind: kind, title: "VibeCoding Go · 样式预览", message: "这是样式预览。正式提醒会显示具体对话名称。")
         previewComponent = component; current = event; shownAt = Date()
         makeWindows(for: event)
         if component == "all" { playChime(kind: kind, name: settings.soundName(for: kind)) }
@@ -875,7 +875,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             }
         } catch {
             lastSoundError = error.localizedDescription
-            fputs("VibeCue: audio playback failed: \(error.localizedDescription)\n", stderr)
+            fputs("VibeCoding Go: audio playback failed: \(error.localizedDescription)\n", stderr)
         }
         writeStatus()
     }
@@ -910,14 +910,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
     @objc func demo(_ sender: NSMenuItem) {
         let kind = sender.representedObject as? String ?? "complete"
-        enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果测试", message: "这是本机示范。正式提醒会显示对话名称。"))
+        enqueue(CueEvent(kind: kind, title: "VibeCoding Go · 提醒效果测试", message: "这是本机示范。正式提醒会显示对话名称。"))
     }
     @objc func quit() {
         do {
             try Data("Disabled from menu at \(ISO8601DateFormatter().string(from: Date()))\n".utf8)
                 .write(to: home.appendingPathComponent("disabled"), options: .atomic)
         } catch {
-            fputs("VibeCue: unable to save disabled marker\n", stderr)
+            fputs("VibeCoding Go: unable to save disabled marker\n", stderr)
         }
         NSApp.terminate(nil)
     }
@@ -1112,7 +1112,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let expected = expectedHistoryDirectory()
         let panel = NSOpenPanel()
         panel.title = "授权读取本机 Codex 记录"
-        panel.message = "请选择 Codex 的 sessions 记录文件夹。VibeCue 只读取本机记录以判断提醒，不修改或上传对话。"
+        panel.message = "请选择 Codex 的 sessions 记录文件夹。VibeCoding Go 只读取本机记录以判断提醒，不修改或上传对话。"
         panel.prompt = "允许读取此文件夹"
         panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.canCreateDirectories = false; panel.allowsMultipleSelection = false
@@ -1150,13 +1150,13 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard approvalLauncher?.isRunning != true else { return }
         let alert = NSAlert()
         alert.messageText = "接通 Codex 提醒、对话与批量设置"
-        alert.informativeText = "首次连接或升级对话输入通道，需要你主动退出并重新打开 Codex。请先完成或保存当前工作；VibeCue 会等你退出后重新打开。对话输入只在你点击“载入对话”或“发送”时执行，模型设置只在点击“应用”后修改。"
+        alert.informativeText = "首次连接或升级对话输入通道，需要你主动退出并重新打开 Codex。请先完成或保存当前工作；VibeCoding Go 会等你退出后重新打开。对话输入只在你点击“载入对话”或“发送”时执行，模型设置只在点击“应用”后修改。"
         alert.addButton(withTitle: "准备连接，等待我退出")
         alert.addButton(withTitle: "稍后")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let helper = home.appendingPathComponent("vibecuectl")
         guard FileManager.default.isExecutableFile(atPath: helper.path) else {
-            let failure = NSAlert(); failure.messageText = "本机接入模块尚未安装"; failure.informativeText = "请先安装最新版 VibeCue。"; failure.runModal(); return
+            let failure = NSAlert(); failure.messageText = "本机接入模块尚未安装"; failure.informativeText = "请先安装最新版 VibeCoding Go。"; failure.runModal(); return
         }
         let process = Process(); process.executableURL = helper
         process.arguments = ["launch-codex", "--wait-for-exit"]
@@ -1240,16 +1240,16 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard statusItem != nil else { return }
         writeModelSettingsTargets()
         let menu = NSMenu()
-        let panel = NSMenuItem(title: "打开 VibeCue 面板…", action: #selector(openSettings), keyEquivalent: ",")
+        let panel = NSMenuItem(title: "打开 VibeCoding Go 面板…", action: #selector(openSettings), keyEquivalent: ",")
         panel.target = self; menu.addItem(panel)
         let usage = NSMenuItem(title: "用量统计与请求日志…", action: #selector(openUsage), keyEquivalent: "u")
         usage.target = self; menu.addItem(usage)
         let quota = NSMenuItem(title: "Codex 账号额度…", action: #selector(openAccountQuota), keyEquivalent: "")
         quota.target = self; menu.addItem(quota)
-        let subtitle = NSMenuItem(title: "AI Coding Companion · AI 开发提醒助手", action: nil, keyEquivalent: "")
+        let subtitle = NSMenuItem(title: "AI Coding Companion · AI 编程助手", action: nil, keyEquivalent: "")
         subtitle.isEnabled = false; menu.addItem(subtitle)
         menu.addItem(.separator())
-        let status = NSMenuItem(title: pausedUntil == nil ? "VibeCue · \(watcherHealthText)" : "已暂停提醒 30 分钟", action: nil, keyEquivalent: "")
+        let status = NSMenuItem(title: pausedUntil == nil ? "VibeCoding Go · \(watcherHealthText)" : "已暂停提醒 30 分钟", action: nil, keyEquivalent: "")
         status.isEnabled = false; menu.addItem(status)
         menu.addItem(.separator())
         let enabled = NSMenuItem(title: "启用提醒", action: #selector(toggleEnabled), keyEquivalent: "")
@@ -1327,7 +1327,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             if !ordinary.isEmpty { heading("历史提醒 · \(ordinary.count) 条"); ordinary.forEach(reminder) }
         }
         menu.addItem(.separator())
-        let exit = NSMenuItem(title: "结束 VibeCue", action: #selector(quit), keyEquivalent: "q")
+        let exit = NSMenuItem(title: "结束 VibeCoding Go", action: #selector(quit), keyEquivalent: "q")
         exit.target = self; menu.addItem(exit)
         shortcutMenu = menu
         refreshStatusItem()
@@ -1360,7 +1360,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         button.imagePosition = .imageLeading
         button.attributedTitle = NSAttributedString(string: usage.title(work: work), attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)])
         button.toolTip = usage.tooltip(work: work, health: watcherHealthText)
-        button.setAccessibilityLabel("VibeCue" + usage.title(work: work))
+        button.setAccessibilityLabel("VibeCoding Go" + usage.title(work: work))
     }
 
     @objc func openAccountQuota() {
@@ -1564,7 +1564,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     init(cue: CueController) {
         self.cue = cue
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 590), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "VibeCue"
+        window.title = "VibeCoding Go"
         window.titleVisibility = .visible
         window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
@@ -1596,12 +1596,12 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
 
     func buildSidebar() {
         let mark = NSImageView(frame: NSRect(x: 20, y: 29, width: 30, height: 30))
-        mark.image = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "VibeCue")
+        mark.image = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "VibeCoding Go")
         mark.contentTintColor = .secondaryLabelColor
         mark.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 24, weight: .semibold)
         sidebar.addSubview(mark)
-        label("VibeCue", in: sidebar, frame: NSRect(x: 60, y: 29, width: 116, height: 30), size: 19, weight: .semibold)
-        label("AI 开发提醒助手", in: sidebar, frame: NSRect(x: 20, y: 73, width: 156, height: 18), size: 11, color: .secondaryLabelColor)
+        label("VCGo", in: sidebar, frame: NSRect(x: 60, y: 29, width: 116, height: 30), size: 19, weight: .semibold)
+        label("AI 编程助手", in: sidebar, frame: NSRect(x: 20, y: 73, width: 156, height: 18), size: 11, color: .secondaryLabelColor)
         for (index, pair) in [("总览", "square.grid.2x2"), ("提醒规则", "bell"), ("泛光与声音", "waveform"), ("集成与文件", "puzzlepiece.extension"), ("用量统计", "chart.bar.xaxis")].enumerated() {
             let button = NSButton(title: pair.0, target: self, action: #selector(navigate(_:)))
             button.image = NSImage(systemSymbolName: pair.1, accessibilityDescription: nil)
@@ -1616,7 +1616,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         let line = NSView(frame: NSRect(x: 20, y: 517, width: 142, height: 1))
         line.wantsLayer = true; line.layer?.backgroundColor = NSColor.separatorColor.cgColor; sidebar.addSubview(line)
         label("本机运行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 533, width: 154, height: 19), size: 10.5, color: .secondaryLabelColor)
-        label("VibeCue \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.5.0")", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
+        label("VCGo \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.5.0")", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
     }
 
     @objc func navigate(_ sender: NSButton) {
@@ -1703,7 +1703,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func overview() {
-        heading("AI 开发提醒助手", "离开对话窗口，也能掌握需要你注意的时刻。")
+        heading("AI 编程助手", "集中查看对话、协作任务与用量，掌握每一步进展。")
         let status = card(106, 199)
         label("CODEX · 本机监控", in: status, frame: NSRect(x: 20, y: 17, width: 480, height: 21), size: 11, weight: .semibold, color: .secondaryLabelColor)
         healthLabel = label("", in: status, frame: NSRect(x: 20, y: 50, width: 480, height: 26), size: 18, weight: .semibold)
@@ -2109,7 +2109,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
     @objc func testAlert(_ sender: NSButton) {
         let kind = sender.identifier?.rawValue ?? "complete"
-        cue.enqueue(CueEvent(kind: kind, title: "VibeCue · 提醒效果测试", message: "使用你目前的泛光、声音与显示时间设置。"))
+        cue.enqueue(CueEvent(kind: kind, title: "VibeCoding Go · 提醒效果测试", message: "使用你目前的泛光、声音与显示时间设置。"))
         updateHealth()
     }
     @objc func testAudio(_ sender: NSButton) {
@@ -2200,7 +2200,7 @@ if let index = CommandLine.arguments.firstIndex(of: "--material-preview-contact-
         let results = try CueMaterialPreviewView.renderContactSheet(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
         print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
         exit(results.values.allSatisfy { $0 } ? 0 : 1)
-    } catch { fputs("VibeCue: material detail capture failed\n", stderr); exit(1) }
+    } catch { fputs("VibeCoding Go: material detail capture failed\n", stderr); exit(1) }
 }
 
 if CommandLine.arguments.contains("--window-preview-self-test") {
@@ -2351,12 +2351,12 @@ if CommandLine.arguments.contains("--resolution-self-test") {
 if let index = CommandLine.arguments.firstIndex(of: "--effects-contact-sheet"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared
     do { try CueEffectCatalog.renderContactSheet(to: URL(fileURLWithPath: CommandLine.arguments[index + 1])); exit(0) }
-    catch { fputs("VibeCue: effect capture failed\n", stderr); exit(1) }
+    catch { fputs("VibeCoding Go: effect capture failed\n", stderr); exit(1) }
 }
 if let index = CommandLine.arguments.firstIndex(of: "--cards-contact-sheet"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared
     do { try CueCardCatalog.renderContactSheet(to: URL(fileURLWithPath: CommandLine.arguments[index + 1])); exit(0) }
-    catch { fputs("VibeCue: card capture failed\n", stderr); exit(1) }
+    catch { fputs("VibeCoding Go: card capture failed\n", stderr); exit(1) }
 }
 
 if CommandLine.arguments.contains("--customization-self-test") {

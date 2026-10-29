@@ -15,7 +15,7 @@ struct CueBatchTarget {
     }
 }
 
-/// Uses only VibeCue's private control module, never sends a chat message.
+/// Uses only VibeCoding Go's private control module, never sends a chat message.
 final class CueCodexControlClient {
     let home: URL
     init(home: URL) { self.home = home }
@@ -25,7 +25,7 @@ final class CueCodexControlClient {
             do {
                 let runtime = home.appendingPathComponent("runtime")
                 guard FileManager.default.fileExists(atPath: runtime.appendingPathComponent("vibecue/codex_control.py").path) else {
-                    throw Self.error("Codex 控制模块尚未安装，请安装最新版 VibeCue。")
+                    throw Self.error("Codex 控制模块尚未安装，请安装最新版 VibeCoding Go。")
                 }
                 let process = Process(), output = Pipe(), stdin = Pipe()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -332,7 +332,7 @@ final class CueCodexBatchController: NSWindowController, NSWindowDelegate {
     }
     static func captureFixture(to output: URL) -> Bool {
         _ = NSApplication.shared
-        let target = CueBatchTarget(threadID: "fixture-pinned", title: "VibeCue｜本轮详情与批量设置")!
+        let target = CueBatchTarget(threadID: "fixture-pinned", title: "VibeCoding Go｜本轮详情与批量设置")!
         let other = CueBatchTarget(threadID: "fixture-running", title: "ALV｜构建与发布验收")!
         let controller = CueCodexBatchController(home: FileManager.default.temporaryDirectory, targets: [target, target, other], connect: {}, loadAutomatically: false)
         let fixture = CueBatchModel(["id":"fixture-model", "name":"模型示例", "default_effort":"high", "efforts":[["id":"high","name":"高"],["id":"medium","name":"中"]], "fast_tier":"priority", "service_tiers":[["id":"priority","description":"1.5x speed · 以当前模型声明为准"]]])!

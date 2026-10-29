@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install VibeCue, its local Codex adapter and passive notification hooks."""
+"""Install VibeCoding Go and migrate the existing VibeCue application safely."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +19,11 @@ import uuid
 PROJECT = Path(__file__).resolve().parent.parent
 LABELS = ('local.vibecue',)
 OWNED_LABELS = frozenset(('local.vibecue', 'local.vibecue.watcher'))
+APP_NAME = 'VibeCoding Go.app'
+EXECUTABLE = 'VCGo'
+LEGACY_APP_NAME = 'VibeCue.app'
+LEGACY_EXECUTABLE = 'VibeCue'
+BUNDLE_IDENTIFIER = 'local.vibecue'  # Preserve macOS identity and existing permissions.
 
 
 def private_write(path, data):
@@ -64,12 +69,40 @@ def stop_owned_app(home, executable):
         os.kill(pid, signal.SIGKILL)
 
 
+def owned_bundle(app, manifest, executable):
+    """Only a recorded, exact-path application may be replaced or archived."""
+    if manifest.get('app') != str(app) or app.is_symlink() or not app.is_dir():
+        return False
+    labels = manifest.get('labels')
+    if not isinstance(labels, list) or 'local.vibecue' not in labels:
+        return False
+    try:
+        info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+        binary = app / 'Contents/MacOS' / executable
+        return (info.get('CFBundleIdentifier') == BUNDLE_IDENTIFIER and
+                info.get('CFBundleExecutable') == executable and
+                binary.is_file() and not binary.is_symlink())
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException):
+        return False
+
+
+def archive_legacy_app(app, manifest, home):
+    if not owned_bundle(app, manifest, LEGACY_EXECUTABLE):
+        return None
+    backup = home / 'backups'
+    backup.mkdir(mode=0o700, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    destination = backup / ('app-legacy-VibeCue-' + stamp + '.app')
+    shutil.move(str(app), str(destination))
+    return str(destination)
+
+
 def replace_app(built, app, home):
     """Use fresh inodes; overwriting signed executable pages breaks macOS launches."""
     app.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:8]
-    staging = app.parent / ('.VibeCue-install-' + stamp + '.app')
-    previous = app.parent / ('.VibeCue-previous-' + stamp + '.app')
+    staging = app.parent / ('.VCGo-install-' + stamp + '.app')
+    previous = app.parent / ('.VCGo-previous-' + stamp + '.app')
     try:
         shutil.copytree(built, staging)
         subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(staging)], check=True)
@@ -144,19 +177,37 @@ def install(start=True, with_hooks=True, user_home=None):
     user_home = Path(user_home or Path.home()).resolve()
     home = user_home / 'Library/Application Support/VibeCue'
     previous = json.loads((home / 'install.json').read_text()) if (home / 'install.json').exists() else {}
-    app = (user_home / 'Applications' if isolated else Path('/Applications')) / 'VibeCue.app'
+    applications = user_home / 'Applications' if isolated else Path('/Applications')
+    app = applications / APP_NAME
+    legacy_app = applications / LEGACY_APP_NAME
     agents = user_home / 'Library/LaunchAgents'
-    built = PROJECT / 'build/VibeCue.app'
-    if not (built / 'Contents/MacOS/VibeCue').exists():
+    built = PROJECT / 'build' / APP_NAME
+    if not (built / 'Contents/MacOS' / EXECUTABLE).exists():
         raise RuntimeError('Run scripts/build.sh first.')
     subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(built)], check=True)
-    if app.exists() and not (home / 'install.json').exists():
-        raise RuntimeError('An unrelated VibeCue.app already exists; refusing to overwrite it.')
+    if app.exists() and not owned_bundle(app, previous, EXECUTABLE):
+        raise RuntimeError('An unrelated VibeCoding Go.app already exists; refusing to overwrite it.')
+    legacy_manifest = previous
+    if (previous.get('app') == str(app) and
+            previous.get('legacy_app_pending') == str(legacy_app)):
+        legacy_manifest = dict(previous, app=str(legacy_app))
+    legacy_owned = owned_bundle(legacy_app, legacy_manifest, LEGACY_EXECUTABLE)
+    record = {'version': '0.26.0', 'product_name': 'VibeCoding Go', 'short_name': 'VCGo',
+              'app': str(app), 'home': str(home), 'hooks': previous.get('hooks'),
+              'source_dir': str(PROJECT), 'labels': list(LABELS),
+              'installed_at': datetime.now(timezone.utc).isoformat()}
+    if legacy_owned:
+        record['legacy_app_pending'] = str(legacy_app)
+    if previous.get('legacy_app_backup'):
+        record['legacy_app_backup'] = previous['legacy_app_backup']
     domain = f'gui/{os.getuid()}'
     if start:
         for label in set(LABELS) | (set(previous.get('labels', [])) & OWNED_LABELS):
             subprocess.run(['/bin/launchctl', 'bootout', domain + '/' + label], capture_output=True)
-        stop_owned_app(home, app / 'Contents/MacOS/VibeCue')
+        if owned_bundle(app, previous, EXECUTABLE):
+            stop_owned_app(home, app / 'Contents/MacOS' / EXECUTABLE)
+        if legacy_owned:
+            stop_owned_app(home, legacy_app / 'Contents/MacOS' / LEGACY_EXECUTABLE)
     for label in set(previous.get('labels', [])) & (OWNED_LABELS - set(LABELS)):
         (agents / (label + '.plist')).unlink(missing_ok=True)
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -169,12 +220,17 @@ def install(start=True, with_hooks=True, user_home=None):
     shutil.copytree(PROJECT / 'vibecue', runtime / 'vibecue', dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     replace_app(built, app, home)
+    # Establish ownership as soon as replacement commits. Any later optional
+    # setup/archive failure must remain safely retryable using this manifest.
+    json_write(home / 'install.json', record)
+    # The original helper path remains stable for existing Codex hooks.
     control = home / 'vibecuectl'
     launcher = ('#!/bin/sh\nset -eu\nexport PYTHONPATH=' + shlex.quote(str(runtime)) + '\n'
                 'export VIBECUE_HOME=' + shlex.quote(str(home)) + '\n'
                 'exec /usr/bin/python3 -m vibecue.cli "$@"\n')
-    private_write(control, launcher.encode())
-    os.chmod(control, 0o700)
+    for command in (home / 'vcgo', control):
+        private_write(command, launcher.encode())
+        os.chmod(command, 0o700)
     bridge_wrapper = home / 'vibecue-codex'
     bridge_launcher = ('#!/bin/sh\nset -eu\nexport PYTHONPATH=' + shlex.quote(str(runtime)) + '\n'
                       'export VIBECUE_HOME=' + shlex.quote(str(home)) + '\n'
@@ -184,7 +240,7 @@ def install(start=True, with_hooks=True, user_home=None):
     env = {'VIBECUE_HOME': str(home), 'PYTHONPATH': str(runtime),
            'PYTHONUNBUFFERED': '1', 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
     jobs = [
-        {'Label': LABELS[0], 'ProgramArguments': [str(app / 'Contents/MacOS/VibeCue'), '--background'],
+        {'Label': LABELS[0], 'ProgramArguments': [str(app / 'Contents/MacOS' / EXECUTABLE), '--background'],
          'KeepAlive': {'SuccessfulExit': False}, 'ProcessType': 'Interactive'},
     ]
     for job in jobs:
@@ -196,9 +252,12 @@ def install(start=True, with_hooks=True, user_home=None):
         private_write(agents / (job['Label'] + '.plist'), plistlib.dumps(job))
     # Preserve config.toml and the existing computer-use notify command verbatim.
     hooks = install_hooks(user_home / '.codex', control, home) if with_hooks else previous.get('hooks')
-    record = {'version': '0.25.1', 'app': str(app), 'home': str(home), 'hooks': hooks,
-              'source_dir': str(PROJECT),
-              'labels': list(LABELS), 'installed_at': datetime.now(timezone.utc).isoformat()}
+    record['hooks'] = hooks
+    json_write(home / 'install.json', record)
+    legacy_backup = archive_legacy_app(legacy_app, legacy_manifest, home) if legacy_owned else None
+    if legacy_backup:
+        record['legacy_app_backup'] = legacy_backup
+    record.pop('legacy_app_pending', None)
     json_write(home / 'install.json', record)
     # Only migrate machines that already opted into the verified local bridge.
     # No CC Switch auth/config files are opened by this bootstrap.

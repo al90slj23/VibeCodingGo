@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -56,15 +57,15 @@ class InstallTests(unittest.TestCase):
                 kill.assert_called_once_with(2222,installer.signal.SIGTERM)
 
     def test_signed_bundle_replacement_uses_fresh_inode_and_keeps_backup(self):
-        if not (PROJECT/'build/VibeCue.app').exists():self.skipTest('Build app first')
+        if not (PROJECT/'build/VibeCoding Go.app').exists():self.skipTest('Build app first')
         with tempfile.TemporaryDirectory() as directory:
-            home=Path(directory);built=PROJECT/'build/VibeCue.app';target=home/'Applications/VibeCue.app'
+            home=Path(directory);built=PROJECT/'build/VibeCoding Go.app';target=home/'Applications/VibeCoding Go.app'
             installer.replace_app(built,target,home)
-            original=(target/'Contents/MacOS/VibeCue').stat().st_ino
+            original=(target/'Contents/MacOS/VCGo').stat().st_ino
             installer.replace_app(built,target,home)
-            self.assertNotEqual((target/'Contents/MacOS/VibeCue').stat().st_ino,original)
+            self.assertNotEqual((target/'Contents/MacOS/VCGo').stat().st_ino,original)
             self.assertTrue(list((home/'backups').glob('app-*.app')))
-            self.assertFalse(list(target.parent.glob('.VibeCue-install-*.app')))
+            self.assertFalse(list(target.parent.glob('.VCGo-install-*.app')))
 
     def test_upgrade_removes_only_our_raw_permission_handler(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -83,10 +84,10 @@ class InstallTests(unittest.TestCase):
             self.assertIn('PreToolUse',result['groups'])
 
     def test_install_merge_reinstall_and_preserve_original_notify(self):
-        if not (PROJECT / 'build/VibeCue.app').exists():
+        if not (PROJECT / 'build/VibeCoding Go.app').exists():
             self.skipTest('Build app before running installer integration test')
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
-            user = Path(directory)
+            user = Path(directory).resolve()
             codex = user / '.codex'
             codex.mkdir()
             config = b'notify = ["existing-helper", "turn-ended"]\n'
@@ -101,12 +102,144 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(json.loads((codex / 'hooks.json').read_text()), installed)
             installer.install(start=False, with_hooks=False, user_home=user)
             manifest = json.loads((user / 'Library/Application Support/VibeCue/install.json').read_text())
+            self.assertEqual(manifest['product_name'], 'VibeCoding Go')
+            self.assertEqual(manifest['app'], str(user / 'Applications/VibeCoding Go.app'))
             self.assertIsNotNone(manifest['hooks'])
             self.assertEqual(manifest['labels'], ['local.vibecue'])
             self.assertFalse((user / 'Library/LaunchAgents/local.vibecue.watcher.plist').exists())
             self.assertEqual((codex / 'config.toml').read_bytes(), config)
             self.assertFalse(any('decision' in handler for group in manifest['hooks']['groups'].values()
                                  for handler in group['hooks']))
+
+
+class BrandMigrationTests(unittest.TestCase):
+    """Use disposable stub bundles, never the build or installed user app."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.project = self.root / 'source'
+        self.user = self.root / 'user'
+        self.home = self.user / 'Library/Application Support/VibeCue'
+        self.home.mkdir(parents=True)
+        (self.project / 'vibecue').mkdir(parents=True)
+        (self.project / 'vibecue/__init__.py').write_text('')
+        self.built = self.project / 'build/VibeCoding Go.app'
+        self.new = self.user / 'Applications/VibeCoding Go.app'
+        self.old = self.user / 'Applications/VibeCue.app'
+        self.bundle(self.built, 'VCGo')
+        project = patch.object(installer, 'PROJECT', self.project)
+        project.start(); self.addCleanup(project.stop)
+        commands = patch.object(installer.subprocess, 'run')
+        self.commands = commands.start(); self.addCleanup(commands.stop)
+        self.commands.return_value = type('Result', (), {'returncode': 0})()
+
+    def bundle(self, target, executable, identifier='local.vibecue'):
+        (target / 'Contents/MacOS').mkdir(parents=True)
+        (target / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+            'CFBundleIdentifier': identifier, 'CFBundleExecutable': executable}))
+        (target / 'Contents/MacOS' / executable).write_bytes(b'stub app')
+
+    def manifest(self, app):
+        value = {'version': '0.25.1', 'app': str(app), 'labels': ['local.vibecue']}
+        (self.home / 'install.json').write_text(json.dumps(value))
+        return value
+
+    def install(self, **kwargs):
+        with redirect_stdout(io.StringIO()):
+            installer.install(start=False, with_hooks=False, user_home=self.user, **kwargs)
+        return json.loads((self.home / 'install.json').read_text())
+
+    def test_upgrade_archives_only_recorded_legacy_bundle_and_preserves_data(self):
+        self.bundle(self.old, 'VibeCue')
+        self.manifest(self.old)
+        original = {'settings.json': b'{"enabled":true}',
+                    'conversation-drafts.json': '草稿内容'.encode(),
+                    'task-recovery.json': b'ongoing task',
+                    'usage.sqlite': b'historical usage'}
+        for name, content in original.items():
+            (self.home / name).write_bytes(content)
+        record = self.install()
+        self.assertEqual(record['app'], str(self.new))
+        self.assertEqual(record['version'], '0.26.0')
+        self.assertEqual(record['short_name'], 'VCGo')
+        self.assertFalse(self.old.exists())
+        backup = Path(record['legacy_app_backup'])
+        self.assertEqual((backup / 'Contents/MacOS/VibeCue').read_bytes(), b'stub app')
+        self.assertTrue(self.new.is_dir())
+        for name, content in original.items():
+            self.assertEqual((self.home / name).read_bytes(), content)
+        for name in ('vcgo', 'vibecuectl', 'vibecue-codex'):
+            self.assertTrue(os.access(self.home / name, os.X_OK))
+        job = plistlib.loads((self.user / 'Library/LaunchAgents/local.vibecue.plist').read_bytes())
+        self.assertEqual(job['ProgramArguments'], [str(self.new / 'Contents/MacOS/VCGo'), '--background'])
+        self.assertEqual(job['EnvironmentVariables']['VIBECUE_HOME'], str(self.home))
+        repeated = self.install()
+        self.assertEqual(repeated['legacy_app_backup'], str(backup))
+        self.assertEqual(len(list((self.home / 'backups').glob('app-legacy-*.app'))), 1)
+        self.assertTrue(list((self.home / 'backups').glob('app-20*.app')))
+
+    def test_unrelated_old_bundle_is_preserved_even_with_an_old_path_in_manifest(self):
+        self.bundle(self.old, 'VibeCue', identifier='other.application')
+        self.manifest(self.old)
+        record = self.install()
+        self.assertTrue(self.old.is_dir())
+        self.assertNotIn('legacy_app_backup', record)
+
+    def test_unrecorded_legacy_bundle_is_not_claimed_by_matching_bundle_identifier(self):
+        self.bundle(self.old, 'VibeCue')
+        self.install()
+        self.assertTrue(self.old.is_dir())
+
+    def test_unrelated_new_target_is_rejected_before_startup_or_data_mutation(self):
+        self.bundle(self.old, 'VibeCue')
+        self.manifest(self.old)
+        self.bundle(self.new, 'VCGo')
+        original = (self.home / 'install.json').read_bytes()
+        with self.assertRaisesRegex(RuntimeError, 'unrelated'):
+            self.install()
+        self.assertTrue(self.old.is_dir())
+        self.assertEqual((self.home / 'install.json').read_bytes(), original)
+        self.assertFalse((self.home / 'runtime').exists())
+
+    def test_upgrade_stops_verified_old_executable_before_new_launch(self):
+        self.bundle(self.old, 'VibeCue')
+        self.manifest(self.old)
+        with patch.object(installer, 'stop_owned_app') as stop, redirect_stdout(io.StringIO()):
+            installer.install(start=True, with_hooks=False, user_home=self.user)
+        stop.assert_called_once_with(self.home, self.old / 'Contents/MacOS/VibeCue')
+        calls = [call.args[0] for call in self.commands.call_args_list]
+        self.assertTrue(any(command[:2] == ['/bin/launchctl', 'bootout'] for command in calls))
+        self.assertTrue(any(command[:2] == ['/bin/launchctl', 'bootstrap'] for command in calls))
+
+    def test_optional_ccswitch_failure_leaves_new_app_owned_and_retryable(self):
+        self.bundle(self.old, 'VibeCue')
+        self.manifest(self.old)
+        (self.home / 'ccswitch-quota-install.json').write_text('{}')
+        with patch('vibecue.ccswitch_maintenance.configure_existing', side_effect=RuntimeError('optional setup failed')):
+            with self.assertRaisesRegex(RuntimeError, 'optional setup failed'):
+                self.install()
+        record = json.loads((self.home / 'install.json').read_text())
+        self.assertEqual(record['app'], str(self.new))
+        self.assertTrue(installer.owned_bundle(self.new, record, 'VCGo'))
+        self.assertFalse(self.old.exists())
+        with patch('vibecue.ccswitch_maintenance.configure_existing'):
+            self.assertEqual(self.install()['app'], str(self.new))
+
+    def test_interrupted_legacy_archive_retains_verified_pending_migration_for_retry(self):
+        self.bundle(self.old, 'VibeCue')
+        self.manifest(self.old)
+        with patch.object(installer, 'archive_legacy_app', side_effect=OSError('temporary archive failure')):
+            with self.assertRaisesRegex(OSError, 'temporary archive failure'):
+                self.install()
+        record = json.loads((self.home / 'install.json').read_text())
+        self.assertEqual(record['legacy_app_pending'], str(self.old))
+        self.assertTrue(installer.owned_bundle(self.new, record, 'VCGo'))
+        self.assertTrue(self.old.exists())
+        recovered = self.install()
+        self.assertNotIn('legacy_app_pending', recovered)
+        self.assertFalse(self.old.exists())
+        self.assertTrue(Path(recovered['legacy_app_backup']).exists())
 
 
 if __name__ == '__main__':

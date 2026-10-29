@@ -319,7 +319,7 @@ def run(operation, params=None, home=None, codex_home=None):
         if desktop is not None:
             return desktop
         return {'schema_version': SCHEMA_VERSION, 'connected': False, 'models': cached_catalog(codex_home),
-                'message': '尚未连接 Codex 控制通道；当前为本机模型缓存。请通过 VibeCue 接通后再应用。'}
+                'message': '尚未连接 Codex 控制通道；当前为本机模型缓存。请通过 VibeCoding Go 接通后再应用。'}
     if operation not in ('apply', 'inspect'):
         raise ControlError('不支持的批量操作')
     identifiers = unique_threads(params.get('thread_ids'))
@@ -365,7 +365,7 @@ def desktop_run(operation, params, home=None, codex_home=None, deadline=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='VibeCue Codex 批量设置')
+    parser = argparse.ArgumentParser(description='VibeCoding Go Codex 批量设置')
     parser.add_argument('operation', choices=('catalog', 'inspect', 'apply'))
     args = parser.parse_args(argv)
     os.umask(0o077)

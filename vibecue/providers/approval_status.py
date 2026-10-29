@@ -1,4 +1,4 @@
-"""Capability summaries from VibeCue's own transparent stdio bridges."""
+"""Capability summaries from VibeCoding Go's own transparent stdio bridges."""
 from __future__ import annotations
 
 import json

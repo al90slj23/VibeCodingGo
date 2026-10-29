@@ -332,7 +332,7 @@ def _merge_history(result, previous, now):
 def read_all_accounts(path=None, now=None, *, home=None):
     """Read numeric exports, optionally retaining last successes privately.
 
-    Omitting home remains purely read-only. Production passes its VibeCue home
+    Omitting home remains purely read-only. Production passes its VibeCoding Go home
     explicitly; the private history contains only whitelisted identity/numbers.
     Missing, failed or obsolete exports never promote a cached value to live.
     """

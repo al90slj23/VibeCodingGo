@@ -48,7 +48,7 @@ struct CueSoundPreset {
         self.id = id; self.name = name; self.family = family; self.description = description
         self.voice = voice; self.score = score; self.legacy = legacy
         tags = ["synthesized"]; sourceType = "synthesized"
-        sourceDescription = "VibeCue 原创合成提示音"; sourceURL = nil; license = "VibeCue 项目许可"
+        sourceDescription = "VibeCoding Go 原创合成提示音"; sourceURL = nil; license = "VibeCoding Go 项目许可"
         assetName = nil; systemURL = nil
         duration = Double(score.reduce(0) { $0 + Int($1.duration * Double(CueChime.sampleRate)) + Int($1.gap * Double(CueChime.sampleRate)) }) / Double(CueChime.sampleRate)
     }
@@ -65,7 +65,7 @@ struct CueSoundPreset {
     fileprivate init(system url: URL, duration: Double) {
         let filename = url.deletingPathExtension().lastPathComponent
         id = "system:" + filename; name = filename; family = "macOS 系统音效"
-        description = "使用本机 macOS 的 \(filename) 音效；音频文件不随 VibeCue 分发。"
+        description = "使用本机 macOS 的 \(filename) 音效；音频文件不随 VibeCoding Go 分发。"
         self.duration = duration; tags = ["system"]; sourceType = "system"
         sourceDescription = "本机 macOS 系统音效"; sourceURL = nil; license = "Apple 系统资源，仅本机读取"
         assetName = nil; systemURL = url; voice = .soft; score = []; legacy = false
@@ -75,7 +75,7 @@ struct CueSoundPreset {
 enum CueSoundCatalog {
     static let tags: [CueSoundTag] = [
         .init(id: "all", name: "全部", description: "所有可用音源，来源类型分别标注。"),
-        .init(id: "synthesized", name: "合成提示音", description: "50 段 VibeCue 原创合成乐句，玻璃、木琴等为音色描述。"),
+        .init(id: "synthesized", name: "合成提示音", description: "50 段 VibeCoding Go 原创合成乐句，玻璃、木琴等为音色描述。"),
         .init(id: "nature", name: "自然", description: "青蛙、鸟鸣、虫鸣、森林、溪流、雨和风的 CC0 实录短片段。"),
         .init(id: "forest", name: "森林氛围", description: "林冠风声和林间溪流，保留真实环境声层次。"),
         .init(id: "animals", name: "动物", description: "青蛙、鸟类和昆虫的真实声音，可与其他标签组合筛选。"),
@@ -389,7 +389,7 @@ struct CueChime {
         let data: Data
         if preset.sourceType == "recording" {
             guard let url = CueSoundCatalog.recordingURL(for: preset) else {
-                throw NSError(domain: "VibeCue.Sound", code: 1, userInfo: [NSLocalizedDescriptionKey: "找不到实录音源：\(preset.name)。请重新安装完整的 VibeCue。"])
+                throw NSError(domain: "VibeCue.Sound", code: 1, userInfo: [NSLocalizedDescriptionKey: "找不到实录音源：\(preset.name)。请重新安装完整的 VibeCoding Go。"])
             }
             data = try Data(contentsOf: url)
             guard !samples(from: data).isEmpty else {

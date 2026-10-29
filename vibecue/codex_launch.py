@@ -69,9 +69,9 @@ def launcher_parent():
     try:
         parent = int(value)
     except (ValueError, TypeError):
-        raise RuntimeError('连接启动来源无效，请从 VibeCue 重新连接。') from None
+        raise RuntimeError('连接启动来源无效，请从 VibeCoding Go 重新连接。') from None
     if parent <= 1 or os.getppid() != parent:
-        raise RuntimeError('原 VibeCue 实例已退出，请从当前 VibeCue 重新连接。')
+        raise RuntimeError('原 VibeCoding Go 实例已退出，请从当前 VibeCoding Go 重新连接。')
     return parent
 
 
@@ -84,17 +84,17 @@ def launch_codex(wait_for_exit=False, home=None, timeout=None):
         app, executable, _ = find_codex_app()
         wrapper = home / 'vibecue-codex'
         if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
-            raise RuntimeError('人工批准监听入口尚未安装，请先更新 VibeCue。')
+            raise RuntimeError('人工批准监听入口尚未安装，请先更新 VibeCoding Go。')
         if app_running(executable):
             if not wait_for_exit:
-                raise RuntimeError('请先正常退出 Codex，再通过 VibeCue 启动，以连接真实的人工批准请求。')
+                raise RuntimeError('请先正常退出 Codex，再通过 VibeCoding Go 启动，以连接真实的人工批准请求。')
             message = '已准备连接。请先完成当前任务并退出 Codex；退出后会自动重新打开。'
             write_launch_status(home, 'waiting_for_codex_exit', message, parent_pid=parent)
             deadline = None if timeout is None else time.monotonic() + timeout
             heartbeat = time.monotonic()
             while app_running(executable):
                 if parent is not None and os.getppid() != parent:
-                    write_launch_status(home, 'cancelled', '原 VibeCue 实例已退出，已取消等待；不会自动打开 Codex。')
+                    write_launch_status(home, 'cancelled', '原 VibeCoding Go 实例已退出，已取消等待；不会自动打开 Codex。')
                     return 0
                 now = time.monotonic()
                 if deadline is not None and now >= deadline:
@@ -104,7 +104,7 @@ def launch_codex(wait_for_exit=False, home=None, timeout=None):
                     heartbeat = now
                 time.sleep(1)
         if parent is not None and os.getppid() != parent:
-            write_launch_status(home, 'cancelled', '原 VibeCue 实例已退出，已取消连接；不会自动打开 Codex。')
+            write_launch_status(home, 'cancelled', '原 VibeCoding Go 实例已退出，已取消连接；不会自动打开 Codex。')
             return 0
         write_launch_status(home, 'launching', '正在通过人工批准监听入口打开 Codex。')
         subprocess.run(['/usr/bin/open', '--env', 'CODEX_CLI_PATH=' + str(wrapper),

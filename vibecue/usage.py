@@ -1268,7 +1268,7 @@ def today_summary(home=None, now=None, cc_path=None):
 
 
 def main(argv=None):
-    parser=argparse.ArgumentParser(description='VibeCue 本机历史 Token 用量')
+    parser=argparse.ArgumentParser(description='VibeCoding Go 本机历史 Token 用量')
     parser.add_argument('command',choices=('sync','query','today-summary'))
     parser.add_argument('--range',dest='period',choices=('today','yesterday','1d','7d','30d','month','90d','year','custom','all'),default='all')
     parser.add_argument('--app',default='all')

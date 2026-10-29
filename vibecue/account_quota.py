@@ -175,7 +175,7 @@ class CodexQuotaProcess:
             self.process = self.process_factory([str(executable), 'app-server', '--stdio'],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 env=environment, start_new_session=True)
-            self.call('initialize', {'clientInfo':{'name':'VibeCue','title':'VibeCue quota reader','version':'1'},
+            self.call('initialize', {'clientInfo':{'name':'vcgo','title':'VibeCoding Go quota reader','version':'0.26.0'},
                                      'capabilities':{'experimentalApi':False}})
             self._write({'method':'initialized'})
             return self
@@ -392,7 +392,7 @@ class QuotaStore:
             except (QuotaError,OSError):
                 result=self.status()
                 result.update(available=False,status='unavailable',current_account_key=None,
-                              message='本机额度快照未能保存，请检查 VibeCue 数据目录后重试。')
+                              message='本机额度快照未能保存，请检查 VibeCoding Go 数据目录后重试。')
                 for row in result['accounts']:
                     row.update(current_account=False,status='last_read')
                 return result

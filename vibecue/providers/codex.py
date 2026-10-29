@@ -810,7 +810,7 @@ class Watcher:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                print('VibeCue watcher: already running', file=sys.stderr, flush=True)
+                print('VibeCoding Go watcher: already running', file=sys.stderr, flush=True)
                 return
             self.running = True
             try:
@@ -831,7 +831,7 @@ class Watcher:
                     try:
                         self.poll_once()
                     except (OSError, ValueError, sqlite3.Error) as error:
-                        print(f'VibeCue watcher: {type(error).__name__}', file=sys.stderr, flush=True)
+                        print(f'VibeCoding Go watcher: {type(error).__name__}', file=sys.stderr, flush=True)
                     time.sleep(self.interval)
             finally:
                 self.running = False

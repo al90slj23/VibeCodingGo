@@ -1,1 +1,1 @@
-"""Local VibeCue adapters. No network requests or Codex state writes."""
+"""Local VibeCoding Go adapters. No network requests or Codex state writes."""

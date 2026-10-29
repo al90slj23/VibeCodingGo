@@ -237,7 +237,7 @@ final class CueSideChatsPopoverController {
         _ = NSApplication.shared
         let now = Date()
         let content = CueSideChatsContentController()
-        content.update(title: "VibeCue｜任务运行状态与提醒列表", children: [
+        content.update(title: "VibeCoding Go｜任务运行状态与提醒列表", children: [
             CueSideChat(raw: CueSideChat.fixtureRaw(parent: "fixture-parent", child: "fixture-side-running", title: "核对侧边聊天入口与状态", status: "running", now: now))!,
             CueSideChat(raw: CueSideChat.fixtureRaw(parent: "fixture-parent", child: "fixture-side-completed", title: "确认原生按钮与列表布局", status: "completed", now: now))!,
         ])

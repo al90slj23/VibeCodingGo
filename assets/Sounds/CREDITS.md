@@ -1,6 +1,6 @@
-# VibeCue 提示音来源
+# VibeCoding Go 提示音来源
 
-50 段乐句为 VibeCue 原创合成提示音，旧 ID 保留。24 项自然及城市音效是真实录音的短剪辑，其中本次新增 16 项青蛙、鸟鸣、虫鸣与森林溪流。macOS 系统音效由运行时读取 `/System/Library/Sounds`；仓库和应用包不包含 Apple 系统音频。
+50 段乐句为 VibeCoding Go 原创合成提示音，旧 ID 保留。24 项自然及城市音效是真实录音的短剪辑，其中本次新增 16 项青蛙、鸟鸣、虫鸣与森林溪流。macOS 系统音效由运行时读取 `/System/Library/Sounds`；仓库和应用包不包含 Apple 系统音频。
 
 所有实录均来自 BigSoundBank。每个原始作品页标注 CC0，[站点许可页](https://bigsoundbank.com/licenses.html)直接链接 [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)，允许剪辑、再分发和商用。核验日期分别记录于 manifest，最新为 2026-10-28。以下保留正文作者署名（可能与站点通用结构化元数据不同）。
 

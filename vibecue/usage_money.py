@@ -261,7 +261,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def fetch_rate(now=None):
-    request = urllib.request.Request(RATE_URL, headers={'Accept': 'application/json', 'User-Agent': 'VibeCue/1.0 exchange-rate'})
+    request = urllib.request.Request(RATE_URL, headers={'Accept': 'application/json', 'User-Agent': 'VCGo/0.26.0 exchange-rate'})
     # A fixed anonymous pair, no account identifiers, usage, API keys or bodies.
     opener = urllib.request.build_opener(_NoRedirect())
     with opener.open(request, timeout=8) as response:
@@ -388,7 +388,7 @@ def decorate(home, result, aggregate_groups, cc_path=None, now=None, *, provider
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='VibeCue API 估算费用与参考汇率')
+    parser = argparse.ArgumentParser(description='VibeCoding Go API 估算费用与参考汇率')
     parser.add_argument('command', choices=('settings', 'save', 'refresh', 'refresh-pricing'))
     parser.add_argument('--home')
     parser.add_argument('--force', action='store_true')

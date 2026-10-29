@@ -70,7 +70,7 @@ def send_params(params):
 
 def unavailable(state='disconnected', connected=False):
     messages = {
-        'legacy_bridge': '当前 Codex 连接尚不支持窗口回复。请在方便时正常退出，再通过 VibeCue 接通 Codex；不会自动重启。',
+        'legacy_bridge': '当前 Codex 连接尚不支持窗口回复。请在方便时正常退出，再通过 VibeCoding Go 接通 Codex；不会自动重启。',
         'disconnected': '正在自动连接 Codex，恢复后即可发送；可以继续查看对话和编辑草稿。',
         'ambiguous_owner': '存在多个 Codex 实例，无法确认此对话的载入归属。请先在对应 Codex 实例打开。',
     }
@@ -423,7 +423,7 @@ def run(operation, params, home=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='VibeCue 用户主动对话操作')
+    parser = argparse.ArgumentParser(description='VibeCoding Go 用户主动对话操作')
     parser.add_argument('operation', choices=('status', 'load', 'send'))
     args = parser.parse_args(argv)
     os.umask(0o077)

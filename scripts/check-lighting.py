@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Offline material/motion evidence, without launching VibeCue or touching settings.
+"""Offline material/motion evidence, without launching VibeCoding Go or touching settings.
 
 Requires only Python's standard library, Swift and the macOS frameworks used by
-VibeCue. Sources are snapshotted into a temporary directory. The real runtime
+VibeCoding Go. Sources are snapshotted into a temporary directory. The real runtime
 model definitions are compiled, but no controller or NSApplication is started.
 The generated frames are 1 pixel per logical point; they are not desktop screen
 captures, compositing/color-management certification, or a judgement of taste.
@@ -315,9 +315,9 @@ def analyze(output: Path, native: dict) -> dict:
               'Inspect 100% crops and full-resolution frames on both backgrounds; shrinking contact sheets hides narrow highlights and seams.',
               'No application controller, Codex connection, live window, installation, notification or audio playback is started.']}
     (output/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
-    parts=['<!doctype html><meta charset="utf-8"><title>VibeCue lighting evidence</title>',
+    parts=['<!doctype html><meta charset="utf-8"><title>VibeCoding Go lighting evidence</title>',
            '<style>body{font:16px system-ui;margin:32px;background:#f3f4f6;color:#17202b}img{max-width:100%}figure{margin:24px 0}code{font-size:13px}a{color:#1465a1}details{margin:20px 0}</style>',
-           '<h1>VibeCue 光照材质：离屏验收帧</h1>',
+           '<h1>VibeCoding Go 光照材质：离屏验收帧</h1>',
            '<p>2560×1440 逻辑像素，同色、同宽、同强度。像素指标仅证明几何和动画行为；舒适度、材质可信度及转角连续性由 100% 图像独立复查。</p>',
            '<p><a href="report.json">指标与限制</a> · <a href="native-report.json">原始采样 / 实际配置持久化结果</a></p>']
     for background in ['dark','light']:

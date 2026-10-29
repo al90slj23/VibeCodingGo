@@ -1,11 +1,11 @@
 #!/bin/zsh
 set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP_DIR="$PROJECT_ROOT/build/VibeCue.app"
+APP_DIR="$PROJECT_ROOT/build/VibeCoding Go.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" /private/tmp/vibecue-swift-cache
 /usr/bin/swiftc -O -whole-module-optimization -module-cache-path /private/tmp/vibecue-swift-cache \
   -framework AppKit -framework Foundation -framework AVFoundation -framework WebKit \
-  "$PROJECT_ROOT"/Sources/*.swift -o "$APP_DIR/Contents/MacOS/VibeCue"
+  "$PROJECT_ROOT"/Sources/*.swift -o "$APP_DIR/Contents/MacOS/VCGo"
 cp "$PROJECT_ROOT/assets/Info.plist" "$APP_DIR/Contents/Info.plist"
 if [[ -f "$PROJECT_ROOT/assets/AppIcon.icns" ]]; then
   cp "$PROJECT_ROOT/assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"

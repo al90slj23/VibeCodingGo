@@ -2,7 +2,7 @@
 
 CC Switch 4.0.21 obtains Codex OAuth quota through a Tauri command and keeps its
 successful snapshots in an in-process UsageCache. Its proxy has no quota export
-route. VibeCue therefore cannot treat its SQLite price/usage ledger as a live
+route. VibeCoding Go therefore cannot treat its SQLite price/usage ledger as a live
 account-quota feed. This adapter deliberately opens only the app's public plist;
 it never opens a CC database, settings file, auth file, keychain or network API.
 """
@@ -63,7 +63,7 @@ def status(app_paths=None, data_root=None):
         'message': '当前未接通 CC Switch 的账号额度共享接口。已核对的 4.0.21 版本通过内部命令查询额度，'
                    '结果只保存在运行进程内，未提供可复用的本地额度接口。\n\n'
                    '本周已用比例和重置时间，请在 CC Switch 的授权中心查看。'
-                   'VibeCue 不读取或复制它的登录 Token，也不发起新的账号授权。'
+                   'VibeCoding Go 不读取或复制它的登录 Token，也不发起新的账号授权。'
     }
 
 

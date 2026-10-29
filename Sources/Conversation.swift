@@ -139,7 +139,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         windowGeometry = CueConversationWindowState.shared(home: home)
         self.detailProvider = detailProvider; self.onHandled = onHandled; self.onCodex = onCodex; self.onConnect = onConnect; self.onPathAction = onPathAction
         let window = CueConversationWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 820), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "VibeCue · " + event.title; window.isReleasedWhenClosed = false
+        window.title = "VibeCoding Go · " + event.title; window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 640, height: 580); window.titlebarAppearsTransparent = true; window.backgroundColor = CueConversationColors.background
         let minimum = window.frameRect(forContentRect: NSRect(origin: .zero, size: window.contentMinSize)).size
         if let saved = windowGeometry.restoredFrame(screens: CueConversationWindowState.visibleScreens, minimum: minimum) {
@@ -371,7 +371,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         source.toolTip = data["message"] as? String
         if data["unchanged"] as? Bool == true { return }
         guard readable else { if bodySignature.isEmpty { transcript.update(messages: [], state: "empty", message: data["message"] as? String ?? "当前对话记录暂不可用。") }; return }
-        if let title = data["title"] as? String, !title.isEmpty { titleField.stringValue = title; titleField.toolTip = title; window?.title = "VibeCue · " + title }
+        if let title = data["title"] as? String, !title.isEmpty { titleField.stringValue = title; titleField.toolTip = title; window?.title = "VibeCoding Go · " + title }
         let messages = data["messages"] as? [[String: Any]] ?? []
         attachmentPaths = Set(messages.flatMap { $0["attachments"] as? [[String: Any]] ?? [] }.compactMap { row in
             guard let path = row["path"] as? String, path.hasPrefix("/") else { return nil }
@@ -616,8 +616,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         controller.connectionGeneration += 1; controller.checking = true
         controller.finishConnectionCheck(.success(["supported": true, "connected": true, "state": "active", "can_send": true, "message": "过期 owner 的迟到结果"]), generation: oldGeneration)
         results["status_reply_from_before_a_restart_cannot_reenable_sending"] = controller.automaticReconnect && !controller.canSend && !controller.checking && controller.connection.stringValue == "正在自动恢复 Codex 连接…"
-        controller.applyChatStatus(["supported": false, "connected": false, "state": "unavailable", "can_send": false, "auto_reconnect": false, "message": "此版本协议需要更新 VibeCue"])
-        results["nonretryable_connection_reasons_are_not_hidden_as_a_restart"] = !controller.automaticReconnect && !controller.connectButton.isHidden && controller.connection.stringValue == "此版本协议需要更新 VibeCue"
+        controller.applyChatStatus(["supported": false, "connected": false, "state": "unavailable", "can_send": false, "auto_reconnect": false, "message": "此版本协议需要更新 VibeCoding Go"])
+        results["nonretryable_connection_reasons_are_not_hidden_as_a_restart"] = !controller.automaticReconnect && !controller.connectButton.isHidden && controller.connection.stringValue == "此版本协议需要更新 VibeCoding Go"
         controller.applyChatStatus(["supported": true, "connected": true, "transport": "desktop_ipc", "state": "waiting", "can_send": false, "message": "请先在 Codex 回答当前问题"])
         results["desktop_pending_input_blocks_send_with_actionable_reason"] = !controller.sendButton.isEnabled && controller.sendButton.toolTip == "请先在 Codex 回答当前问题"
         var released = 0
@@ -675,13 +675,13 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
 
     private static func fixtureController(dark: Bool, width: CGFloat = 1000) -> (CueConversationController, URL) {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-conversation-capture-" + UUID().uuidString)
-        let event = CueEvent(runningThreadID: "conversation-fixture", title: "VibeCue｜对话排版与后续任务", date: Date())
+        let event = CueEvent(runningThreadID: "conversation-fixture", title: "VibeCoding Go｜对话排版与后续任务", date: Date())
         let controller = CueConversationController(home: home, event: event, detailProvider: { nil }, onHandled: {}, onCodex: {}, onConnect: {}, onPathAction: { _ in })
         controller.fixtureMode = true
         controller.window?.setContentSize(NSSize(width: width, height: 820))
         controller.window?.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         controller.window?.setFrameOrigin(NSPoint(x: -10000, y: -10000)); controller.window?.orderFrontRegardless()
-        controller.applyTranscript(["thread_id": event.threadID, "title": "VibeCue｜对话排版与后续任务", "cwd": "/Users/example/Projects/VibeCue", "source_readable": true, "coverage": ["partial": true], "messages": [
+        controller.applyTranscript(["thread_id": event.threadID, "title": "VibeCoding Go｜对话排版与后续任务", "cwd": "/Users/example/Projects/VibeCoding Go", "source_readable": true, "coverage": ["partial": true], "messages": [
             ["id": "user-one", "turn_id": "turn-one", "role": "user", "phase": "user", "text": "把对话窗口按 Codex 的格式整理一下，代码和表格要能正常阅读。后续需求我会稍后继续。"],
             ["id": "comment-one", "turn_id": "turn-one", "role": "assistant", "phase": "commentary", "text": "我会对照当前排版，先检查内容和交互，再调整阅读区与输入区。"],
             ["id": "final-one", "turn_id": "turn-one", "role": "assistant", "phase": "final_answer", "text": "正文已按 Codex 的阅读方式整理。\n\n## 本次调整\n\n- **阅读区**：保留清晰的层级，减少常驻标签和边框。\n- **代码与表格**：正常排版，支持复制与横向滚动。\n- **待续记录**：关闭窗口后保留，备注可以按需展开。\n\n```swift\nlet status = ConversationState.connected\nawait conversation.send(message)\n```\n\n| 项目 | 状态 |\n| --- | --- |\n| Markdown 排版 | 已完成 |\n| 草稿与备注 | 自动保存 |\n\n> 本轮结束不等于所有需求都处理完。你可以在方便时继续。"]

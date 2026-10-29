@@ -34,7 +34,7 @@ MESSAGES = {
     'interface_changed': '新版 CC Switch 的额度接口发生变化，需要更新适配器。',
     'setup_changed': '新版 CC Switch 的启动结构发生变化，暂不自动插入共享模块。',
     'module_conflict': '源码中已有不同的额度共享模块，暂不覆盖。',
-    'template_unavailable': 'VibeCue 额度共享模块模板不可用。',
+    'template_unavailable': 'VibeCoding Go 额度共享模块模板不可用。',
     'write_failed': '额度共享源码适配未能保存，原始内容已恢复。',
 }
 

@@ -1,6 +1,14 @@
-# VibeCue — AI Coding Companion
+# VibeCoding Go（VCGo）— AI Coding Companion
 
-原生 macOS AI 开发提醒助手。提醒的重点是“哪个对话、什么状态、是否需要我”，目前支持 Codex。
+[GitHub · al90slj23/VibeCodingGo](https://github.com/al90slj23/VibeCodingGo)
+
+原生 macOS AI 编程助手。集中管理并行任务、对话与待续工作，查看 Token 用量、API 参考费用和账号额度，在需要你时提醒。当前任务交互主要支持 Codex，用量统计接入 Codex、Claude Code 与 OpenCode，并为后续开发工具保留扩展入口。
+
+## 项目名称与兼容升级
+
+0.26.0 起，项目由 VibeCue 更名为 **VibeCoding Go**，简称 **VCGo**；源码与仓库名称为 `VibeCodingGo`。应用为 `/Applications/VibeCoding Go.app`，可执行程序为 `VCGo`，常用命令入口为 `./scripts/vcgo`。
+
+升级沿用已有设置、草稿、提醒历史、用量账本与 CC Switch 额度桥接。为保持系统权限和旧 hooks 连续，内部 `local.vibecue` 标识、`vibecue` Python 模块、`VIBECUE_HOME`、旧命令别名及 `~/Library/Application Support/VibeCue/` 数据目录保留兼容；旧应用会在验证归属后归档到私有备份目录。历史设计记录保留当时的产品名称。
 
 ## 外观与分类
 
@@ -18,11 +26,11 @@
 
 0.18 补齐 macOS 原生编辑快捷键、跨对话共享的窗口位置和大小记忆，并加入 Codex 当前登录账号的订阅额度面板。
 
-0.19 加入 CC Switch 多账号额度共享：由 CC Switch 使用它已有的授权独立查询各账号，VibeCue 只读本机的身份与数字快照，不切换账号、不新建授权。对话顶部跳转改为醒目的文字按钮；修复长对话状态快照超过 8 MiB 时无法接通的问题。
+0.19 加入 CC Switch 多账号额度共享：由 CC Switch 使用它已有的授权独立查询各账号，VibeCoding Go 只读本机的身份与数字快照，不切换账号、不新建授权。对话顶部跳转改为醒目的文字按钮；修复长对话状态快照超过 8 MiB 时无法接通的问题。
 
 0.19.1 补上 Codex 重启、连接替换和系统唤醒后的自动重连。只读状态查询会重新发现 socket 与对话归属，失败后短退避继续检查；暂时断线显示自动恢复进度，不再要求手动点击。旧连接均失效时改查新的桌面连接，真实多实例归属歧义、版本及权限问题仍明确提示。草稿和未确认发送的锁保留，重连不会重发消息或启动任务。
 
-0.20 为 CC Switch 官方升级增加自动维护：每分钟检查已安装版本及二进制指纹，同一官方版本可恢复已验证缓存；新版从对应官方 tag 取源码，经结构适配、桥接测试、构建与验签后，在后台空闲时正常重启并恢复共享。不会把旧版覆盖到新版，也不会强制结束应用。升级、接口暂不兼容、导出被覆盖或查询失败期间，两个账号的最后成功额度由 VibeCue 独立私有缓存保留，明确标注读取时间与非实时状态；新鲜配置已删除的账号不会复活。
+0.20 为 CC Switch 官方升级增加自动维护：每分钟检查已安装版本及二进制指纹，同一官方版本可恢复已验证缓存；新版从对应官方 tag 取源码，经结构适配、桥接测试、构建与验签后，在后台空闲时正常重启并恢复共享。不会把旧版覆盖到新版，也不会强制结束应用。升级、接口暂不兼容、导出被覆盖或查询失败期间，两个账号的最后成功额度由 VibeCoding Go 独立私有缓存保留，明确标注读取时间与非实时状态；新鲜配置已删除的账号不会复活。
 
 0.21 调整用量窗口的日历热力图、摘要卡片和请求表布局，避免月标签相撞与滚动条遮住数据。金额始终使用完整货币单位，人民币采用千分位和后置 `¥`，不再缩写为 K/M。悬停预览会先清理内部提问回复包装，再显示 Markdown 排版，同时保留文字选择、跟随最新和悬停暂停滚动。
 
@@ -46,7 +54,7 @@
 
 模型价格按可编辑的优先级队列逐模型回退，默认依次为手动单价、CC Switch 本机价格、BaseLLM、models.dev、LiteLLM、OpenRouter、Vercel。支持添加公开 HTTPS JSON 来源、编辑、启停、上下移动和删除；原厂 models.dev 价格保留原厂身份，其他平台保留命名空间，避免同名优惠价串入基础参考价。来源界面可查看模型数、读取时间、缓存状态和实际 URL；模型单价编辑器显示最终采用的来源。
 
-公开价格默认每 6 小时更新，可设 30 分钟至 7 天，独立于历史同步频率。更新失败保留最后成功快照并标明缓存，后台有失败退避与进程去重；普通统计查询只读本地缓存。仅匿名获取目录，不上传对话、用量或账号授权。NACP 的多个来源适配和来源快照作为参考，VibeCue 新增跨来源优先级策略。BaseLLM 的固定线性 Token 表达式通过严格语法识别，不执行表达式；复杂分层、按次/图片/秒价格会跳过交给后续来源。未知缓存单价保持未知，显式零价与未定价分别处理，费用仍是基础 API 参考估算。
+公开价格默认每 6 小时更新，可设 30 分钟至 7 天，独立于历史同步频率。更新失败保留最后成功快照并标明缓存，后台有失败退避与进程去重；普通统计查询只读本地缓存。仅匿名获取目录，不上传对话、用量或账号授权。NACP 的多个来源适配和来源快照作为参考，VibeCoding Go 新增跨来源优先级策略。BaseLLM 的固定线性 Token 表达式通过严格语法识别，不执行表达式；复杂分层、按次/图片/秒价格会跳过交给后续来源。未知缓存单价保持未知，显式零价与未定价分别处理，费用仍是基础 API 参考估算。
 
 自定义“标准 JSON”格式（单位均为 USD / 百万 Tokens）：
 
@@ -59,18 +67,18 @@
 - **菜单栏概览**：图标旁常驻显示“运行 N · 待办 N | 今日 N T · ≈费用”。运行按对话 ID 去重；待处理合并未读、待续与中断对话并排除正在运行的对话，同一对话只计一次。今日用量按本机时区统计全部已接入应用，和用量统计窗口共用账本与 API 单价、货币及汇率设置。默认每 30 秒只读刷新显示、每 10 分钟同步源历史，间隔可在统计设置中修改；同步结束、费用设置变更、唤醒或日期／时区变化会提前刷新。尚未成功同步或读取失败时显示“—”，跨日不沿用昨天的数值。费用含未定价记录时显示星号，悬停查看精确数字、同步时间、汇率和覆盖提示。
 - **秒级耗时**：本轮耗时独立放在列表右侧、状态下方，运行中每秒更新到秒；完成、等待和中断后固定在已记录的工作时间。计时只更新文字，不重建行，不影响勾选、滚动与悬停；列表关闭后停止计时刷新。
 
-- **最近提醒**：左键菜单栏图标打开可滚动面板，每次最多显示 12 条（随屏幕高度调整）。未读提醒自动置顶，手动置顶在打开后仍保留；置顶项不占普通历史的 50 条额度。普通历史按最近打开时间保留，老任务刚打开也可再次标为未读。蓝色表示未读，灰色表示已查看；提醒的查看状态按每条独立记录，待续按对话独立记录，均在重启后保留。关闭提示卡、提醒超时或批准请求解除都不会冒充“已打开”。右键提醒可选择“标为未读”“置顶／取消置顶”“删除”；删除只移除 VibeCue 提醒记录，不删除原对话。右键菜单栏图标仍提供快捷菜单。
+- **最近提醒**：左键菜单栏图标打开可滚动面板，每次最多显示 12 条（随屏幕高度调整）。未读提醒自动置顶，手动置顶在打开后仍保留；置顶项不占普通历史的 50 条额度。普通历史按最近打开时间保留，老任务刚打开也可再次标为未读。蓝色表示未读，灰色表示已查看；提醒的查看状态按每条独立记录，待续按对话独立记录，均在重启后保留。关闭提示卡、提醒超时或批准请求解除都不会冒充“已打开”。右键提醒可选择“标为未读”“置顶／取消置顶”“删除”；删除只移除 VibeCoding Go 提醒记录，不删除原对话。右键菜单栏图标仍提供快捷菜单。
 - **当前模型设置**：复用已有 Codex 本机连接，只投影当前对话的模型、强度和速度字段；显式的下一轮选择优先于仍在执行的旧轮参数。列表保留的对话 ID 以 0600 私有文件请求查询，订阅上限 64，按运行任务和近期对话优先、再查询保留列表，先处理未查询或最久未查询项；不会为了查设置恢复线程或打开新模型请求。只读状态流有 32 MiB 有界快照预算，解析后仅保留请求标识和设置元数据，正文不缓存或落盘。已有连接的变更会随 watcher 约 5 秒刷新到列表、悬停与对话窗。断连、超时或未加载时明确显示当前不可读，旧值仅标本轮／上次记录。显式 priority/fast 显示闪电，default 显示标准；null 显示跟随默认，不擅自猜测闪电关闭。
-- **行内快捷操作**：每行右侧常驻跳转 Codex、手动置顶、标为未读、更多四个按钮；直接跳转绕过 VibeCue 对话窗。未读自动置顶，手动固定在打开后继续保留；已未读按钮显示当前状态，更多菜单保留完整路径、复制、删除与待续操作。批量模式隐藏行内按钮，避免与勾选冲突。行内新增模型、强度、速度和 Tokens，耗时继续在右侧状态下每秒更新。
+- **行内快捷操作**：每行右侧常驻跳转 Codex、手动置顶、标为未读、更多四个按钮；直接跳转绕过 VibeCoding Go 对话窗。未读自动置顶，手动固定在打开后继续保留；已未读按钮显示当前状态，更多菜单保留完整路径、复制、删除与待续操作。批量模式隐藏行内按钮，避免与勾选冲突。行内新增模型、强度、速度和 Tokens，耗时继续在右侧状态下每秒更新。
 - **Codex 下一步建议**：当前安装版本只把原生输入建议保存在 Codex 内存缓存，现有共享接口无法读取。按用户选择暂不额外生成，不增加模型请求；尚未接通 Tab 接受原生建议。[核对依据与接口边界](docs/codex-prompt-suggestions.md)。
-- **查看与待续**：点击列表中的任务打开 VibeCue 独立对话窗口，展示最近用户／助手消息；不再默认跳回 Codex。查看只标记“看过”，并建立独立的待续记录。直接关闭、只阅读、保存草稿或发送消息都不表示整项工作完成；明确点击窗口的“标记完成”或菜单的“标记处理完成”才移出待续。可以保存“下次从哪里继续”的备注，待续与置顶都不占普通历史 50 条额度。旧已读记录保留原状态，不批量改成待续。
+- **查看与待续**：点击列表中的任务打开 VibeCoding Go 独立对话窗口，展示最近用户／助手消息；不再默认跳回 Codex。查看只标记“看过”，并建立独立的待续记录。直接关闭、只阅读、保存草稿或发送消息都不表示整项工作完成；明确点击窗口的“标记完成”或菜单的“标记处理完成”才移出待续。可以保存“下次从哪里继续”的备注，待续与置顶都不占普通历史 50 条额度。旧已读记录保留原状态，不批量改成待续。
 - **编辑与窗口记忆**：原生编辑菜单支持 ⌘C／⌘X／⌘V／⌘A、撤销与重做；正文可选择复制，输入框和备注可剪贴编辑。所有对话共用最近一次调整的位置与大小，写入独立 0600 的 `conversation-window.json`；移动／缩放后自动保存，重新启动、打开其他对话同样恢复。屏幕移除或变小时自动移回可见区域，旧窗口关闭不会覆盖后来调整，测试截图不保存离屏位置。
 - **对话排版**：正文遵循 Codex 的 14px／22px 系统字体和 768px 阅读列，跟随深浅外观，不再逐条显示“你／Codex + 时间”。标题、列表、引用、表格及代码块正常排版，常见语言离线语法高亮，代码与整条回复可复制；工具操作按轮次折叠，仅展示安全的名称／状态，不包含参数、输出或推理。明确的用户附件显示入口，不自动加载图片。清除内部消息包装与同轮镜像重复，保留不同轮的相同文字。向上阅读时保持消息位置，选中文本时保留选择；备注按需展开，输入框随内容增高；Enter 发送、Shift+Enter 换行，中文输入法正在组词时不提交。
 - **详情回复**：查看窗口只发现已有对话归属、读取运行状态，不自动载入、续跑或发送。点击“发送到当前对话”后，文字交给现有 Codex 对话：运行时作为补充，本轮刚结束时会开始新一轮。不创建新的 app-server，不切换授权，也不改模型、权限或审批模式。此前尚未在桌面打开的对话，需要先点击“在 Codex 打开”；就绪后窗口自动接通。最多 8192 UTF-8 字节，超限不截断。消息按请求 ID 保存无正文回执，提交后超时明确显示待确认并锁住重复发送，不自动重试或换通道重发，需核对后主动解锁。草稿始终由用户点击才提交。批准和结构化问题仍在 Codex 处理，不自动决定。显式接通的旧 stdio 通道仍可使用。
 - **右键操作**：任务、运行、中断和待续行提供查看对话、在 Codex 打开、待续／处理完成、置顶及本地移除；提醒行保留已读／未读控制。可复制标题、对话 ID、链接、项目路径、会话日志路径，在访达打开项目或定位记录，以及用终端打开项目目录。路径从只读元数据获取，远程或不存在的目录会明确提示，不猜测位置。
 - **首次悬停**：菜单栏列表无需先点击激活，鼠标经过即能触发延迟预览；使用非激活跟踪与位置核对，不抢输入焦点。
 - **正在运行**：列表顺序为置顶提醒 → 正在运行 → 中断待续 → 普通历史。绿色运行行点击打开对应对话，不生成提醒、不占历史额度；同一对话已在置顶时显示运行徽标，不重复列出。依本机明确的任务生命周期、工具调用和回复事件判断，完成、中止和阻塞式提问后移出；异步提问后继续工作的任务仍显示。监听启动只恢复有限尾部状态，不补发历史提醒。无法读取、监控断连或超过 24 小时没有活动证据的状态不冒充正在运行。
-- **中断保留**：任务导航元数据持久保存在私有 `task-recovery.json`，不因 Codex 或 VibeCue 重启消失。已观察到本轮中断，或此前进程实例消失且未见完成时，显示橙色“中断待续”；无法核实运行连续性时显示“运行待确认”。只打开对话不会清除标记，实际续跑／完成才更新；右键可明确移除。置顶任务附中断徽标，其他中断任务独立分组，均不占普通历史 50 条额度。不自动发送继续消息或恢复任务。只保留标题、ID、数字和已知记录路径，不保存对话正文或凭据。
+- **中断保留**：任务导航元数据持久保存在私有 `task-recovery.json`，不因 Codex 或 VibeCoding Go 重启消失。已观察到本轮中断，或此前进程实例消失且未见完成时，显示橙色“中断待续”；无法核实运行连续性时显示“运行待确认”。只打开对话不会清除标记，实际续跑／完成才更新；右键可明确移除。置顶任务附中断徽标，其他中断任务独立分组，均不占普通历史 50 条额度。不自动发送继续消息或恢复任务。只保留标题、ID、数字和已知记录路径，不保存对话正文或凭据。
 - **批量模式**：列表可勾选置顶、运行中或单个项目，以 Codex 对话 ID 去重；勾选时点行只切换选择，不跳转。批量弹窗独立选择模型、强度及闪电，均可保持原设置。桌面连接使用本机模型缓存，并明确显示来源；旧 stdio 通道可读取实时目录。闪电描述随模型变化，不统一承诺 1.5 倍。批量新设置用于后续轮次，不发送消息或打断当前任务；未载入当前 Codex 的对话逐项提示先打开。结果区分已确认、待确认和失败，不把提交请求当成成功。
 - **本轮详情与悬停**：显示本轮耗时、Tokens，浮窗补充输入／输出／缓存、模型、强度与速度。只有有限尾部证据时标明部分或下限，不把全会话累计当本轮；缺失保持未知。悬停约 0.45 秒显示最近用户／助手可见消息，支持文本选择、手动滚动、慢滚与跟随最新，移入浮窗暂停自动滚动。只读最近 2 MiB，正文最多每对话 8 条／12K 字符，另限制全局正文与状态文件大小；不展示系统、推理或工具参数，常见凭据做脱敏。预览保存在本机私有 `watcher-state.json` 短期快照，不写入用量账本。详情只读原日志及压缩日志的有限尾部，不持久缓存会话正文；离线 WebKit 渲染器不请求网络，禁用正文 HTML、自动导航和远程媒体，链接只在主动点击后交给原生校验；关闭详情窗口后释放渲染器；用户主动输入的草稿和备注单独保存在 0600 的 `conversation-drafts.json`，不会进入用量库。
 - **待确认提醒接通**：浏览器 MCP 表单／URL／用户验证、真实提问与选项请求均纳入已观察请求的等待与解除流程；自动响应或已解除请求不回放。批量控制与批准监听自动复用现有桌面连接。主列表按真实能力显示连接状态；断线自动重试，恢复后移除诊断按钮。批量窗口可见时每 5 秒重查连接并保留未提交参数、已有结果，不自动重放设置。仅增加模型／强度／速度控制，不提供批准决策或权限变更；详情窗口的载入和消息输入需用户另行明确触发。
@@ -79,10 +87,10 @@
 - **用量口径**：从日志已有的 usage 数字读取，Codex 优先单次用量、缺失时对累计值做差；缓存与 reasoning 按协议去重。有父会话证据的分叉／子代理，沿各代分叉时间限定的祖先链，按完整用量数字签名与物理顺序剥除连续继承前缀；零值状态快照不会结束继承前缀。重写时间戳或同一毫秒的历史重放不算新请求，分叉后真实新用量保留。旧去重规则升级前先私有备份用量库，再只重建 Codex 缓存，保留其他来源与提醒记录。历史没有供应商信息时只标为会话来源，缺少模型保留 unknown；不推测供应商、账单、速度或 HTTP 状态。数据说明会展示不可读、暂缓或跳过的记录。
 - **OpenCode**：只读 SQLite 的 V1 `message`、V2 `session_message` 用量字段和旧版 `storage/message` JSON；不读取正文、消息 part 或认证数据。支持 SQLite WAL、旧历史补入、同一消息流式更新，以及迁移、复制、重复目录防重。输入按 fresh input，独立 reasoning 归入输出一次；V2 已结束或失败的压缩请求也计入。来源筛选显示日志实际记录的 provider ID。旧版负 visible output 仅在与 reasoning 合并非负且精确符合明确 `tokens.total` 时兼容，不凭负值擅自抬高总量。
 - **API 参考费用**：用量窗口提供“费用与汇率”，按四种互斥 Token 分类和精确模型 ID 读取 CC Switch `model_pricing` 单价，也支持按模型自定义美元／百万 Tokens 单价。新增输入、输出、缓存读取、缓存写入分别计算，不把缓存再计为普通输入。缺少单价显示未定价；混合汇总显示已定价小计及未定价条数。历史按当前单价重估，未记录的阶梯、长上下文或服务档位差价不推断，不等同订阅扣款。可选人民币、美元或双币；人民币支持手动汇率或 [Frankfurter](https://frankfurter.dev/) 公开 USD/CNY 日参考汇率，缓存 6 小时，失败保留标记过期的旧值，缺少汇率时不造默认值。只向固定公开端点请求币种，不发送账号或用量。
-- **Codex 账号额度**：菜单栏右键菜单和用量统计窗口提供入口，每 60 秒读取各账号每周及短窗口剩余比例、重置时间和读取时间。当前 Codex 账号使用[官方只读账号接口](https://learn.chatgpt.com/docs/app-server)。多个 CC Switch 账号通过[可选本机共享桥接](integrations/ccswitch/README.md)独立查询，由 CC Switch 自己管理已有授权、刷新锁与令牌轮换，VibeCue 不读取它的授权文件；每账号失败、超时或过期单独标记。相同服务账号按 ID 去重，无需来回切换。官方原版 CC Switch 4.0.21 没有外部共享接口，需要安装带此小补丁的同版本 CC Switch 并启用共享，原始应用保留备份。快照仅含白名单身份与数值，以 0600 原子保存；不发起新授权、不切账号、不发送模型请求，也不把订阅额度混进 Token 账本或 API 费用。
+- **Codex 账号额度**：菜单栏右键菜单和用量统计窗口提供入口，每 60 秒读取各账号每周及短窗口剩余比例、重置时间和读取时间。当前 Codex 账号使用[官方只读账号接口](https://learn.chatgpt.com/docs/app-server)。多个 CC Switch 账号通过[可选本机共享桥接](integrations/ccswitch/README.md)独立查询，由 CC Switch 自己管理已有授权、刷新锁与令牌轮换，VibeCoding Go 不读取它的授权文件；每账号失败、超时或过期单独标记。相同服务账号按 ID 去重，无需来回切换。官方原版 CC Switch 4.0.21 没有外部共享接口，需要安装带此小补丁的同版本 CC Switch 并启用共享，原始应用保留备份。快照仅含白名单身份与数值，以 0600 原子保存；不发起新授权、不切账号、不发送模型请求，也不把订阅额度混进 Token 账本或 API 费用。
 - **后台同步**：启动后与后台每 10 分钟扫描，打开用量窗口后可手动同步并查看进度，扫描和查询均在后台执行。用量缓存只保存数字、模型和会话标识，不保存正文或凭据，不修改源日志。明细保留在本机私有 `usage.sqlite3`，不进行 30 天删除。
 
-默认读取 `CODEX_HOME`（未设置时为 `~/.codex`）下的 `sessions`、`archived_sessions`、`CLAUDE_CONFIG_DIR`（未设置时为 `~/.claude`）下的 `projects`，以及 `XDG_DATA_HOME`（未设置时为 `~/.local/share`）下的 `opencode`；识别软链接。`OPENCODE_DB` 可直接指定 OpenCode 数据库。Codex 的 `.jsonl.zst` 需要本机已有的 `zstd`，没有解码器时明确提示覆盖缺失。需要额外目录时可在 VibeCue 数据目录建立 `usage-sources.json`；列出的键覆盖对应默认来源，空数组关闭该工具的采集：
+默认读取 `CODEX_HOME`（未设置时为 `~/.codex`）下的 `sessions`、`archived_sessions`、`CLAUDE_CONFIG_DIR`（未设置时为 `~/.claude`）下的 `projects`，以及 `XDG_DATA_HOME`（未设置时为 `~/.local/share`）下的 `opencode`；识别软链接。`OPENCODE_DB` 可直接指定 OpenCode 数据库。Codex 的 `.jsonl.zst` 需要本机已有的 `zstd`，没有解码器时明确提示覆盖缺失。需要额外目录时可在 VibeCoding Go 数据目录建立 `usage-sources.json`；列出的键覆盖对应默认来源，空数组关闭该工具的采集：
 
 ```json
 {"codex_roots": ["/path/to/codex"], "claude_roots": ["/path/to/claude/projects"], "opencode_roots": ["/path/to/opencode"]}
@@ -102,14 +110,14 @@
 
 ## 安装
 
-需要 macOS 13 以上、Xcode Command Line Tools 的 Swift 与 `/usr/bin/python3`。没有第三方运行依赖，不需要给 VibeCue 配置 API key。
+需要 macOS 13 以上、Xcode Command Line Tools 的 Swift 与 `/usr/bin/python3`。没有第三方运行依赖，不需要给 VibeCoding Go 配置 API key。
 
 ```sh
 ./scripts/build.sh
 /usr/bin/python3 scripts/install.py
 ```
 
-- App：`/Applications/VibeCue.app`
+- App：`/Applications/VibeCoding Go.app`
 - 私有设置和事件：`~/Library/Application Support/VibeCue/`
 - 登录启动：`~/Library/LaunchAgents/local.vibecue.plist`
 
@@ -119,7 +127,7 @@
 
 窗口回复、真实人工批准提醒与批量设置默认自动复用正在运行的 Codex 桌面连接，无需退出 Codex 或重新授权。只跟随现有对话 owner，不注册 ownership、接管线程或自动载入对话。尚未在 Codex 打开的对话仍需主动打开，服务不会为取得状态而启动任务。
 
-原始 `PermissionRequest` hook 发生在审批流程之前，**不能证明正在等人操作**。VibeCue 不用它触发提醒，也不根据等待时间、命令速度、自动审核结果或单一 `waitingOnApproval` 标志猜测。桌面订阅只读取实际客户端请求的待处理／已解除状态，包含命令、文件、权限、浏览器 MCP 表单／URL 验证、提问和选项；请求自动响应、解除、结束或观察断连时撤下提示。短暂请求先核对是否仍在等待，不把自动审查过程当作人工批准。
+原始 `PermissionRequest` hook 发生在审批流程之前，**不能证明正在等人操作**。VibeCoding Go 不用它触发提醒，也不根据等待时间、命令速度、自动审核结果或单一 `waitingOnApproval` 标志猜测。桌面订阅只读取实际客户端请求的待处理／已解除状态，包含命令、文件、权限、浏览器 MCP 表单／URL 验证、提问和选项；请求自动响应、解除、结束或观察断连时撤下提示。短暂请求先核对是否仍在等待，不把自动审查过程当作人工批准。
 
 自动恢复在本机监控进程内运行，使用一个持久连接跟随最多 64 个近期活跃对话，逐步发现现有 owner；旧中断任务继续保留导航记录，实际续跑后自动纳入实时监听，避免拉取长期未动的超大会话快照。首次有界快照仅在内存中解析，保留请求标识与状态投影；后续只处理请求相关增量，不缓存消息正文、工具参数、URL 或验证内容。增量版本缺口、owner 退出或 socket 断开时清除不确定的等待，以 1–30 秒退避重新连接并获取新快照。Codex 重新打开后会自动恢复；与旧 stdio 监听同时存在时避免双报。
 
@@ -130,12 +138,12 @@
 原透明 stdio 监听仍兼容；若需要手动使用旧入口，可在正常退出 Codex 后执行：
 
 ```sh
-./scripts/vibecuectl launch-codex
+./scripts/vcgo launch-codex
 # 或显式准备旧入口，等待自己退出后再打开
-./scripts/vibecuectl launch-codex --wait-for-exit
+./scripts/vcgo launch-codex --wait-for-exit
 ```
 
-旧入口仅通过本次启动的 `CODEX_CLI_PATH` 覆盖指向透明监听，不改动 Codex 安装包、凭据、沙箱或审批模式。等待不再有 30 分钟自动过期限制；所属 VibeCue 实例退出后取消。日常窗口、列表和设置不再用这个等待退出流程作为连接前提。
+旧入口仅通过本次启动的 `CODEX_CLI_PATH` 覆盖指向透明监听，不改动 Codex 安装包、凭据、沙箱或审批模式。等待不再有 30 分钟自动过期限制；所属 VibeCoding Go 实例退出后取消。日常窗口、列表和设置不再用这个等待退出流程作为连接前提。
 
 协议参考：[Codex App Server](https://learn.chatgpt.com/docs/app-server)、[Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)。桌面 follower 协议属于本机已核对实现，并非公开稳定 API。模拟请求与重连测试、真实只读连接和实际人工提醒验收分别记录，不混为同一种验证。
 
@@ -149,7 +157,7 @@
 - 最后回复中明确要求用户确认或选择，也会以保守文本规则识别；提示会标注「依回复文本判断」，可能存在漏判或误判。
 - 本地记录格式属于内部接口；没有落到这台电脑上的云端或其他电脑对话不在本地记录监控范围。
 
-原有 `config.toml`、computer-use 的 `notify` 与其他工具的 hooks 保持原样。安装器仅加入可选的结构化提问 hook，并移除 VibeCue 自己的旧权限请求回调。完成和提问监控不依赖 hooks。可选提问 hook 若要启用，在 `/hooks` 中审阅 `PreToolUse` 项目；安装器不会替用户信任。
+原有 `config.toml`、computer-use 的 `notify` 与其他工具的 hooks 保持原样。安装器仅加入可选的结构化提问 hook，并移除 VibeCoding Go 自己的旧权限请求回调。完成和提问监控不依赖 hooks。可选提问 hook 若要启用，在 `/hooks` 中审阅 `PreToolUse` 项目；安装器不会替用户信任。
 
 ```sh
 ./scripts/review-hooks.sh
@@ -161,34 +169,34 @@
 ## 控制与验证
 
 ```sh
-./scripts/vibecuectl status
-./scripts/vibecuectl test complete
-./scripts/vibecuectl test input
-./scripts/vibecuectl test permission  # 明确的人工提醒测试，不是假装有真实待批请求
-./scripts/vibecuectl stop
-./scripts/vibecuectl start
+./scripts/vcgo status
+./scripts/vcgo test complete
+./scripts/vcgo test input
+./scripts/vcgo test permission  # 明确的人工提醒测试，不是假装有真实待批请求
+./scripts/vcgo stop
+./scripts/vcgo start
 /usr/bin/python3 scripts/uninstall.py
 ```
 
-菜单栏提供暂停、静音、最近提醒、测试和设置入口。卸载会移除 VibeCue 的登录入口与 hook，保留程序及个人数据。
+菜单栏提供暂停、静音、最近提醒、测试和设置入口。卸载会移除 VibeCoding Go 的登录入口与 hook，保留程序及个人数据。
 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -v
-build/VibeCue.app/Contents/MacOS/VibeCue --appearance-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --sound-source-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --preview-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --recent-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --conversation-renderer-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --usage-dashboard-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --usage-money-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --usage-schedule-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --window-preview-self-test  # 短暂显示无声测试窗口
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --appearance-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --sound-source-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --preview-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --recent-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --conversation-renderer-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --usage-dashboard-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --usage-money-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --usage-schedule-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --window-preview-self-test  # 短暂显示无声测试窗口
 /usr/bin/python3 scripts/check-lighting.py --output /private/tmp/vibecue-lighting-review
-build/VibeCue.app/Contents/MacOS/VibeCue --resolution-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --event-validation-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --customization-self-test
-build/VibeCue.app/Contents/MacOS/VibeCue --effects-contact-sheet /private/tmp/vibecue-effects.png
-build/VibeCue.app/Contents/MacOS/VibeCue --cards-contact-sheet /private/tmp/vibecue-cards.png
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --resolution-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --event-validation-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --customization-self-test
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --effects-contact-sheet /private/tmp/vibecue-effects.png
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --cards-contact-sheet /private/tmp/vibecue-cards.png
 ```
 
 验证覆盖原始字节转发、自动审查静默、人工请求与解除配对、快速响应竞态、隐私文件、历史不重播、异常恢复，以及样式迁移和渲染。测试使用模拟后端，不会创建真实任务。声音播放状态不能代替人耳确认。

@@ -449,7 +449,7 @@ private final class CueRecentRowButton: NSButton {
         heading.font = .systemFont(ofSize: 13, weight: record.isOpened ? .regular : .semibold)
         heading.textColor = record.isOpened ? .secondaryLabelColor : .labelColor
         heading.lineBreakMode = .byTruncatingTail; addSubview(heading)
-        let state = record.isOpened ? "已从 VibeCue 打开" : record.canOpen ? "未读" : "无可用对话入口"
+        let state = record.isOpened ? "已从 VibeCoding Go 打开" : record.canOpen ? "未读" : "无可用对话入口"
         let kind = record.resolved ? (record.event.kind == "permission" ? "人工批准已解除" : "等待已解除") : record.event.label
         let date = DateFormatter(); date.locale = Locale(identifier: "zh_CN"); date.dateFormat = Calendar.current.isDateInToday(record.event.date) ? "HH:mm" : "MM-dd HH:mm"
         let metadata = NSTextField(labelWithString: "\(isRunning ? "上次提醒：" : "")\(kind) · \(date.string(from: record.event.date))\(record.isPinned ? " · 置顶" : "")")
@@ -792,7 +792,7 @@ final class CueStatusPopoverController: NSViewController {
         let height = fixedHeight + viewport
         view.frame.size = NSSize(width: panelWidth, height: height)
         preferredContentSize = view.frame.size
-        label("VibeCue", NSRect(x: 22, y: 16, width: 260, height: 27), size: 18, weight: .semibold)
+        label("VibeCoding Go", NSRect(x: 22, y: 16, width: 260, height: 27), size: 18, weight: .semibold)
         label(status, NSRect(x: 22, y: 47, width: 535, height: 19), size: 11, color: .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("monitor-status")
         let toolbarWidth = (panelWidth - 60) / 4
         for (index, item) in [("打开面板", #selector(openSettings)), ("用量统计", #selector(openUsage)), ("测试提醒", #selector(demo)), ("结束", #selector(quit))].enumerated() {
@@ -1396,14 +1396,14 @@ final class CueStatusPopoverController: NSViewController {
             if opened { history.markOpened(id: event.id, didOpen: true) }
             if pin { history.setPinned(id: event.id, pinned: true) }
         }
-        alert("capture-unread", title: "VibeCue｜任务运行状态与提醒列表", thread: "pinned-running", minutes: 2)
+        alert("capture-unread", title: "VibeCoding Go｜任务运行状态与提醒列表", thread: "pinned-running", minutes: 2)
         alert("capture-manual", title: "ALV｜发布验证与后续检查", thread: "pinned-read", minutes: 12, opened: true, pin: true)
         alert("capture-active-history", title: "NACP｜增量同步与恢复验证", thread: "active-lint", minutes: 20, opened: true)
         for number in 0..<8 {
-            alert("capture-history-\(number)", title: ["KLS｜首页视觉与交互调整", "ALV｜模型用量记录核对", "VibeCue｜提示音与光效设置", "NACP｜备份状态检查"][number % 4], thread: "history-\(number)", minutes: Double(30 + number * 4), opened: true)
+            alert("capture-history-\(number)", title: ["KLS｜首页视觉与交互调整", "ALV｜模型用量记录核对", "VibeCoding Go｜提示音与光效设置", "NACP｜备份状态检查"][number % 4], thread: "history-\(number)", minutes: Double(30 + number * 4), opened: true)
         }
-        history.followups.retain(threadID: "fixture-followup", title: "VibeCue｜下次继续完善声音与任务列表", now: now.addingTimeInterval(-300))
-        let tasks: [CueRunningTask] = [("pinned-running", "VibeCue｜任务运行状态与提醒列表", 6.0), ("active-lint", "NACP｜增量同步与恢复验证", 12.0), ("active-build", "ALV｜构建发布与验收检查", 4.0)].compactMap { thread, title, minutes in
+        history.followups.retain(threadID: "fixture-followup", title: "VibeCoding Go｜下次继续完善声音与任务列表", now: now.addingTimeInterval(-300))
+        let tasks: [CueRunningTask] = [("pinned-running", "VibeCoding Go｜任务运行状态与提醒列表", 6.0), ("active-lint", "NACP｜增量同步与恢复验证", 12.0), ("active-build", "ALV｜构建发布与验收检查", 4.0)].compactMap { thread, title, minutes in
             CueRunningTask(raw: ["thread_id": thread, "title": title, "provider": "codex", "started_at": now.addingTimeInterval(-minutes * 60).timeIntervalSince1970, "last_activity": now.timeIntervalSince1970, "turn_id": "fixture-" + thread])
         }
         let actions = CueStatusPopoverActions(openSettings: {}, openUsage: {}, toggleEnabled: {}, toggleSound: {}, pause: {}, demo: {}, quit: {}, openEvent: { _ in })
@@ -1503,7 +1503,7 @@ final class CueStatusPopoverController: NSViewController {
         let menu = navigationContextMenu(task.ephemeralCueEvent)
         menu.addItem(.separator())
         let remove = NSMenuItem(title: "移除此中断记录", action: #selector(dismissRecoveryFromMenu(_:)), keyEquivalent: "")
-        remove.target = self; remove.representedObject = task; remove.toolTip = "仅移除 VibeCue 的中断标记，不删除原对话。"; menu.addItem(remove)
+        remove.target = self; remove.representedObject = task; remove.toolTip = "仅移除 VibeCoding Go 的中断标记，不删除原对话。"; menu.addItem(remove)
         return menu
     }
     private func navigationContextMenu(_ event: CueEvent, followup: CueThreadFollowup? = nil, includePin: Bool = true) -> NSMenu {
@@ -1537,7 +1537,7 @@ final class CueStatusPopoverController: NSViewController {
         }
         if followup != nil {
             menu.addItem(.separator())
-            item("移除待续记录", #selector(removeFollowupFromMenu(_:))).toolTip = "仅移除 VibeCue 的待续记录，不删除原对话。"
+            item("移除待续记录", #selector(removeFollowupFromMenu(_:))).toolTip = "仅移除 VibeCoding Go 的待续记录，不删除原对话。"
         }
         return menu
     }
@@ -1827,7 +1827,7 @@ final class CueStatusPopoverController: NSViewController {
         menu.addItem(.separator())
         let remove = NSMenuItem(title: "删除", action: #selector(deleteRow(_:)), keyEquivalent: "")
         remove.target = self; remove.representedObject = id
-        remove.toolTip = "仅从 VibeCue 提醒列表移除，不删除原对话。"
+        remove.toolTip = "仅从 VibeCoding Go 提醒列表移除，不删除原对话。"
         menu.addItem(remove)
         return menu
     }

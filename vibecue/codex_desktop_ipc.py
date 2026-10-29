@@ -91,7 +91,7 @@ def _peer_bundle(sock):
         if info.get('CFBundleIdentifier') != 'com.openai.codex':
             raise ValueError()
         if (str(info.get('CFBundleShortVersionString')), str(info.get('CFBundleVersion'))) not in DESKTOP_BUILDS:
-            raise DesktopProtocolUnsupported('当前 Codex 版本的窗口回复协议尚未核对，请更新 VibeCue')
+            raise DesktopProtocolUnsupported('当前 Codex 版本的窗口回复协议尚未核对，请更新 VibeCoding Go')
         return bundle
     except ControlError:
         raise

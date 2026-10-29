@@ -36,7 +36,7 @@ struct CueCodexConnection {
             // A stream revision reset is normal after owner/cache replacement.
             // Only the transport's explicit incompatibility code needs setup.
             state = fresh && desktop["status"] as? String == "unsupported" && desktop["reason_code"] as? String == "protocol_unsupported" ? "unsupported" : "reconnecting"
-            summary = state == "unsupported" ? String((desktop["message"] as? String ?? "当前 Codex 版本需要适配，请更新 VibeCue。").prefix(180)) : "Codex 自动重连中，正在重新发现当前连接。"
+            summary = state == "unsupported" ? String((desktop["message"] as? String ?? "当前 Codex 版本需要适配，请更新 VibeCoding Go。").prefix(180)) : "Codex 自动重连中，正在重新发现当前连接。"
         }
     }
     static func validationReport() -> [String: Bool] {

@@ -1,4 +1,4 @@
-/* Original VibeCue rendering adapter. Markdown parsing is provided by the
+/* Original VibeCoding Go rendering adapter. Markdown parsing is provided by the
  * separately licensed, pinned markdown-it distribution in vendor/. */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory(require('./vendor/markdown-it.min.js'), require('./vendor/highlight.min.js'));

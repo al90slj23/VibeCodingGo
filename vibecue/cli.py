@@ -1,4 +1,4 @@
-"""Local control and passive hook adapters for VibeCue."""
+"""Local control and passive hook adapters for VibeCoding Go."""
 from __future__ import annotations
 
 import argparse
@@ -117,13 +117,13 @@ def control(action):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='VibeCue 本机对话提醒')
+    parser = argparse.ArgumentParser(description='VibeCoding Go · AI 编程助手')
     sub = parser.add_subparsers(dest='command', required=True)
     watch = sub.add_parser('watch', help='被动观察本机 Codex 对话')
     watch.add_argument('--interval', type=float, default=1.0)
     demo = sub.add_parser('test', help='测试画面与声音')
     demo.add_argument('kind', choices=('complete', 'input', 'permission', 'error'))
-    demo.add_argument('--title', default='VibeCue · 提醒效果测试')
+    demo.add_argument('--title', default='VibeCoding Go · 提醒效果测试')
     demo.add_argument('--thread-id', default='')
     demo.add_argument('--message', default='这是一则测试提醒。')
     sub.add_parser('status', help='显示本机进程与事件来源状态')

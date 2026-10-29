@@ -376,7 +376,7 @@ def remember(home, rows):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='VibeCue 保留任务记录操作，不控制 Codex 执行')
+    parser = argparse.ArgumentParser(description='VibeCoding Go 保留任务记录操作，不控制 Codex 执行')
     parser.add_argument('command', choices=('dismiss', 'remember'))
     parser.add_argument('--home')
     parser.add_argument('--thread-id', default='')

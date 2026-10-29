@@ -1,7 +1,7 @@
 """Bounded read-only conversation excerpts and verified local path metadata.
 
 No owner is attached, turn resumed, auth file read or transcript changed. Text
-is returned over stdout only; it is never saved in VibeCue's usage ledger.
+is returned over stdout only; it is never saved in VibeCoding Go's usage ledger.
 """
 from __future__ import annotations
 
@@ -428,7 +428,7 @@ def read(identifier, codex_home=None, if_fingerprint=None, metadata_only=False):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='VibeCue 本机对话详情与路径，只读')
+    parser = argparse.ArgumentParser(description='VibeCoding Go 本机对话详情与路径，只读')
     parser.add_argument('command', choices=('read',))
     parser.parse_args(argv)
     try:

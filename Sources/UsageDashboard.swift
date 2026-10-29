@@ -90,7 +90,7 @@ final class CueUsageClient {
         candidates.append(Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent())
         candidates.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true))
         guard let found = candidates.first(where: { FileManager.default.fileExists(atPath: $0.appendingPathComponent("vibecue/usage.py").path) }) else {
-            throw error("本机用量模块尚未安装，请重新安装最新版 VibeCue。")
+            throw error("本机用量模块尚未安装，请重新安装最新版 VibeCoding Go。")
         }
         return found
     }
@@ -270,7 +270,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         self.home = home; client = CueUsageClient(home: home); schedule = CueUsageSchedulePreferences(home: home)
         if useSavedColumns { columnOverrides = UserDefaults.standard.dictionary(forKey: "VibeCueUsageLogColumns") as? [String: Bool] ?? [:] }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 850), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "VibeCue · 用量统计"; window.isReleasedWhenClosed = false
+        window.title = "VibeCoding Go · 用量统计"; window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 1000, height: 760); window.center()
         super.init(window: window); window.delegate = self; window.contentView = surface
         titleLabel.font = .systemFont(ofSize: 23, weight: .semibold)
@@ -919,7 +919,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private func rowTSV(_ row: [String: Any]) -> String { table.tableColumns.map { display(row, key: $0.identifier.rawValue).replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ") }.joined(separator: "\t") }
     @objc private func copyRow() { let index = table.selectedRow >= 0 ? table.selectedRow : table.clickedRow; guard rows.indices.contains(index) else { return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(rowTSV(rows[index]), forType: .string) }
     @objc private func exportPage() {
-        let panel = NSSavePanel(); panel.nameFieldStringValue = "VibeCue-\(currentView)-page-\(page).csv"; panel.canCreateDirectories = true
+        let panel = NSSavePanel(); panel.nameFieldStringValue = "VibeCoding Go-\(currentView)-page-\(page).csv"; panel.canCreateDirectories = true
         guard let window else { return }
         panel.beginSheetModal(for: window) { [weak self] response in
             guard response == .OK, let self, let url = panel.url else { return }

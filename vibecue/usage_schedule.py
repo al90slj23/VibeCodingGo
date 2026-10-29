@@ -77,7 +77,7 @@ def save(home, patch):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='VibeCue 用量统计同步频率')
+    parser = argparse.ArgumentParser(description='VibeCoding Go 用量统计同步频率')
     parser.add_argument('command', choices=('settings', 'save'))
     parser.add_argument('--home')
     args = parser.parse_args(argv)

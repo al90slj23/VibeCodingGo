@@ -78,7 +78,7 @@ final class CueCCAccountsController: NSWindowController {
     init(home: URL, fixture: [String: Any]? = nil) {
         monitor = .shared(home: home); self.fixture = fixture
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 640), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "VibeCue · Codex 账号额度"; window.isReleasedWhenClosed = false; window.contentMinSize = NSSize(width: 640, height: 420); window.center()
+        window.title = "VibeCoding Go · Codex 账号额度"; window.isReleasedWhenClosed = false; window.contentMinSize = NSSize(width: 640, height: 420); window.center()
         super.init(window: window); window.contentView = root
         root.fillColor = .windowBackgroundColor
         titleField.font = .systemFont(ofSize: 19, weight: .semibold)
@@ -122,7 +122,7 @@ final class CueCCAccountsController: NSWindowController {
         }
         let rows = data["accounts"] as? [[String: Any]] ?? []
         let liveCount = rows.filter { Self.isLive($0) }.count
-        status.stringValue = rows.isEmpty ? "复用已有登录，无需在 VibeCue 重新授权。" : "已显示 \(rows.count) 个账号 · \(liveCount) 个实时更新。"
+        status.stringValue = rows.isEmpty ? "复用已有登录，无需在 VibeCoding Go 重新授权。" : "已显示 \(rows.count) 个账号 · \(liveCount) 个实时更新。"
         if maintenance["enabled"] as? Bool == true, maintenance["phase"] as? String == "healthy" { status.stringValue += " 升级自动维护已开启。" }
         renderAccounts()
     }

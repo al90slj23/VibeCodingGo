@@ -67,7 +67,7 @@ struct CueMenuBarUsage {
         return " 运行 \(work.running) · 待办 \(work.pending)  |  今日 \(tokens) T · \(cost(now: now))"
     }
     func tooltip(work: CueMenuBarWork, health: String, now: Date = Date()) -> String {
-        var lines = ["VibeCue · \(health)", "运行中 \(work.running) 个对话 · 待处理 \(work.pending) 个对话", "待处理 = 未读、待续和中断对话去重；正在运行的另计。", "未读 \(work.unread) · 待续 \(work.followups) · 中断／待确认 \(work.interrupted)"]
+        var lines = ["VibeCoding Go · \(health)", "运行中 \(work.running) 个对话 · 待处理 \(work.pending) 个对话", "待处理 = 未读、待续和中断对话去重；正在运行的另计。", "未读 \(work.unread) · 待续 \(work.followups) · 中断／待确认 \(work.interrupted)"]
         if isCurrent(now: now) {
             lines += ["今天（本机时区）· 全部已接入应用", "\(CueUsageDashboardController.integer(Self.number(summary["total_tokens"]) ?? 0)) Tokens · \(CueUsageDashboardController.integer(Self.number(summary["requests"]) ?? 0)) 条用量记录", "API 参考费用：\(CueUsageMoney.display(summary, currency: currency))"]
             let unpriced = Self.number(summary["unpriced_requests"]) ?? 0

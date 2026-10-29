@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unload VibeCue and remove only its own hooks/startup entries; keep local data."""
+"""Unload VibeCoding Go and remove its own startup entries; keep local data."""
 from __future__ import annotations
 
 import json
@@ -31,7 +31,7 @@ def main():
                 if group in groups:
                     groups.remove(group)
             json_write(path, config)
-    print('VibeCue 已停用；应用程序与本机数据保留，可自行删除。')
+    print('VibeCoding Go 已停用；应用程序与本机数据保留，可自行删除。')
 
 
 if __name__ == '__main__':

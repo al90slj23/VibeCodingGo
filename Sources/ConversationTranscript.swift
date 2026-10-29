@@ -45,7 +45,7 @@ final class CueConversationTranscriptView: NSView, WKNavigationDelegate {
                 if let list { self.webView.configuration.userContentController.add(list) }
                 self.webView.loadFileURL(documentURL, allowingReadAccessTo: documentURL.deletingLastPathComponent())
             }
-        } else { renderError = "对话排版资源尚未安装，请更新 VibeCue。" }
+        } else { renderError = "对话排版资源尚未安装，请更新 VibeCoding Go。" }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit { webView.configuration.userContentController.removeScriptMessageHandler(forName: "vibecue") }

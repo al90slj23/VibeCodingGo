@@ -270,7 +270,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def fetch_source(source):
     url = validate_url(source['url'])
-    request = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'VibeCue/0.22 public-pricing'})
+    request = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'VCGo/0.26.0 public-pricing'})
     with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
         data = response.read(MAX_RESPONSE + 1)
         if len(data) > MAX_RESPONSE: raise ValueError('价格目录响应过大')

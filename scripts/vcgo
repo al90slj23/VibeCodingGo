@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+VCGO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+export PYTHONPATH="$VCGO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m vibecue.cli "$@"

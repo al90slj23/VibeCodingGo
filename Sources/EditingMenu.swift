@@ -7,11 +7,11 @@ enum CueEditingMenu {
         let main = NSApp.mainMenu ?? NSMenu()
         guard !main.items.contains(where: { $0.identifier?.rawValue == "vibecue.edit-menu" }) else { return }
         if main.items.isEmpty {
-            let application = NSMenuItem(title: "VibeCue", action: nil, keyEquivalent: "")
-            let menu = NSMenu(title: "VibeCue")
-            menu.addItem(withTitle: "隐藏 VibeCue", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+            let application = NSMenuItem(title: "VibeCoding Go", action: nil, keyEquivalent: "")
+            let menu = NSMenu(title: "VibeCoding Go")
+            menu.addItem(withTitle: "隐藏 VibeCoding Go", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
             menu.addItem(.separator())
-            menu.addItem(withTitle: "退出 VibeCue", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+            menu.addItem(withTitle: "退出 VibeCoding Go", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             application.submenu = menu; main.addItem(application)
         }
         let item = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
@@ -62,7 +62,7 @@ enum CueEditingMenu {
         window.isReleasedWhenClosed = false
         let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 160))
         editor.isRichText = false; editor.isEditable = true; editor.allowsUndo = true
-        editor.string = "VibeCue 剪贴板回归"
+        editor.string = "VibeCoding Go 剪贴板回归"
         window.contentView = editor; window.orderFrontRegardless(); window.makeKey(); window.makeFirstResponder(editor)
         defer { window.orderOut(nil) }
         func key(_ value: String, modifiers: NSEvent.ModifierFlags = .command) -> NSEvent {
@@ -71,37 +71,37 @@ enum CueEditingMenu {
         var results: [String: Bool] = [:]
         editor.setSelectedRange(NSRange(location: 0, length: (editor.string as NSString).length))
         let copied = window.performKeyEquivalent(with: key("c")); lastChange = pasteboard.changeCount
-        results["editing_command_copy_uses_native_responder_selection"] = copied && pasteboard.string(forType: .string) == "VibeCue 剪贴板回归"
+        results["editing_command_copy_uses_native_responder_selection"] = copied && pasteboard.string(forType: .string) == "VibeCoding Go 剪贴板回归"
         let cut = window.performKeyEquivalent(with: key("x")); lastChange = pasteboard.changeCount
-        results["editing_command_cut_removes_only_selected_input"] = cut && editor.string.isEmpty && pasteboard.string(forType: .string) == "VibeCue 剪贴板回归"
+        results["editing_command_cut_removes_only_selected_input"] = cut && editor.string.isEmpty && pasteboard.string(forType: .string) == "VibeCoding Go 剪贴板回归"
         let pasted = window.performKeyEquivalent(with: key("v")); lastChange = pasteboard.changeCount
-        results["editing_command_paste_inserts_clipboard_as_plain_text"] = pasted && editor.string == "VibeCue 剪贴板回归" && !editor.isRichText
+        results["editing_command_paste_inserts_clipboard_as_plain_text"] = pasted && editor.string == "VibeCoding Go 剪贴板回归" && !editor.isRichText
         editor.setSelectedRange(NSRange(location: 0, length: 0))
         results["editing_command_select_all_targets_focused_editor"] = window.performKeyEquivalent(with: key("a")) && editor.selectedRange().length == (editor.string as NSString).length
         results["editing_menu_keeps_undo_redo_and_paste_matching_style"] = NSApp.mainMenu?.items.first(where: { $0.identifier?.rawValue == "vibecue.edit-menu" })?.submenu?.items.filter { $0.action != nil }.count == 7
         results["editing_shortcuts_leave_send_and_ime_keys_alone"] = editingAction(key("\r")) == nil && editingAction(key("c", modifiers: [.control])) == nil && editingAction(key("c", modifiers: [])) == nil
         let configuration = WKWebViewConfiguration(); configuration.websiteDataStore = .nonPersistent()
         let web = WKWebView(frame: editor.frame, configuration: configuration)
-        window.contentView = web; web.loadHTMLString("<p>VibeCue WebKit copy test</p>", baseURL: nil)
+        window.contentView = web; web.loadHTMLString("<p>VibeCoding Go WebKit copy test</p>", baseURL: nil)
         var ready = false, checking = false
         let loadDeadline = Date().addingTimeInterval(8)
         while !ready && Date() < loadDeadline {
             if !checking {
                 checking = true
-                web.evaluateJavaScript("document.readyState === 'complete' && document.body.textContent.includes('VibeCue WebKit copy test')") { value, _ in ready = value as? Bool == true; checking = false }
+                web.evaluateJavaScript("document.readyState === 'complete' && document.body.textContent.includes('VibeCoding Go WebKit copy test')") { value, _ in ready = value as? Bool == true; checking = false }
             }
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
         }
         window.makeFirstResponder(web)
         var selected = false
         if ready {
-            web.evaluateJavaScript("const r=document.createRange();r.selectNodeContents(document.querySelector('p'));const s=window.getSelection();s.removeAllRanges();s.addRange(r);s.toString()") { value, _ in selected = value as? String == "VibeCue WebKit copy test" }
+            web.evaluateJavaScript("const r=document.createRange();r.selectNodeContents(document.querySelector('p'));const s=window.getSelection();s.removeAllRanges();s.addRange(r);s.toString()") { value, _ in selected = value as? String == "VibeCoding Go WebKit copy test" }
             while !selected && Date() < loadDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
         }
         let webCopy = selected && window.performKeyEquivalent(with: key("c"))
         let copyDeadline = Date().addingTimeInterval(2)
-        while webCopy && pasteboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) != "VibeCue WebKit copy test" && Date() < copyDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
-        results["editing_command_copy_works_for_readonly_webkit_transcript"] = webCopy && pasteboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) == "VibeCue WebKit copy test"
+        while webCopy && pasteboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) != "VibeCoding Go WebKit copy test" && Date() < copyDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        results["editing_command_copy_works_for_readonly_webkit_transcript"] = webCopy && pasteboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) == "VibeCoding Go WebKit copy test"
         if results["editing_command_copy_works_for_readonly_webkit_transcript"] == true { lastChange = pasteboard.changeCount }
         return results
     }
