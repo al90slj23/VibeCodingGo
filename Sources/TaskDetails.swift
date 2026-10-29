@@ -154,6 +154,9 @@ struct CueTaskDetail {
     private let selectedReasoningEffort: String
     private let selectedServiceTier: String
     private let selectedSpeedStatus: String
+    private let selectedModelDisplayName: String
+    private let selectedSpeedKind: String
+    private let selectedSpeedMessage: String
     let currentSettingsStatus: String
     let currentSettingsSource: String
     let currentSettingsObservedAt: Date?
@@ -200,6 +203,9 @@ struct CueTaskDetail {
         selectedReasoningEffort = Self.label(selected["reasoning_effort"], limit: 40)
         selectedServiceTier = Self.label(selected["service_tier"], limit: 40)
         selectedSpeedStatus = Self.label(selected["speed_status"], limit: 40)
+        selectedModelDisplayName = Self.label(selected["model_display_name"], limit: 180)
+        selectedSpeedKind = Self.label(selected["speed_kind"], limit: 40)
+        selectedSpeedMessage = Self.label(selected["speed_message"], limit: 700)
         totalTokens = Self.integer(raw["total_tokens"])
         inputTokens = Self.integer(raw["input_tokens"])
         outputTokens = Self.integer(raw["output_tokens"])
@@ -282,44 +288,52 @@ struct CueTaskDetail {
         if let observed = currentSettingsObservedAt, !(-10...45).contains(Date().timeIntervalSince(observed)) { return false }
         return true
     }
-    private static func modelFields(model: String, effort: String, tier: String, modelStatus: String = "", speedStatus: String = "", complete: Bool = false) -> [String] {
-        var fields: [String] = []
-        if modelStatus == "default" { fields.append("模型跟随默认") }
-        else if modelStatus != "unknown", !model.isEmpty, model != "unknown" { fields.append(model) }
-        else if complete { fields.append("模型未提供") }
-        let effortNames = ["none": "无推理", "minimal": "极低强度", "low": "低强度", "medium": "中等强度", "high": "高强度", "xhigh": "特高强度", "max": "最高强度", "ultra": "Ultra 强度", "default": "默认强度"]
-        if !effort.isEmpty, effort != "unknown" { fields.append(effortNames[effort] ?? effort) }
-        else if complete { fields.append("强度未提供") }
-        if ["fast", "priority"].contains(tier) { fields.append("闪电 Fast") }
-        else if tier == "ultrafast" { fields.append("极速 Ultra Fast") }
-        else if ["default", "standard"].contains(tier) { fields.append("标准速度") }
-        else if !tier.isEmpty, tier != "unknown" { fields.append("速度 " + tier) }
-        else if speedStatus == "default" { fields.append("速度跟随默认") }
-        else if complete { fields.append("速度未提供") }
-        return fields
+    private static func friendlyModel(_ identifier: String, displayName: String = "") -> String {
+        let name = displayName.isEmpty ? identifier : displayName
+        let parts = name.split(separator: "-").map(String.init)
+        if parts.count == 3, parts[0].lowercased() == "gpt", ["sol", "terra", "luna", "astra"].contains(parts[2].lowercased()), parts[1].range(of: #"^[0-9]+(?:\.[0-9]+)*$"#, options: .regularExpression) != nil {
+            return "GPT-" + parts[1] + " " + parts[2].capitalized
+        }
+        return name
     }
-    private var recordedSettingsLine: String {
-        // Older log readers used "default" for a null override as well as an
-        // explicit selection. That historical field cannot prove Fast is off.
-        Self.modelFields(model: recordedModel, effort: recordedReasoningEffort,
-                         tier: recordedServiceTier == "default" ? "" : recordedServiceTier,
-                         speedStatus: recordedServiceTier == "default" ? "default" : "").joined(separator: " · ")
+    private static func effortLabel(_ effort: String) -> String {
+        ["none":"None", "minimal":"Minimal", "low":"Low", "medium":"Medium", "high":"High", "xhigh":"Extra High", "max":"Max", "ultra":"Ultra", "default":"默认强度"][effort] ?? effort
     }
-    var secondaryLine: String {
+    var modelSelectionLine: String {
         if currentSettingsReadable {
-            return (["当前"] + Self.modelFields(model: selectedModel, effort: selectedReasoningEffort, tier: selectedServiceTier, modelStatus: selectedModelStatus, speedStatus: selectedSpeedStatus, complete: true)).joined(separator: " · ")
+            let name = selectedModelStatus == "default" ? "模型跟随默认" : selectedModel.isEmpty ? "模型未提供" : Self.friendlyModel(selectedModel, displayName: selectedModelDisplayName)
+            return "当前 · " + name + " " + (selectedReasoningEffort.isEmpty ? "强度未提供" : Self.effortLabel(selectedReasoningEffort))
         }
-        let recorded = recordedSettingsLine
-        if !recorded.isEmpty {
-            let label = isActive ? "本轮记录" : "上次记录"
-            return (currentSettingsStatus.isEmpty ? "" : "当前不可读 · ") + label + " · " + recorded
+        guard !recordedModel.isEmpty || !recordedReasoningEffort.isEmpty else { return "当前设置不可读" }
+        return (currentSettingsStatus.isEmpty ? "" : "当前不可读 · ") + (isActive ? "本轮记录 · " : "上次记录 · ") + Self.friendlyModel(recordedModel) + (recordedReasoningEffort.isEmpty ? "" : " " + Self.effortLabel(recordedReasoningEffort))
+    }
+    var speedSelectionLine: String {
+        if currentSettingsReadable {
+            switch selectedSpeedKind {
+            case "fast": return "Fast · 已保存"
+            case "ultrafast": return "Ultra Fast · 已保存"
+            case "standard": return "标准速度 · 已保存"
+            case "unsupported": return "档位未支持"
+            case "default": return "速度跟随默认"
+            default:
+                if selectedSpeedStatus == "default" { return "速度跟随默认" }
+                if ["default", "standard"].contains(selectedServiceTier) { return "标准速度 · 已保存" }
+                return selectedServiceTier.isEmpty ? "速度未提供" : "速度待核实"
+            }
         }
-        return "当前设置不可读"
+        if recordedServiceTier.isEmpty { return "速度待同步" }
+        if recordedServiceTier == "default" { return "速度跟随默认（记录）" }
+        return "仅有历史档位"
+    }
+    var speedSelectionIsFast: Bool { currentSettingsReadable && ["fast", "ultrafast"].contains(selectedSpeedKind) }
+    var secondaryLine: String {
+        let modelLine = modelSelectionLine
+        return modelLine == "当前设置不可读" ? modelLine : modelLine + " · " + speedSelectionLine
     }
     var settingsTooltip: String {
         var lines = [secondaryLine]
         if currentSettingsReadable {
-            lines.append("来源：Codex 当前对话设置，只读获取；不是日志中的历史设置。")
+            lines.append("来源：Codex 已保存的对话设置，只读获取。输入框内尚未提交的临时选择不在共享接口内。")
             if let observed = currentSettingsObservedAt {
                 let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"
                 lines.append("读取时间：" + formatter.string(from: observed))
@@ -335,6 +349,11 @@ struct CueTaskDetail {
             lines.append("当前选择暂不可核实；记录值仅表示已读到的本轮或上次执行设置。")
             if !currentSettingsMessage.isEmpty { lines.append(currentSettingsMessage) }
         }
+        if currentSettingsReadable {
+            if !selectedServiceTier.isEmpty { lines.append("已保存请求档位：" + selectedServiceTier) }
+            if !selectedSpeedMessage.isEmpty { lines.append(selectedSpeedMessage) }
+            lines.append("Ultra 表示推理强度；Fast 是独立速度档位。")
+        } else if !recordedServiceTier.isEmpty { lines.append("历史请求档位：" + recordedServiceTier + "；不能据此判断输入框当前的速度选择。") }
         return lines.joined(separator: "\n")
     }
 
@@ -647,15 +666,15 @@ final class CueTaskHoverController: NSObject {
         let invalid = CueTaskDetail(raw: ["total_tokens": true, "input_tokens": -1, "output_tokens": 2.5, "elapsed_seconds": Double.infinity])
         let messages = CueTaskDetail(raw: ["messages": [["role": "system", "text": "SYSTEM-NOT-VISIBLE"], ["role": "tool", "text": "TOOL-ARGUMENTS-NOT-VISIBLE"], ["role": "reasoning", "text": "REASONING-NOT-VISIBLE"], ["role": "user", "text": "可见问题"], ["role": "assistant", "text": "可见回复"]]])
         let long = CueTaskDetail(raw: ["messages": (0..<10).map { ["role": "assistant", "text": String(repeating: "内容", count: 3000) + "\($0)"] }])
-        let selection: [String: Any] = ["status": "current", "source": "codex_desktop", "observed_at": Date().timeIntervalSince1970, "model": "current-model", "reasoning_effort": "ultra", "service_tier": "priority"]
+        let selection: [String: Any] = ["status": "current", "source": "codex_desktop", "observed_at": Date().timeIntervalSince1970, "model": "current-model", "reasoning_effort": "ultra", "service_tier": "priority", "model_display_name": "current-model", "speed_kind": "fast", "speed_source": "codex_saved_thread_settings"]
         let selected = CueTaskDetail(raw: ["status": "running", "model": "old-model", "reasoning_effort": "low", "service_tier": "default", "current_settings": selection, "total_tokens": 12345, "tokens_status": "partial"])
-        var inherited = selection; inherited["service_tier"] = NSNull(); inherited["speed_status"] = "default"; inherited["reasoning_effort"] = "default"
+        var inherited = selection; inherited["service_tier"] = NSNull(); inherited["speed_status"] = "default"; inherited["reasoning_effort"] = "default"; inherited["speed_kind"] = "default"
         let inheritedDetail = CueTaskDetail(raw: ["current_settings": inherited])
         var defaultModel = inherited; defaultModel["status"] = "partial"; defaultModel["model"] = NSNull(); defaultModel["model_status"] = "default"
         let defaultModelDetail = CueTaskDetail(raw: ["model": "old-model", "current_settings": defaultModel])
-        var clearedSelection = selection; clearedSelection["status"] = "partial"; clearedSelection["model"] = NSNull(); clearedSelection["model_status"] = "unknown"; clearedSelection["reasoning_effort"] = NSNull(); clearedSelection["service_tier"] = NSNull(); clearedSelection["speed_status"] = "unknown"
+        var clearedSelection = selection; clearedSelection["status"] = "partial"; clearedSelection["model"] = NSNull(); clearedSelection["model_status"] = "unknown"; clearedSelection["reasoning_effort"] = NSNull(); clearedSelection["service_tier"] = NSNull(); clearedSelection["speed_status"] = "unknown"; clearedSelection.removeValue(forKey: "speed_kind")
         let clearedSelectionDetail = CueTaskDetail(raw: ["model": "old-model", "reasoning_effort": "ultra", "service_tier": "priority", "current_settings": clearedSelection])
-        var incomplete = selection; incomplete["status"] = "partial"; incomplete.removeValue(forKey: "reasoning_effort"); incomplete.removeValue(forKey: "service_tier")
+        var incomplete = selection; incomplete["status"] = "partial"; incomplete.removeValue(forKey: "reasoning_effort"); incomplete.removeValue(forKey: "service_tier"); incomplete.removeValue(forKey: "speed_kind")
         let incompleteDetail = CueTaskDetail(raw: ["model": "old-model", "reasoning_effort": "low", "service_tier": "fast", "current_settings": incomplete])
         var expired = selection; expired["observed_at"] = Date().addingTimeInterval(-120).timeIntervalSince1970
         let expiredDetail = CueTaskDetail(raw: ["status": "complete", "model": "old-model", "reasoning_effort": "low", "service_tier": "fast", "current_settings": expired])
@@ -664,8 +683,12 @@ final class CueTaskHoverController: NSObject {
         var healthyUnchanged = expired; healthyUnchanged["verified_at"] = Date().timeIntervalSince1970; healthyUnchanged["expires_at"] = Date().addingTimeInterval(30).timeIntervalSince1970
         let healthyUnchangedDetail = CueTaskDetail(raw: ["current_settings": healthyUnchanged])
         let historicalDefault = CueTaskDetail(raw: ["model": "old-model", "service_tier": "default"])
-        var explicitDefault = selection; explicitDefault["service_tier"] = "default"
+        var explicitDefault = selection; explicitDefault["service_tier"] = "default"; explicitDefault["speed_kind"] = "standard"
         let explicitDefaultDetail = CueTaskDetail(raw: ["current_settings": explicitDefault])
+        var standardSol = selection; standardSol["model"] = "gpt-6.1-sol"; standardSol["model_display_name"] = "GPT-6.1-Sol"; standardSol["service_tier"] = "default"; standardSol["speed_kind"] = "standard"
+        var fastSol = standardSol; fastSol["service_tier"] = "priority"; fastSol["speed_kind"] = "fast"
+        var unconfirmedSol = fastSol; unconfirmedSol.removeValue(forKey: "speed_kind")
+        let standardSolDetail = CueTaskDetail(raw: ["current_settings": standardSol]), fastSolDetail = CueTaskDetail(raw: ["current_settings": fastSol]), unconfirmedSolDetail = CueTaskDetail(raw: ["current_settings": unconfirmedSol])
         var results = ["task_detail_unknown_never_fabricates_zero_tokens": unknown.totalTokens == nil && unknown.summaryLine(now: now).contains("待同步"),
                        "task_detail_partial_has_explicit_lower_bound": partial.summaryLine(now: now).contains("≥") && partial.summaryLine(now: now).contains("部分"),
                        "task_detail_live_duration_advances": partial.elapsed(now: now.addingTimeInterval(10)) == 135,
@@ -676,10 +699,10 @@ final class CueTaskHoverController: NSObject {
                        "task_detail_explicit_zero_is_retained": complete.summaryLine(now: now).contains("0 Tokens"),
                        "task_detail_old_alert_labels_latest_turn": partial.summaryLine(now: now, eventDate: now.addingTimeInterval(-1000)).hasPrefix("最新轮"),
                        "task_detail_invalid_numbers_remain_unknown": invalid.totalTokens == nil && invalid.inputTokens == nil && invalid.outputTokens == nil && invalid.elapsedSeconds == nil,
-                       "task_detail_reliable_model_and_speed_are_visible": partial.secondaryLine.contains("gpt-model") && partial.secondaryLine.contains("高强度") && partial.secondaryLine.contains("Fast"),
+                       "task_detail_reliable_model_and_speed_are_visible": partial.secondaryLine.contains("gpt-model") && partial.secondaryLine.contains("High") && partial.secondaryLine.contains("仅有历史档位"),
                        "task_detail_current_owner_settings_override_recorded_settings": selected.model == "current-model" && selected.reasoningEffort == "ultra" && selected.serviceTier == "priority" && selected.secondaryLine.hasPrefix("当前 · ") && !selected.secondaryLine.contains("old-model"),
                        "task_detail_current_settings_do_not_change_numeric_usage": selected.totalTokens == 12345 && selected.tokensStatus == "partial",
-                       "task_detail_current_fast_state_is_explicit": selected.secondaryLine.contains("闪电 Fast") && selected.secondaryLine.contains("Ultra 强度"),
+                       "task_detail_current_fast_state_is_explicit": selected.speedSelectionLine == "Fast · 已保存" && selected.modelSelectionLine.contains("Ultra") && !selected.modelSelectionLine.contains("Fast"),
                        "task_detail_null_speed_override_follows_default_without_guessing": inheritedDetail.secondaryLine.contains("速度跟随默认") && inheritedDetail.secondaryLine.contains("默认强度") && !inheritedDetail.secondaryLine.contains("标准速度") && !inheritedDetail.secondaryLine.contains("闪电"),
                        "task_detail_null_model_override_follows_default_without_guessing": defaultModelDetail.model.isEmpty && defaultModelDetail.secondaryLine.contains("模型跟随默认") && !defaultModelDetail.secondaryLine.contains("模型未提供") && !defaultModelDetail.secondaryLine.contains("old-model") && defaultModelDetail.settingsTooltip.contains("未推断实际默认模型"),
                        "task_detail_null_clear_removes_previous_model_effort_and_fast": clearedSelectionDetail.model.isEmpty && clearedSelectionDetail.reasoningEffort.isEmpty && clearedSelectionDetail.serviceTier.isEmpty && clearedSelectionDetail.secondaryLine.contains("模型未提供") && clearedSelectionDetail.secondaryLine.contains("强度未提供") && clearedSelectionDetail.secondaryLine.contains("速度未提供") && !clearedSelectionDetail.secondaryLine.contains("old-model") && !clearedSelectionDetail.secondaryLine.contains("current-model") && !clearedSelectionDetail.secondaryLine.contains("Ultra") && !clearedSelectionDetail.secondaryLine.contains("Fast"),
@@ -692,6 +715,9 @@ final class CueTaskHoverController: NSObject {
                        "task_detail_setting_tooltip_explains_source_and_inheritance": selected.settingsTooltip.contains("只读获取") && selected.settingsTooltip.contains("读取时间") && inheritedDetail.settingsTooltip.contains("未推断"),
                        "task_detail_only_user_and_assistant_are_previewed": messages.messages.map(\.role) == ["user", "assistant"],
                        "task_detail_preview_text_stays_bounded": long.messages.count <= 8 && long.messages.reduce(0) { $0 + $1.text.count } <= 12000 && long.contentTruncated]
+        results["native_model_title_is_independent_of_saved_fast_setting"] = standardSolDetail.modelSelectionLine == "当前 · GPT-6.1 Sol Ultra" && fastSolDetail.modelSelectionLine == standardSolDetail.modelSelectionLine && standardSolDetail.speedSelectionLine == "标准速度 · 已保存" && fastSolDetail.speedSelectionIsFast
+        results["raw_priority_without_catalog_confirmation_does_not_assert_fast"] = unconfirmedSolDetail.speedSelectionLine == "速度待核实" && !unconfirmedSolDetail.speedSelectionIsFast && unconfirmedSolDetail.settingsTooltip.contains("priority")
+        results["saved_speed_tooltip_explains_independent_strength_and_composer_boundary"] = fastSolDetail.settingsTooltip.contains("Ultra 表示推理强度") && fastSolDetail.settingsTooltip.contains("尚未提交")
         _ = NSApplication.shared
         results.merge(CueTaskUsageSummary.validationReport()) { _, new in new }
         results.merge(CueHoverMarkdown.validationReport()) { _, new in new }

@@ -18,6 +18,7 @@ from .codex_control import ControlError, THREAD_ID
 from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable
 from .codex_runtime import RuntimeProjection
 from .current_model_settings import ModelSettingsProjection, unavailable_settings
+from .model_presentation import ModelPresentation
 from .events import emit_event, emit_resolution, event_identifier, input_event_id
 from .providers.approval_bridge import APPROVAL_METHODS, INPUT_METHODS, SETTLE_SECONDS
 
@@ -302,6 +303,7 @@ class DesktopAttentionService:
         self._health = {'connected': False, 'status': 'reconnecting', 'message': '正在自动连接 Codex', 'last_seen': 0,
                         'capabilities': {'reply': False, 'control': False, 'attention': False}}
         self.monitor = DesktopAttentionMonitor(home)
+        self.model_presentation = ModelPresentation(codex_home)
         self.channel = None
         self.projections = {}
         self.next_discovery = {}
@@ -365,7 +367,7 @@ class DesktopAttentionService:
             for thread in self._threads:
                 projection = self.projections.get(thread)
                 if projection is not None and projection.revision is not None:
-                    result[thread] = projection.settings.snapshot()
+                    result[thread] = self.model_presentation.decorate(projection.settings.snapshot())
                 else:
                     reason = self.unavailable_reasons.get(thread) or ('此对话的 Codex 快照暂不可读' if self.quarantine_until.get(thread, 0) > time.monotonic() else '正在读取此对话的 Codex 当前设置')
                     result[thread] = unavailable_settings(reason=reason)

@@ -414,7 +414,8 @@ private struct CueTaskRowLayout {
     var elapsed: NSRect { NSRect(x: state.minX, y: 29, width: state.width, height: 15) }
     var heading: NSRect { NSRect(x: 42, y: 6, width: max(100, state.minX - 54), height: 21) }
     var metadata: NSRect { NSRect(x: 42, y: 28, width: heading.width, height: 15) }
-    var model: NSRect { NSRect(x: 42, y: 52, width: max(100, leftMaxX - 42), height: 16) }
+    var model: NSRect { NSRect(x: 42, y: 52, width: max(100, leftMaxX - 180), height: 16) }
+    var speed: NSRect { NSRect(x: leftMaxX - 130, y: 52, width: 130, height: 16) }
     func action(_ index: Int) -> NSRect {
         NSRect(x: actionsX + CGFloat(index % 2) * 28, y: 12 + CGFloat(index / 2) * 29, width: 25, height: 25)
     }
@@ -1095,7 +1096,7 @@ final class CueStatusPopoverController: NSViewController {
         let updatedCheckbox = stable.recentDocument?.subviews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "active-thread" }
         let updatedMetrics = stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-metrics:active-thread" }
         results["batch_background_refresh_preserves_checkbox_identity_and_frame"] = stableCheckbox != nil && stableCheckbox === updatedCheckbox && stableCheckbox?.frame == checkboxFrame
-        results["batch_background_refresh_preserves_metrics_identity_and_updates_value"] = stableMetrics != nil && stableMetrics === updatedMetrics && stableMetrics?.stringValue == completed.secondaryLine
+        results["batch_background_refresh_preserves_metrics_identity_and_updates_value"] = stableMetrics != nil && stableMetrics === updatedMetrics && stableMetrics?.stringValue == completed.modelSelectionLine
         let updatedUsage = stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "usage-turn-tokens" }
         results["batch_background_refresh_updates_usage_without_replacing_the_column"] = stableUsage != nil && stableUsage === updatedUsage && updatedUsage?.stringValue == completed.turnUsage.tokenLine
         results["batch_completed_task_keeps_selection_and_shows_completion_in_place"] = stable.selectedThreads == selectedBeforeRefresh && stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "row-state" }?.stringValue == "已完成"
@@ -1288,7 +1289,8 @@ final class CueStatusPopoverController: NSViewController {
         let quickRunning = quick.recentDocument!.subviews.compactMap { $0 as? CueRunningRowButton }.first { $0.task.threadID == "quick-running" }
         let metricsText = quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-metrics:quick-running" }?.stringValue ?? ""
         let turnTokensText = quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "usage-turn-tokens" }?.stringValue ?? ""
-        results["row_separates_turn_tokens_from_model_effort_and_speed"] = turnTokensText.contains("12.0K") && !metricsText.contains("Tokens") && metricsText.contains("gpt-6.1-sol") && metricsText.contains("高强度") && metricsText.contains("Fast")
+        let speedText = quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-speed:quick-running" }?.stringValue ?? ""
+        results["row_separates_tokens_model_strength_and_speed"] = turnTokensText.contains("12.0K") && !metricsText.contains("Tokens") && metricsText.contains("GPT-6.1 Sol") && metricsText.contains("High") && !metricsText.contains("Fast") && speedText == "仅有历史档位"
         func usageField(_ part: String) -> NSTextField? { quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == part } }
         let turnColumn = usageField("usage-turn-tokens"), historyColumn = usageField("usage-history-tokens")
         let actionFrames = quickRunning?.subviews.compactMap { $0 as? CueRowQuickButton }.map(\.frame) ?? []
@@ -1296,6 +1298,8 @@ final class CueStatusPopoverController: NSViewController {
         results["row_right_columns_are_turn_history_then_shortcuts"] = (turnColumn?.frame.maxX ?? 0) + 12 <= (historyColumn?.frame.minX ?? 0) && (historyColumn?.frame.maxX ?? 0) + 12 <= (actionFrames.map(\.minX).min() ?? 0) && historyColumn?.alignment == .right && turnColumn?.alignment == .right
         let modelField = quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-metrics:quick-running" }
         results["row_model_and_status_stay_left_of_accounting"] = (modelField?.frame.maxX ?? 0) + 10 < (turnColumn?.frame.minX ?? 0) && (quickRunning?.subviews.first { $0.identifier?.rawValue == "row-state" }?.frame.maxX ?? 0) < (turnColumn?.frame.minX ?? 0)
+        let speedField = quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-speed:quick-running" }
+        results["row_speed_badge_is_separate_from_model_and_accounting"] = (modelField?.frame.maxX ?? 0) + 7 < (speedField?.frame.minX ?? 0) && (speedField?.frame.maxX ?? 0) + 10 < (turnColumn?.frame.minX ?? 0)
         results["row_accounting_scopes_have_independent_headers_and_values"] = usageField("usage-turn-label")?.stringValue == "本轮" && usageField("usage-history-label")?.stringValue == "历史累计" && turnColumn?.stringValue == "12.0K Tokens" && historyColumn?.stringValue == "≥9.9B Tokens"
         let historyMoney = usageField("usage-history-cost")
         results["row_full_currency_and_dual_currency_fit_their_column"] = historyMoney?.stringValue.contains("1,234,567.89 ¥") == true && historyMoney?.stringValue.contains("\n") == true && historyMoney.map { field in field.stringValue.components(separatedBy: "\n").allSatisfy { ($0 as NSString).size(withAttributes: [.font: field.font!]).width <= field.frame.width } } == true
@@ -1343,7 +1347,7 @@ final class CueStatusPopoverController: NSViewController {
             ["total_tokens": tokens, "tokens_status": index == 1 ? "partial" : "complete", "cost_usd": historical ? 12345.67 : 0.1742 + Double(index), "cost_cny": historical ? 88543.76 : 1.2493 + Double(index), "cost_status": index == 1 ? "partial" : "complete", "currency": index == 2 ? "both" : "CNY", "updated_at": now.addingTimeInterval(-120).timeIntervalSince1970, "provenance": historical ? "synced_history" : "current_turn"]
         }
         var details = Dictionary(uniqueKeysWithValues: tasks.enumerated().map { index, task in
-            (task.threadID, CueTaskDetail(raw: ["status":"running", "started_at":task.startDate.timeIntervalSince1970, "last_activity":now.timeIntervalSince1970, "elapsed_status":"complete", "turn_usage":captureUsage(24750 + index * 12300, index:index), "history_usage":captureUsage(234567890 + index * 1230000, historical:true, index:index), "total_tokens":24750 + index * 12300, "input_tokens":2100, "output_tokens":1250, "cache_read_tokens":21400 + index * 12300, "cache_creation_tokens":0, "tokens_status":"complete", "model":"gpt-6.1-sol", "reasoning_effort":"high", "service_tier":"priority", "messages":[["role":"assistant","text":"正在核对本轮变更，完成后会报告验证结果。","created_at":now.timeIntervalSince1970]]]))
+            (task.threadID, CueTaskDetail(raw: ["status":"running", "started_at":task.startDate.timeIntervalSince1970, "last_activity":now.timeIntervalSince1970, "elapsed_status":"complete", "turn_usage":captureUsage(24750 + index * 12300, index:index), "history_usage":captureUsage(234567890 + index * 1230000, historical:true, index:index), "total_tokens":24750 + index * 12300, "input_tokens":2100, "output_tokens":1250, "cache_read_tokens":21400 + index * 12300, "cache_creation_tokens":0, "tokens_status":"complete", "model":"gpt-6.1-sol", "reasoning_effort":"high", "service_tier":"priority", "current_settings":["status":"current","source":"codex_desktop","model":"gpt-6.1-sol","model_display_name":"GPT-6.1-Sol","model_status":"explicit","reasoning_effort":"ultra","service_tier":index == 1 ? "default" : "priority","speed_kind":index == 1 ? "standard" : "fast","speed_source":"codex_saved_thread_settings","observed_at":now.timeIntervalSince1970,"verified_at":now.timeIntervalSince1970,"expires_at":now.addingTimeInterval(60).timeIntervalSince1970], "messages":[["role":"assistant","text":"正在核对本轮变更，完成后会报告验证结果。","created_at":now.timeIntervalSince1970]]]))
         })
         let lost = CueRunningTask(raw: ["thread_id": "fixture-interrupted", "title": "ALV｜重启前的任务，等待手动继续", "started_at": now.addingTimeInterval(-1800).timeIntervalSince1970, "last_activity": now.addingTimeInterval(-600).timeIntervalSince1970, "interrupted_at": now.addingTimeInterval(-590).timeIntervalSince1970, "status": "interrupted", "reason_text": "Codex 进程已结束，保留任务记录。", "turn_id": "fixture-old-turn"])!
         for id in ["fixture-followup", "fixture-interrupted", "pinned-read", "history-0", "history-1"] {
@@ -1514,6 +1518,10 @@ final class CueStatusPopoverController: NSViewController {
         metrics.font = .systemFont(ofSize: 10); metrics.textColor = .secondaryLabelColor
         metrics.lineBreakMode = .byTruncatingTail; metrics.identifier = NSUserInterfaceItemIdentifier("task-metrics:" + threadID)
         row.addSubview(metrics)
+        let speed = NSTextField(labelWithString: "")
+        speed.font = .systemFont(ofSize: 9.5, weight: .medium); speed.alignment = .right
+        speed.lineBreakMode = .byTruncatingHead; speed.identifier = NSUserInterfaceItemIdentifier("task-speed:" + threadID)
+        row.addSubview(speed)
         let elapsed = NSTextField(labelWithString: "")
         elapsed.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular); elapsed.textColor = .secondaryLabelColor
         elapsed.alignment = .right; elapsed.lineBreakMode = .byTruncatingHead
@@ -1546,6 +1554,10 @@ final class CueStatusPopoverController: NSViewController {
             case "row-state": field.frame = layout.state
             case "task-metrics:" + threadID: field.stringValue = line; field.frame = layout.model; field.toolTip = detail.settingsTooltip
             case "task-elapsed:" + threadID: field.stringValue = elapsed; field.frame = layout.elapsed
+            case "task-speed:" + threadID:
+                field.stringValue = detail.speedSelectionLine; field.frame = layout.speed
+                field.textColor = detail.speedSelectionIsFast ? .systemOrange : .secondaryLabelColor
+                field.toolTip = detail.settingsTooltip
             default: break
             }
         }
@@ -1573,11 +1585,11 @@ final class CueStatusPopoverController: NSViewController {
                 field.toolTip = value.tooltip
             }
         }
-        row.setAccessibilityHelp(line + "，" + elapsed + "。本轮 " + turn.tokenLine + "，" + turn.costLine + "。历史累计 " + detail.historyUsage.tokenLine + "，" + detail.historyUsage.costLine + "。悬停查看详情；点击打开对应对话。")
+        row.setAccessibilityHelp(line + "，" + detail.speedSelectionLine + "，" + elapsed + "。本轮 " + turn.tokenLine + "，" + turn.costLine + "。历史累计 " + detail.historyUsage.tokenLine + "，" + detail.historyUsage.costLine + "。悬停查看详情；点击打开对应对话。")
         configureQuickActions(in: row)
     }
     private func rowInformation(threadID: String, eventDate: Date?) -> String {
-        taskDetails[threadID]?.secondaryLine ?? "当前设置不可读"
+        taskDetails[threadID]?.modelSelectionLine ?? "当前设置不可读"
     }
     private func configureQuickActions(in row: NSButton) {
         let event: CueEvent, recordID: String?
