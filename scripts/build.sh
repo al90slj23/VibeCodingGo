@@ -21,4 +21,5 @@ cp "$PROJECT_ROOT/integrations/ccswitch/vibecue_quota.rs" "$APP_DIR/Contents/Res
 /usr/bin/codesign --force --sign - "$APP_DIR"
 /usr/bin/python3 "$PROJECT_ROOT/scripts/check-ui-performance.py"
 PYTHONPATH="$PROJECT_ROOT" PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s "$PROJECT_ROOT/tests" -p test_usage_overview.py
+PYTHONPATH="$PROJECT_ROOT" PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s "$PROJECT_ROOT/tests" -p 'test_engineering_*.py'
 printf '%s\n' "$APP_DIR"

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Darwin
 
 /// Local numeric usage only. The collector runs off the AppKit thread and never
 /// receives a shell command, a prompt, or an authentication credential.
@@ -8,13 +9,17 @@ final class CueUsageClient {
     private let lock = NSLock()
     private let collectorOwner = UUID()
     private var active: [UUID: Process] = [:]
+    private var engineeringProcesses: Set<UUID> = []
     private var stopped = false
     init(home: URL) { self.home = home }
 
     func stop() {
-        lock.lock(); stopped = true; let processes = Array(active.values); lock.unlock()
+        lock.lock(); stopped = true; let processes = Array(active.values)
+        let engineering = active.filter { engineeringProcesses.contains($0.key) }.map(\.value)
+        lock.unlock()
         CueCollectorScheduler.shared.cancel(owner: collectorOwner)
         for process in processes where process.isRunning { process.terminate() }
+        engineering.forEach { Self.ensureEngineeringTermination($0) }
     }
 
     func run(_ arguments: [String], module: String = "vibecue.usage", input: Data? = nil, completion: @escaping (Result<[String: Any], Error>) -> Void) {
@@ -25,7 +30,7 @@ final class CueUsageClient {
         }) { finished in
             defer { finished() }
             let id = UUID()
-            defer { self.lock.lock(); self.active.removeValue(forKey: id); self.lock.unlock() }
+            defer { self.lock.lock(); self.active.removeValue(forKey: id); self.engineeringProcesses.remove(id); self.lock.unlock() }
             do {
                 let runtime = try Self.runtime(home: home)
                 let process = Process(), output = Pipe(), errors = Pipe()
@@ -39,7 +44,11 @@ final class CueUsageClient {
                 process.standardInput = input == nil ? FileHandle.nullDevice : inputPipe
                 self.lock.lock()
                 if self.stopped { self.lock.unlock(); throw Self.error("用量采集已停止。") }
-                do { try process.run(); self.active[id] = process; self.lock.unlock() }
+                do {
+                    try process.run(); self.active[id] = process
+                    if module == "vibecue.engineering_tools" { self.engineeringProcesses.insert(id) }
+                    self.lock.unlock()
+                }
                 catch { self.lock.unlock(); throw error }
                 if let input { inputPipe.fileHandleForWriting.write(input); try? inputPipe.fileHandleForWriting.close() }
                 // Drain stderr concurrently: an unread error pipe must never
@@ -53,7 +62,10 @@ final class CueUsageClient {
                     }
                     group.leave()
                 }
-                let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                let timeout = DispatchWorkItem {
+                    if process.isRunning { process.terminate() }
+                    if module == "vibecue.engineering_tools" { Self.ensureEngineeringTermination(process) }
+                }
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + (arguments.first == "sync" ? 1800 : 60), execute: timeout)
                 let outputLimit = module == "vibecue.usage_money" ? 25_165_824 : 8_388_608
                 var bytes = Data(), exceeded = false
@@ -76,26 +88,41 @@ final class CueUsageClient {
         }
     }
 
+    /// Explicit cancellation of a finite engineering read/request cannot leave
+    /// a signal-ignoring Python worker holding its only resource slot forever.
+    /// Other collectors retain their existing receipt and cancellation rules.
+    private static func ensureEngineeringTermination(_ process: Process) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+            if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+        }
+    }
+
     /// Network tests inherit only configured proxy routing, never unrelated API credentials.
     static func childEnvironment(inherited: [String: String], module: String, home: URL, runtime: URL) -> [String: String] {
         var environment: [String: String] = [:]
         var allowed = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "OPENCODE_DB", "VIBECUE_CC_SWITCH_QUOTA_FILE"]
-        if module == "vibecue.network_tests" {
+        if ["vibecue.network_tests", "vibecue.engineering_tools"].contains(module) {
             allowed += ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]
         }
         for key in allowed { if let value = inherited[key] { environment[key] = value } }
         environment["VIBECUE_HOME"] = home.path; environment["PYTHONPATH"] = runtime.path
         environment["PYTHONUNBUFFERED"] = "1"; environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        if module == "vibecue.engineering_tools" {
+            let paths = (inherited["PATH"] ?? "").split(separator: ":").map(String.init).filter { $0.hasPrefix("/") && !$0.contains("\n") && !$0.contains("\0") }.prefix(128)
+            environment["PATH"] = (Array(paths) + ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]).joined(separator: ":")
+        } else { environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin" }
         return environment
     }
     static func networkEnvironmentValidationReport() -> [String: Bool] {
-        let fixture = ["HTTPS_PROXY": "http://proxy.example:8080", "all_proxy": "socks5h://proxy.example:1080", "NO_PROXY": "localhost", "OPENAI_API_KEY": "fixture-only", "AUTHORIZATION": "fixture-only"]
+        let fixture = ["PATH": "/opt/homebrew/bin:.:relative:/usr/bin", "HTTPS_PROXY": "http://proxy.example:8080", "all_proxy": "socks5h://proxy.example:1080", "NO_PROXY": "localhost", "OPENAI_API_KEY": "fixture-only", "AUTHORIZATION": "fixture-only"]
         let home = URL(fileURLWithPath: "/tmp/vcgo-env-fixture"), runtime = URL(fileURLWithPath: "/tmp/vcgo-env-fixture/runtime")
         let network = childEnvironment(inherited: fixture, module: "vibecue.network_tests", home: home, runtime: runtime)
         let usage = childEnvironment(inherited: fixture, module: "vibecue.usage", home: home, runtime: runtime)
+        let engineering = childEnvironment(inherited: fixture, module: "vibecue.engineering_tools", home: home, runtime: runtime)
         return ["network_transport_inherits_existing_proxy_and_bypass_configuration": network["HTTPS_PROXY"] == fixture["HTTPS_PROXY"] && network["all_proxy"] == fixture["all_proxy"] && network["NO_PROXY"] == "localhost",
                 "network_transport_never_inherits_unrelated_api_credentials": network["OPENAI_API_KEY"] == nil && network["AUTHORIZATION"] == nil,
+                "engineering_transport_reuses_proxy_without_inheriting_api_credentials": engineering["HTTPS_PROXY"] == fixture["HTTPS_PROXY"] && engineering["OPENAI_API_KEY"] == nil && engineering["AUTHORIZATION"] == nil,
+                "engineering_tool_discovery_uses_only_absolute_path_entries": engineering["PATH"]?.split(separator: ":").allSatisfy { $0.hasPrefix("/") } == true && engineering["PATH"]?.contains("/opt/homebrew/bin") == true,
                 "network_proxy_forwarding_does_not_expand_other_collectors_environment": usage["HTTPS_PROXY"] == nil && usage["all_proxy"] == nil && usage["NO_PROXY"] == nil]
     }
 

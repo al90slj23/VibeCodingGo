@@ -1231,7 +1231,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     private func rebuildShortcutMenuIfNeeded() {
         guard shortcutMenuDirty || shortcutMenu == nil else { return }
         shortcutMenuDirty = false; menuRebuilds += 1
-        let menu = NSMenu(), remindersMenu = NSMenu(), codingMenu = NSMenu(), testMenu = NSMenu()
+        let menu = NSMenu(), remindersMenu = NSMenu(), codingMenu = NSMenu(), testMenu = NSMenu(), engineeringMenu = NSMenu()
         func command(_ title: String, _ action: Selector, in parent: NSMenu) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self; parent.addItem(item)
@@ -1241,6 +1241,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         command("Codex · 连接设置…", #selector(openCodingSettings), in: codingMenu)
         command("网络检测工具…", #selector(openTestModule), in: testMenu)
         command("检测来源与范围…", #selector(openTestSettings), in: testMenu)
+        command("环境体检…", #selector(openEngineeringEnvironment), in: engineeringMenu)
+        command("接口调试…", #selector(openEngineeringAPI), in: engineeringMenu)
+        command("日志诊断…", #selector(openEngineeringLogs), in: engineeringMenu)
         let panel = NSMenuItem(title: "打开工作台…", action: #selector(openWorkbench), keyEquivalent: ",")
         panel.target = self; menu.addItem(panel)
         let usage = NSMenuItem(title: "用量统计与请求日志…", action: #selector(openUsage), keyEquivalent: "u")
@@ -1325,7 +1328,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             let ordinary = snapshot.ordinary
             if !ordinary.isEmpty { heading("历史提醒 · \(ordinary.count) 条"); ordinary.forEach(reminder) }
         }
-        for (title, submenu) in [("任务提醒", remindersMenu), ("编程助手", codingMenu), ("网络检测", testMenu)] {
+        for (title, submenu) in [("任务提醒", remindersMenu), ("编程助手", codingMenu), ("网络检测", testMenu), ("工程工具", engineeringMenu)] {
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: ""); item.submenu = submenu; menu.addItem(item)
         }
         command("通用设置…", #selector(openGeneralSettings), in: menu)
@@ -1375,6 +1378,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     @objc func openReminderModule() { openWorkspacePage(.reminderOverview) }
     @objc func openCodingModule() { openWorkspacePage(.codingTasks) }
     @objc func openTestModule() { openWorkspacePage(.networkIP) }
+    @objc func openEngineeringEnvironment() { openWorkspacePage(.engineeringEnvironment) }
+    @objc func openEngineeringAPI() { openWorkspacePage(.engineeringAPI) }
+    @objc func openEngineeringLogs() { openWorkspacePage(.engineeringLogs) }
     @objc func openCodingSettings() { openWorkspacePage(.codexSettings) }
     @objc func openTestSettings() { openWorkspacePage(.testSettings) }
     @objc func openGeneralSettings() { openWorkspacePage(.general) }
@@ -1522,7 +1528,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
             "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
             "codex_connection_state": codexConnectionState, "codex_connection_summary": codexConnectionSummary,
-            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
+            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "engineering": settingsPanel?.engineeringController?.performanceSnapshot ?? ["created": false], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
         let destination = home.appendingPathComponent("app-status.json")
         let write = {
@@ -1549,6 +1555,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         menuUsage?.stop()
         accountQuotaMonitor?.stop()
         usageDashboard?.stopBackgroundSync()
+        settingsPanel?.engineeringController?.stop()
         conversationWindows.values.forEach { $0.stop() }; conversationClient?.stop(); recoveryClient?.stop()
         approvalLauncher?.terminate()
         try? approvalLaunchLog?.close(); approvalLaunchLog = nil
@@ -1604,6 +1611,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     var preferencesController: CueUsagePreferencesController?
     var scheduleController: CueUsageScheduleController?
     var pricesController: CuePriceSourcesController?
+    var engineeringController: CueEngineeringToolsController?
     private var layingOut = false
     var healthLabel: NSTextField?
     var threadLabel: NSTextField?
@@ -1729,6 +1737,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .usageSchedule: scheduleController?.deactivateEmbedded()
         case .priceSources: pricesController?.deactivateEmbedded()
         case .networkTests, .networkIP, .networkDomain, .networkTrace, .networkPing, .networkHTTP, .networkSpeed: cue.networkTests?.stopEmbeddedWork()
+        case .engineeringEnvironment, .engineeringAPI, .engineeringLogs: _ = engineeringController?.deactivateEmbedded()
         default: break
         }
         return true
@@ -1742,6 +1751,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .usagePreferences: preferencesController?.activateEmbedded()
         case .usageSchedule: scheduleController?.activateEmbedded()
         case .priceSources: pricesController?.activateEmbedded()
+        case .engineeringEnvironment, .engineeringAPI, .engineeringLogs: engineeringController?.activateEmbedded()
         default: break
         }
     }
@@ -1755,6 +1765,11 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         cue.populateTaskController(taskController, maximumHeight: max(430, pageScroll.contentSize.height))
     }
     private func embeddedPage(_ route: CueWorkspacePage) -> NSView? {
+        if let kind = route.engineeringKind {
+            if engineeringController == nil { engineeringController = CueEngineeringToolsController(home: cue.home) }
+            engineeringController?.selectKind(kind)
+            return engineeringController?.embeddedContentView()
+        }
         if let kind = route.networkKind {
             if cue.networkTests == nil { cue.networkTests = CueNetworkTestsController(home: cue.home) }
             cue.networkTests?.selectKind(kind); return cue.networkTests?.embeddedContentView()
@@ -1791,7 +1806,8 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         let width = root.bounds.width, height = root.bounds.height
         sidebar.frame = NSRect(x: 0, y: 0, width: width, height: 118)
         homeButton.frame = NSRect(x: 20, y: 20, width: 160, height: 34)
-        primary.frame = NSRect(x: max(190, (width - 420) / 2), y: 20, width: 420, height: 34)
+        let primaryWidth = CGFloat(CueWorkspacePage.moduleTitles.count) * 136 + 12
+        primary.frame = NSRect(x: max(190, (width - primaryWidth) / 2), y: 20, width: primaryWidth, height: 34)
         generalButton.frame = NSRect(x: width - 124, y: 22, width: 104, height: 30)
         secondary.frame = NSRect(x: 24, y: 75, width: width - 48, height: 29)
         pageScroll.frame = NSRect(x: 18, y: 118, width: width - 36, height: max(400, height - 134))
@@ -1804,6 +1820,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .usageSchedule: minimum = NSSize(width: 620, height: 385); fixed = true
         case .accountQuota: minimum = NSSize(width: 640, height: 420)
         case .codingTasks: minimum = NSSize(width: 680, height: 430)
+        case .engineeringEnvironment, .engineeringAPI, .engineeringLogs: minimum = NSSize(width: 860, height: 600)
         default: if route.networkKind != nil { minimum = NSSize(width: 760, height: 430) }
         }
         let size = NSSize(width: max(minimum.width, pageScroll.contentSize.width), height: max(minimum.height, pageScroll.contentSize.height))
@@ -1905,11 +1922,11 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
 
     func overview() {
         heading("工作台", "从上方两级标签切换功能，任务与设置都在同一面板。")
-        for (y, title, detail, target) in [(CGFloat(106), "任务提醒", "完成、等待输入、人工批准 · 规则、光影、提示框与声音", 5), (CGFloat(246), "编程助手", "任务与对话、运行状态、用量统计、账号额度和连接设置", 6), (CGFloat(386), "网络检测", "IP 信誉、域名可达性、出口痕迹、全球 Ping 与下载测速", 7)] {
-            let box = card(y, 124)
-            label(title, in: box, frame: NSRect(x: 20, y: 17, width: 480, height: 25), size: 16, weight: .semibold)
-            label(detail, in: box, frame: NSRect(x: 20, y: 51, width: 480, height: 33), size: 11.5, color: .secondaryLabelColor, lines: 2)
-            let enter = button("进入板块", in: box, frame: NSRect(x: 370, y: 83, width: 136, height: 29), action: #selector(goPage(_:)))
+        for (y, title, detail, target) in [(CGFloat(106), "任务提醒", "完成、等待输入、人工批准 · 规则、光影、提示框与声音", 5), (CGFloat(224), "编程助手", "任务与对话、运行状态、用量统计、账号额度和连接设置", 6), (CGFloat(342), "网络检测", "IP 信誉、域名可达性、出口痕迹、全球 Ping 与下载测速", 7), (CGFloat(460), "工程工具", "环境体检、接口调试与日志诊断 · 按需运行", 21)] {
+            let box = card(y, 106)
+            label(title, in: box, frame: NSRect(x: 20, y: 12, width: 480, height: 25), size: 16, weight: .semibold)
+            label(detail, in: box, frame: NSRect(x: 20, y: 43, width: 480, height: 27), size: 11.5, color: .secondaryLabelColor, lines: 2)
+            let enter = button("进入板块", in: box, frame: NSRect(x: 370, y: 69, width: 136, height: 29), action: #selector(goPage(_:)))
             enter.tag = target
         }
     }
@@ -2427,6 +2444,14 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         NSWorkspace.shared.open(logs)
     }
+    func windowDidDeminiaturize(_ notification: Notification) { refreshVisibleEngineeringReport() }
+    func windowDidChangeOcclusionState(_ notification: Notification) { refreshVisibleEngineeringReport() }
+    private func refreshVisibleEngineeringReport() {
+        guard CueWorkspacePage.canonical(page).engineeringKind != nil,
+              window?.isVisible == true, window?.isMiniaturized == false,
+              window?.occlusionState.contains(.visible) == true else { return }
+        engineeringController?.activateEmbedded()
+    }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         window?.makeFirstResponder(nil)
         return deactivateCurrentEmbedded()
@@ -2434,6 +2459,29 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         _ = deactivateCurrentEmbedded()
         DispatchQueue.main.async { self.cue.writeStatus() }
+    }
+    static func engineeringNavigationValidationReport() -> [String: Bool] {
+        let cue = CueController(); cue.presentsWindows = false
+        let controller = CueSettingsController(cue: cue)
+        let lazy = controller.engineeringController == nil && controller.primary.segmentCount == 4
+        _ = controller.selectPage(CueWorkspacePage.engineeringEnvironment.rawValue)
+        let tools = controller.engineeringController, firstView = controller.embeddedView
+        _ = controller.selectPage(CueWorkspacePage.engineeringAPI.rawValue)
+        let api = controller.embeddedView === firstView && controller.engineeringController === tools && controller.secondary.selectedSegment == 1
+        _ = controller.selectPage(CueWorkspacePage.engineeringLogs.rawValue)
+        let logs = controller.embeddedView === firstView && controller.secondary.selectedSegment == 2 && tools?.performanceSnapshot["selected_kind"] as? String == "logs"
+        _ = controller.selectPage(CueWorkspacePage.workspace.rawValue)
+        controller.primary.selectedSegment = 3; controller.changeModule(controller.primary)
+        let restored = controller.page == CueWorkspacePage.engineeringLogs.rawValue && controller.secondary.segmentCount == 3
+        let idle = tools?.performanceSnapshot["requests_started"] as? Int == 0 && tools?.performanceSnapshot["client_created"] as? Bool == false && cue.usageDashboard == nil && cue.networkTests == nil
+        controller.root.setFrameSize(NSSize(width: 960, height: 720)); controller.layoutWorkspace()
+        let fits = controller.homeButton.frame.maxX <= controller.primary.frame.minX && controller.primary.frame.maxX <= controller.generalButton.frame.minX && controller.primary.frame.maxX <= 960
+        tools?.stop()
+        return ["engineering_workspace_does_not_construct_tools_before_navigation": lazy,
+                "engineering_three_tabs_share_one_workbench_view_and_controller": api && logs,
+                "engineering_primary_tag_restores_its_selected_secondary_tag": restored,
+                "engineering_navigation_never_starts_collectors_or_other_modules": idle,
+                "engineering_four_primary_tags_fit_minimum_workbench_width": fits]
     }
     func capture(to path: String) {
         root.layoutSubtreeIfNeeded()
@@ -2460,6 +2508,8 @@ if CommandLine.arguments.contains("--ui-performance-measure") {
     checks.merge(CueCollectorScheduler.validationReport()) { _, new in new }
     checks.merge(CueWatcherProjectionReader.validationReport()) { _, new in new }
     checks.merge(CueWorkPipelineChecks.validationReport()) { _, new in new }
+    checks.merge(CueEngineeringToolsController.validationReport()) { _, new in new }
+    checks.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
     let measurement = CueStatusPopoverController.performanceMeasurement()
     checks["unchanged_list_does_not_rebuild"] = measurement["diff_rebuilds"] as? Int == 0
     checks["unchanged_list_does_not_rerender_rows"] = measurement["diff_row_refreshes"] as? Int == 0
@@ -2467,6 +2517,23 @@ if CommandLine.arguments.contains("--ui-performance-measure") {
     let result: [String: Any] = ["checks": checks, "measurement": measurement, "watcher_measurement": CueWatcherProjectionReader.performanceMeasurement()]
     print(String(data: try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]), encoding: .utf8)!)
     exit(checks.values.allSatisfy { $0 } ? 0 : 1)
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--capture-engineering-fixture"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    let kindIndex = CommandLine.arguments.firstIndex(of: "--engineering-kind")
+    let kind = kindIndex.flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil } ?? "environment"
+    let passed = CueEngineeringToolsController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), kind: kind)
+    exit(passed ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--engineering-self-test") {
+    _ = NSApplication.shared
+    var results = CueEngineeringToolsController.validationReport()
+    results.merge(CueWorkspacePage.validationReport()) { _, new in new }
+    results.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
 }
 
 if CommandLine.arguments.contains("--recent-self-test") {
@@ -2480,6 +2547,8 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results.merge(CueCollectorScheduler.validationReport()) { _, new in new }
     results.merge(CueWatcherProjectionReader.validationReport()) { _, new in new }
     results.merge(CueWorkspacePage.validationReport()) { _, new in new }
+    results.merge(CueEngineeringToolsController.validationReport()) { _, new in new }
+    results.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
     results.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
     results.merge(CueNetworkTestsController.validationReport()) { _, new in new }
     results.merge(CueStatusPopoverController.validationReport()) { _, new in new }

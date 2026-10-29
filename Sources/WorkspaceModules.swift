@@ -6,13 +6,15 @@ enum CueWorkspacePage: Int, CaseIterable {
     case reminderOverview = 5, codingTasks = 6, networkTests = 7, general = 8, testSettings = 9
     case networkIP = 10, networkDomain = 11, networkTrace = 12, networkPing = 13, networkHTTP = 14, networkSpeed = 15
     case accountQuota = 16, usagePreferences = 17, conversation = 18, usageSchedule = 19, priceSources = 20
-    static let moduleTitles = ["任务提醒", "编程助手", "网络检测"]
+    case engineeringEnvironment = 21, engineeringAPI = 22, engineeringLogs = 23
+    static let moduleTitles = ["任务提醒", "编程助手", "网络检测", "工程工具"]
     var module: String {
         switch self {
         case .workspace: return "工作台"
         case .reminderOverview, .reminderRules, .reminderEffects: return "任务提醒"
         case .codingTasks, .usage, .codexSettings, .accountQuota, .usagePreferences, .conversation, .usageSchedule, .priceSources: return "编程助手"
         case .networkTests, .testSettings, .networkIP, .networkDomain, .networkTrace, .networkPing, .networkHTTP, .networkSpeed: return "网络检测"
+        case .engineeringEnvironment, .engineeringAPI, .engineeringLogs: return "工程工具"
         case .general: return "通用"
         }
     }
@@ -38,6 +40,9 @@ enum CueWorkspacePage: Int, CaseIterable {
         case .conversation: return "当前对话"
         case .usageSchedule: return "同步频率"
         case .priceSources: return "价格来源"
+        case .engineeringEnvironment: return "环境体检"
+        case .engineeringAPI: return "接口调试"
+        case .engineeringLogs: return "日志诊断"
         }
     }
     var networkKind: String? {
@@ -48,6 +53,14 @@ enum CueWorkspacePage: Int, CaseIterable {
         case .networkPing: return "global_ping"
         case .networkHTTP: return "global_http"
         case .networkSpeed: return "speed"
+        default: return nil
+        }
+    }
+    var engineeringKind: String? {
+        switch self {
+        case .engineeringEnvironment: return "environment"
+        case .engineeringAPI: return "api"
+        case .engineeringLogs: return "logs"
         default: return nil
         }
     }
@@ -67,13 +80,15 @@ enum CueWorkspacePage: Int, CaseIterable {
         case "任务提醒": return [.reminderOverview, .reminderRules, .reminderEffects]
         case "编程助手": return [.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources, .codexSettings]
         case "网络检测": return [.networkIP, .networkDomain, .networkTrace, .networkPing, .networkHTTP, .networkSpeed, .testSettings]
+        case "工程工具": return [.engineeringEnvironment, .engineeringAPI, .engineeringLogs]
         default: return []
         }
     }
-    var isEmbedded: Bool { networkKind != nil || [.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources].contains(self) }
+    var isEmbedded: Bool { engineeringKind != nil || networkKind != nil || [.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources].contains(self) }
     static func validationReport() -> [String: Bool] {
         ["workspace_legacy_page_routes_remain_stable": Self.reminderRules.rawValue == 1 && Self.reminderEffects.rawValue == 2 && Self.codexSettings.rawValue == 3 && Self.usage.rawValue == 4 && canonical(7) == .networkIP,
-         "workspace_three_primary_names_are_intuitive_and_symmetric": moduleTitles.count == 3 && moduleTitles.allSatisfy { $0.count == 4 },
+         "workspace_four_primary_names_are_intuitive_and_symmetric": moduleTitles.count == 4 && moduleTitles.allSatisfy { $0.count == 4 },
+         "workspace_engineering_has_three_lazy_embedded_pages": children(of: "工程工具") == [.engineeringEnvironment, .engineeringAPI, .engineeringLogs] && children(of: "工程工具").allSatisfy { $0.isEmbedded && $0.engineeringKind != nil && $0.module == "工程工具" },
          "workspace_reminder_settings_are_separate_from_coding": Set(children(of: "任务提醒")) == Set([.reminderOverview, .reminderRules, .reminderEffects]),
          "workspace_coding_includes_all_main_functions_in_second_level": Set([Self.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources, .codexSettings]).isSubset(of: Set(children(of: "编程助手"))),
          "workspace_network_kinds_each_have_one_secondary_tag": Set(children(of: "网络检测").compactMap(\.networkKind)).count == 6,

@@ -3,7 +3,7 @@ import Foundation
 /// One admission owner for finite collector processes. No result cache, write
 /// merging or replay: every accepted request still executes against live data.
 final class CueCollectorScheduler {
-    enum Lane: String, CaseIterable { case interactive, status, read, maintenance, network, control }
+    enum Lane: String, CaseIterable { case interactive, status, read, maintenance, network, control, engineering }
     enum Discard { case cancelled, saturated }
     typealias Work = (@escaping () -> Void) -> Void
     private struct Job {
@@ -26,7 +26,7 @@ final class CueCollectorScheduler {
 
     init(queueLimit: Int = 256, limits: [Lane: Int] = [:], execute: ((Lane, @escaping () -> Void) -> Void)? = nil) {
         self.queueLimit = max(1, queueLimit)
-        var configured: [Lane: Int] = [.interactive: 2, .status: 2, .read: 2, .maintenance: 1, .network: 2, .control: 1]
+        var configured: [Lane: Int] = [.interactive: 2, .status: 2, .read: 2, .maintenance: 1, .network: 2, .control: 1, .engineering: 1]
         for (lane, value) in limits { configured[lane] = max(1, value) }
         self.limits = configured
         self.execute = execute ?? { lane, work in
@@ -36,6 +36,7 @@ final class CueCollectorScheduler {
     }
     static func lane(module: String, arguments: [String]) -> Lane {
         let command = arguments.first ?? ""
+        if module == "vibecue.engineering_tools" { return .engineering }
         if module == "vibecue.codex_chat" { return command == "status" ? .status : .interactive }
         if module == "vibecue.codex_control" { return command == "apply" ? .control : .status }
         if module == "vibecue.usage", command == "sync" { return .maintenance }
@@ -136,6 +137,19 @@ final class CueCollectorScheduler {
         let drained = group.wait(timeout: .now() + 3) == .success
         results["collector_parallel_completions_preserve_global_bounds_and_do_not_lose_work"] = drained && concurrent.metrics["completed"] == 40 && (concurrent.metrics["peak_active"] ?? 99) <= 2 && concurrent.metrics["queued"] == 0
         results["collector_classification_separates_writes_network_and_numeric_reads"] = lane(module: "vibecue.codex_chat", arguments: ["send"]) == .interactive && lane(module: "vibecue.codex_chat", arguments: ["status"]) == .status && lane(module: "vibecue.codex_control", arguments: ["apply"]) == .control && lane(module: "vibecue.usage", arguments: ["query"]) == .read && lane(module: "vibecue.usage", arguments: ["sync"]) == .maintenance && lane(module: "vibecue.usage_money", arguments: ["refresh"]) == .network
+        let engineering = CueCollectorScheduler(execute: { _, action in action() })
+        let toolOwner = UUID(), other = UUID()
+        var toolStarts = 0, toolDiscards = 0, toolDone: [() -> Void] = []
+        for _ in 0..<3 {
+            engineering.submit(owner: toolOwner, lane: .engineering, discard: { _ in toolDiscards += 1 }) { done in toolStarts += 1; toolDone.append(done) }
+        }
+        results["engineering_collectors_share_one_background_slot"] = toolStarts == 1 && engineering.metrics["engineering_queued"] == 2
+        for lane in [Lane.status, .interactive] { engineering.submit(owner: other, lane: lane, discard: { _ in }) { done in toolDone.append(done) } }
+        results["engineering_work_cannot_occupy_chat_or_status_slots"] = engineering.metrics["status_active"] == 1 && engineering.metrics["interactive_active"] == 1
+        engineering.cancel(owner: toolOwner)
+        results["engineering_close_removes_its_queued_work_without_touching_other_owners"] = toolDiscards == 2 && engineering.metrics["queued"] == 0 && engineering.metrics["active"] == 3
+        toolDone.forEach { $0() }
+        results["engineering_finished_work_releases_budget_and_classifies_all_tools"] = engineering.metrics["active"] == 0 && ["environment", "api", "logs"].allSatisfy { lane(module: "vibecue.engineering_tools", arguments: [$0]) == .engineering }
         return results
     }
 }
