@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from vibecue.engineering_runtime import EngineeringError, Runtime, redact
+from vibecue.engineering_runtime import EngineeringError, ProcessResult, Runtime, redact
 
 
 class RuntimeTests(unittest.TestCase):
@@ -69,6 +69,65 @@ class RuntimeTests(unittest.TestCase):
             executable=Path(directory)/'hurl';executable.write_text('#!/bin/sh\nprintf "hurl fixture\\n"\n');executable.chmod(0o700)
             found=Runtime(search_path=directory).capability('hurl')
             self.assertTrue(found['available']);self.assertEqual(found['version'],'hurl fixture')
+
+    def test_explicit_version_probes_stay_offline_and_reuse_the_result(self):
+        runtime=Runtime(search_path='/fixture')
+        with patch.object(runtime,'find_tool',return_value='/fixture/mise'), \
+                patch.object(runtime,'run',return_value=ProcessResult(0,stdout=b'2026.10.23 macos-arm64\n')) as run:
+            first=runtime.capability('mise');second=runtime.capability('mise')
+        self.assertEqual(first,second);self.assertEqual(run.call_count,1)
+        self.assertEqual(run.call_args.kwargs['env']['MISE_OFFLINE'],'1')
+        self.assertEqual(run.call_args.kwargs['env']['MISE_AUTO_INSTALL'],'false')
+        self.assertEqual(run.call_args.kwargs['timeout'],2)
+
+    def test_managed_tool_symlink_is_preferred_without_starting_a_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);managed=root/'state/engineering-tools/bin';managed.mkdir(parents=True)
+            versioned=root/'state/engineering-tools/versions/hurl/fixture/hurl';versioned.parent.mkdir(parents=True)
+            versioned.write_text('#!/bin/sh\nprintf "managed fixture\\n"\n');versioned.chmod(0o700)
+            (managed/'hurl').symlink_to(versioned)
+            other=root/'other';other.mkdir();(other/'hurl').write_text('fixture');(other/'hurl').chmod(0o700)
+            with patch.dict(os.environ,{'VIBECUE_HOME':str(root/'state'),'PATH':str(other)},clear=False), \
+                    patch('subprocess.Popen',side_effect=AssertionError('lookup started a process')):
+                self.assertEqual(Runtime().find_tool('hurl'),str(versioned.resolve()))
+
+    def test_managed_directory_is_not_used_with_an_explicit_search_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);managed=root/'state/engineering-tools/bin';managed.mkdir(parents=True)
+            (managed/'hurl').write_text('fixture');(managed/'hurl').chmod(0o700)
+            explicit=root/'explicit';explicit.mkdir();(explicit/'hurl').write_text('fixture');(explicit/'hurl').chmod(0o700)
+            with patch.dict(os.environ,{'VIBECUE_HOME':str(root/'state')}):
+                self.assertEqual(Runtime(search_path=str(explicit)).find_tool('hurl'),str((explicit/'hurl').resolve()))
+
+    def test_managed_path_applies_only_to_the_three_engineering_engines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);managed=root/'state/engineering-tools/bin';managed.mkdir(parents=True)
+            other=root/'other';other.mkdir()
+            for name in ('mise','hurl','lnav','node'):
+                for parent in (managed,other):
+                    path=parent/name;path.write_text('fixture');path.chmod(0o700)
+            with patch.dict(os.environ,{'VIBECUE_HOME':str(root/'state'),'PATH':str(other),'VIBECUE_ENGINEERING_PATH':str(other)}):
+                runtime=Runtime()
+                for name in ('mise','hurl','lnav'):
+                    self.assertEqual(runtime.find_tool(name),str((managed/name).resolve()))
+                self.assertEqual(runtime.find_tool('node'),str((other/'node').resolve()))
+
+    def test_managed_path_uses_home_fallback_and_rejects_relative_home_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);managed=root/'Library/Application Support/VibeCue/engineering-tools/bin';managed.mkdir(parents=True)
+            executable=managed/'lnav';executable.write_text('fixture');executable.chmod(0o700)
+            with patch.dict(os.environ,{'VIBECUE_HOME':'relative-state'}), patch('vibecue.engineering_runtime.Path.home',return_value=root):
+                self.assertEqual(Runtime().find_tool('lnav'),str(executable.resolve()))
+
+    def test_broken_or_non_executable_managed_tool_falls_back_to_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);managed=root/'state/engineering-tools/bin';managed.mkdir(parents=True)
+            other=root/'other';other.mkdir();executable=other/'hurl';executable.write_text('fixture');executable.chmod(0o700)
+            (managed/'hurl').symlink_to(root/'missing-tool')
+            with patch.dict(os.environ,{'VIBECUE_HOME':str(root/'state'),'PATH':str(other),'VIBECUE_ENGINEERING_PATH':str(other)}):
+                self.assertEqual(Runtime().find_tool('hurl'),str(executable.resolve()))
+                (managed/'hurl').unlink();(managed/'hurl').write_text('fixture');(managed/'hurl').chmod(0o600)
+                self.assertEqual(Runtime().find_tool('hurl'),str(executable.resolve()))
 
     def test_reports_redact_tokens_headers_and_connection_passwords(self):
         text='Authorization: Bearer abc123\npassword=secret api_key=private\nhttps://u:p@example.com?token=hide\nCookie: session=cookie-secret\nSet-Cookie: session=set-cookie-secret\nsk-abcdefghijklmnop ghp_abcdefghijklmno'

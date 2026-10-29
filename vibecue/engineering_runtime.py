@@ -23,6 +23,7 @@ MAX_OUTPUT = 2 * 1024 * 1024
 TOOLS = {'node': '--version', 'npm': '--version', 'pnpm': '--version',
          'python3': '--version', 'go': 'version', 'git': '--version',
          'mise': '--version', 'hurl': '--version', 'lnav': '-V', 'curl': '--version'}
+MANAGED_TOOLS = frozenset(('mise', 'hurl', 'lnav'))
 
 
 class EngineeringError(ValueError):
@@ -71,6 +72,13 @@ class Runtime:
         home = Path.home()
         directories = (self.search_path if self.search_path is not None else
                        os.environ.get('VIBECUE_ENGINEERING_PATH', os.environ.get('PATH', ''))).split(os.pathsep)
+        if self.search_path is None and name in MANAGED_TOOLS:
+            configured_home = os.environ.get('VIBECUE_HOME', '')
+            managed_home = (Path(configured_home) if os.path.isabs(configured_home) else
+                            home / 'Library/Application Support/VibeCue')
+            # Fixed, known paths only. Installation and checksum validation are
+            # separate explicit operations; discovery never starts a process.
+            directories.insert(0, str(managed_home / 'engineering-tools/bin'))
         directories += ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
                         str(home / '.local/bin'), str(home / '.cargo/bin')]
         # Do not enumerate installations, execute login shells, or trust a
@@ -102,7 +110,7 @@ class Runtime:
         if path and name in TOOLS and not self.cancelled:
             with tempfile.TemporaryDirectory(prefix='vcgo-tool-version-') as temp:
                 result = self.run([path, TOOLS[name]], timeout=2, max_output=16384, cwd=temp,
-                                  env={'MISE_NO_CONFIG': '1', 'NO_COLOR': '1'})
+                                  env={'MISE_NO_CONFIG': '1', 'MISE_OFFLINE': '1', 'MISE_AUTO_INSTALL': 'false', 'NO_COLOR': '1'})
             text = (result.stdout or result.stderr).decode('utf-8', 'replace').splitlines()
             if result.returncode == 0 and not result.truncated and text:
                 item['version'] = redact(text[0], 180)

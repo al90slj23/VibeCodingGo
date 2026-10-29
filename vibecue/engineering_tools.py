@@ -182,6 +182,19 @@ def environment(payload, runtime=None):
     result['warnings'] = warnings
     checked = {name: runtime.capability(name) for name in CORE_TOOLS + OPTIONAL_TOOLS}
     result['capabilities'] = checked
+    # Reuse this run's already bounded probes. Showing optional engine identity
+    # must never trigger another process or imply that an installed engine was
+    # used for the project checks below.
+    for name in OPTIONAL_TOOLS:
+        tool = checked[name]
+        confirmed = tool.get('available') is True and bool(tool.get('version'))
+        detail = tool.get('path') or '未找到；本次运行保留原生后备。'
+        if tool.get('version_error'):
+            detail += ' · ' + tool['version_error']
+        result['items'].append({'label': '工程引擎 · '+name,
+                                'value': tool['version'] if confirmed else '已找到，版本未核实' if tool.get('available') else '未安装',
+                                'status': 'success' if confirmed else 'unknown',
+                                'detail': detail})
     for name in CORE_TOOLS:
         tool = checked[name]
         result['items'].append({'label': name, 'value': tool['version'] or ('已找到，版本未核实' if tool['available'] else '未找到'),

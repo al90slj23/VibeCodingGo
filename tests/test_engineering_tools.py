@@ -52,6 +52,48 @@ class EngineeringToolsTests(unittest.TestCase):
             self.assertEqual(item['status'], 'unknown')
             self.assertEqual(item['value'], '已找到，版本未核实')
 
+    def test_environment_shows_optional_engine_identity_without_duplicate_probes(self):
+        runtime = FakeRuntime(mise=True, lnav=True)
+        original = runtime.capability
+        probed = []
+        def capability(name):
+            probed.append(name)
+            return original(name)
+        runtime.capability = capability
+        result = tools.environment({'project_path': str(self.root)}, runtime)
+        self.assertEqual(probed, list(tools.CORE_TOOLS + tools.OPTIONAL_TOOLS))
+        inventory = {item['label']: item for item in result['items'] if item['label'].startswith('工程引擎 · ')}
+        self.assertEqual(set(inventory), {'工程引擎 · '+name for name in tools.OPTIONAL_TOOLS})
+        for name in ('mise', 'lnav'):
+            item = inventory['工程引擎 · '+name]
+            self.assertEqual(item['value'], 'fixture 1.0')
+            self.assertEqual(item['status'], 'success')
+            self.assertEqual(item['detail'], '/fixture/'+name)
+        self.assertEqual(inventory['工程引擎 · hurl']['value'], '未安装')
+        self.assertEqual(inventory['工程引擎 · hurl']['status'], 'unknown')
+        # Only the pre-existing, explicit mise inventory commands are executed.
+        self.assertEqual(len(runtime.calls), 3)
+        self.assertEqual(result['engine'], 'builtin+mise')
+
+    def test_optional_engine_version_failure_keeps_path_and_never_claims_pass(self):
+        (self.root/'package.json').write_text('{"engines":{"node":"20"}}')
+        runtime = FakeRuntime(mise=True)
+        original = runtime.capability
+        def capability(name):
+            if name == 'hurl':
+                return {'available': True, 'version': None, 'path': '/fixture/hurl', 'version_error': '版本探测超时'}
+            return original(name)
+        runtime.capability = capability
+        result = tools.environment({'project_path': str(self.root)}, runtime)
+        item = next(item for item in result['items'] if item['label'] == '工程引擎 · hurl')
+        self.assertEqual(item['value'], '已找到，版本未核实')
+        self.assertEqual(item['status'], 'unknown')
+        self.assertIn('/fixture/hurl', item['detail'])
+        self.assertIn('版本探测超时', item['detail'])
+        # Unavailable optional engines do not turn successful static checks into
+        # failures; their actual state is reported on the individual engine row.
+        self.assertEqual(result['status'], 'success')
+
     def test_static_project_requirements_and_versions(self):
         (self.root/'package.json').write_text(json.dumps({'engines':{'node':'>=22','npm':'>=9'},'packageManager':'pnpm@9.1.0','scripts':{'postinstall':'touch should-not-run'}}))
         (self.root/'.python-version').write_text('3.11\n');(self.root/'go.mod').write_text('module example\ngo 1.21\n')
