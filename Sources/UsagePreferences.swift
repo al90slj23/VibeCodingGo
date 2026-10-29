@@ -5,6 +5,9 @@ import Foundation
 /// enters this window or the local worker used by it.
 final class CueUsagePreferencesController: NSWindowController {
     private let client: CueUsageClient
+    private let home: URL
+    private var scheduleController: CueUsageScheduleController?
+    private var sourcesController: CuePriceSourcesController?
     private let currency = NSPopUpButton(), exchangeMode = NSPopUpButton(), model = NSPopUpButton()
     private let rate = NSTextField(string: "")
     private let rateInfo = NSTextField(wrappingLabelWithString: "正在读取…")
@@ -13,8 +16,10 @@ final class CueUsagePreferencesController: NSWindowController {
     private let fields = (0..<4).map { _ in NSTextField(string: "") }
     private let saveButton = NSButton(title: "保存显示设置", target: nil, action: nil)
     private let priceButton = NSButton(title: "保存此模型单价", target: nil, action: nil)
-    private let resetButton = NSButton(title: "恢复 CC Switch 单价", target: nil, action: nil)
+    private let resetButton = NSButton(title: "恢复来源队列价格", target: nil, action: nil)
     private let refreshButton = NSButton(title: "更新公开汇率", target: nil, action: nil)
+    private let scheduleButton = NSButton(title: "同步频率…", target: nil, action: nil)
+    private let sourcesButton = NSButton(title: "模型价格来源…", target: nil, action: nil)
     private var pricing: [[String: Any]] = []
     private var preferences: [String: Any] = [:]
     private let onChange: () -> Void
@@ -24,16 +29,23 @@ final class CueUsagePreferencesController: NSWindowController {
     private let priceKeys = ["input", "output", "cache_read", "cache_creation"]
 
     init(home: URL, knownModels: [String] = [], onChange: @escaping () -> Void) {
-        self.client = CueUsageClient(home: home); self.knownModels = knownModels; self.onChange = onChange
+        self.home = home; self.client = CueUsageClient(home: home); self.knownModels = knownModels; self.onChange = onChange
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 660), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "费用与汇率"; window.isReleasedWhenClosed = false; window.center()
+        window.title = "统计设置"; window.isReleasedWhenClosed = false; window.center()
         super.init(window: window)
         let root = CuePreferencesSurface(frame: window.contentLayoutRect); window.contentView = root
         func label(_ text: String, _ y: CGFloat, size: CGFloat = 12, weight: NSFont.Weight = .regular) {
             let field = NSTextField(labelWithString: text); field.font = .systemFont(ofSize: size, weight: weight)
             field.frame = NSRect(x: 26, y: y, width: 598, height: 22); root.addSubview(field)
         }
-        label("费用显示", 22, size: 19, weight: .semibold)
+        label("统计设置", 22, size: 19, weight: .semibold)
+        scheduleButton.frame = NSRect(x: 300, y: 20, width: 133, height: 30)
+        sourcesButton.frame = NSRect(x: 441, y: 20, width: 179, height: 30)
+        scheduleButton.bezelStyle = .rounded; scheduleButton.target = self; scheduleButton.action = #selector(showSchedule)
+        sourcesButton.bezelStyle = .rounded; sourcesButton.target = self; sourcesButton.action = #selector(showSources)
+        scheduleButton.identifier = NSUserInterfaceItemIdentifier("usage-settings.schedule")
+        sourcesButton.identifier = NSUserInterfaceItemIdentifier("usage-settings.price-sources")
+        root.addSubview(scheduleButton); root.addSubview(sourcesButton)
         label("按模型 API 单价估算；与订阅额度是不同口径。", 53)
         label("显示货币", 98); currency.frame = NSRect(x: 167, y: 94, width: 240, height: 28)
         for (id, text) in [("CNY", "人民币 CNY"), ("USD", "美元 USD"), ("both", "人民币 + 美元")] { currency.addItem(withTitle: text); currency.lastItem?.representedObject = id }
@@ -109,7 +121,22 @@ final class CueUsagePreferencesController: NSWindowController {
         guard let row = pricing.first(where: { ($0["model"] as? String ?? $0["id"] as? String ?? $0["model_id"] as? String) == selected(model) }) else { fields.forEach { $0.stringValue = "" }; return }
         for (index, key) in priceKeys.enumerated() { fields[index].stringValue = (row[key] as? NSNumber)?.stringValue ?? (row[key] as? String ?? "") }
         let source = row["source"] as? String ?? "unpriced"
-        sourceInfo.stringValue = (source == "custom" ? "此模型使用 VibeCue 自定义价格。" : source == "ccswitch" ? "只读复用 CC Switch 模型价格。" : "此模型未定价，可填写四项单价。") + "按精确模型标识匹配。"
+        let name = row["source_name"] as? String ?? (source == "custom" ? "手动模型单价" : source == "ccswitch" ? "CC Switch 本机价格" : source)
+        let missing = priceKeys.filter { row[$0] == nil || row[$0] is NSNull }
+        sourceInfo.stringValue = source == "unpriced" ? "此模型未定价，可填写四项单价。按精确模型标识匹配。" : "当前来源：\(name)" + (row["source_stale"] as? Bool == true ? " · 缓存，可能已过期。" : "。") + (missing.isEmpty ? "按来源队列与精确模型标识匹配。" : "部分单价未提供，实际使用该项时保持未定价，可手动补充。")
+        sourceInfo.toolTip = sourceInfo.stringValue
+        if let updated = row["source_updated_at"] as? NSNumber {
+            let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            sourceInfo.toolTip = sourceInfo.stringValue + "\n价格读取于 " + formatter.string(from: Date(timeIntervalSince1970: updated.doubleValue))
+        }
+    }
+    @objc private func showSchedule() {
+        if scheduleController == nil { scheduleController = CueUsageScheduleController(home: home, onChange: { [weak self] in self?.onChange() }) }
+        scheduleController?.showWindow(nil); scheduleController?.window?.makeKeyAndOrderFront(nil)
+    }
+    @objc private func showSources() {
+        if sourcesController == nil { sourcesController = CuePriceSourcesController(home: home, onChange: { [weak self] in self?.load(); self?.onChange() }) }
+        sourcesController?.showWindow(nil); sourcesController?.window?.makeKeyAndOrderFront(nil)
     }
     @objc private func refreshRate() {
         guard !busy else { return }; setBusy(true); feedback.stringValue = "正在更新公开日参考汇率…"
@@ -135,11 +162,11 @@ final class CueUsagePreferencesController: NSWindowController {
             guard let value = Double(fields[index].stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), value.isFinite, value >= 0 else { feedback.stringValue = "四项单价都需要填写，可填 0；不能为负数。"; return }; values[key] = value
         }
         var overrides = preferences["model_overrides"] as? [String: Any] ?? [:]; overrides[selected(model)] = values
-        save(["model_overrides": overrides], message: "此模型的自定义单价已保存。")
+        save(["model_overrides": overrides], message: "单价已保存到手动来源；实际采用由该来源的启用状态和优先级决定。")
     }
     @objc private func resetPrice() {
         var overrides = preferences["model_overrides"] as? [String: Any] ?? [:]; overrides.removeValue(forKey: selected(model))
-        save(["model_overrides": overrides], message: "已恢复读取 CC Switch 的此模型价格。")
+        save(["model_overrides": overrides], message: "已移除此模型手动单价，恢复按来源队列查找。")
     }
     private func save(_ patch: [String: Any], message: String) {
         guard !busy, let input = try? JSONSerialization.data(withJSONObject: patch) else { return }; setBusy(true)
@@ -165,7 +192,8 @@ final class CueUsagePreferencesController: NSWindowController {
         controller.apply(["prefs": ["currency": "USD", "fx_mode": "manual", "manual_rate": 7.1], "pricing": [["model": "exact-model", "input": 2, "output": 10, "cache_read": 0.1, "cache_creation": 0, "source": "ccswitch"]]])
         let manual = controller.rate.isEnabled
         controller.select(controller.exchangeMode, "auto"); controller.exchangeChanged()
-        return ["unknown_cost_never_displays_zero": CueUsageMoney.display([:], currency: "USD") == "未定价",
+        var results = CuePriceSourcesController.validationReport()
+        results.merge(["unknown_cost_never_displays_zero": CueUsageMoney.display([:], currency: "USD") == "未定价",
                 "zero_price_displays_zero": CueUsageMoney.display(["cost_usd": 0], currency: "USD") == "$0.0000",
                 "missing_fx_is_explicit": CueUsageMoney.display(["cost_usd": 1], currency: "CNY") == "汇率未获取",
                 "dual_currency_display": CueUsageMoney.display(["cost_usd": 1, "cost_cny": 7.1], currency: "both") == "7.10 ¥ / $1.00",
@@ -180,7 +208,12 @@ final class CueUsagePreferencesController: NSWindowController {
                 "invalid_money_numbers_never_become_a_cost": CueUsageMoney.display(["cost_cny": true], currency: "CNY") == "未定价" && CueUsageMoney.display(["cost_cny": Double.nan], currency: "CNY") == "未定价",
                 "unpriced_logged_models_can_be_customized": controller.pricing.contains { $0["model"] as? String == "unknown-model" },
                 "manual_fx_field_enabled_only_for_manual_mode": manual && !controller.rate.isEnabled,
-                "model_zero_rate_preserved_in_editor": controller.fields.last?.stringValue == "0"]
+                "model_zero_rate_preserved_in_editor": controller.fields.last?.stringValue == "0"]) { _, new in new }
+        let partial = CueUsagePreferencesController(home: URL(fileURLWithPath: "/private/tmp/vibecue-money-offline-fixture"), onChange: {})
+        partial.apply(["prefs": ["currency": "USD"], "pricing": [["model": "partial-model", "input": 2, "output": 10, "cache_read": NSNull(), "cache_creation": NSNull(), "source": "public-source", "source_name": "公开样例"]]])
+        results["missing_source_cache_prices_stay_blank_in_editor"] = partial.fields[2].stringValue.isEmpty && partial.fields[3].stringValue.isEmpty && partial.sourceInfo.stringValue.contains("未提供")
+        results["effective_price_source_name_is_visible"] = partial.sourceInfo.stringValue.contains("公开样例")
+        return results
     }
 }
 

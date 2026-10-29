@@ -2469,6 +2469,22 @@ if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-preferences
     do { try CueUsagePreferencesController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
     catch { print("费用与汇率设置截图失败"); exit(1) }
 }
+if let index = CommandLine.arguments.firstIndex(of: "--capture-price-sources"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do { try CuePriceSourcesController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
+    catch { print("模型价格来源截图失败"); exit(1) }
+}
+if CommandLine.arguments.contains("--usage-schedule-self-test") {
+    _ = NSApplication.shared
+    let results = CueUsageScheduleController.validationReport()
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-schedule"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    do { try CueUsageScheduleController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
+    catch { print("统计频率设置截图失败"); exit(1) }
+}
 
 let app = NSApplication.shared
 let controller = CueController()

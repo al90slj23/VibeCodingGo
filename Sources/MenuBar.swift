@@ -25,9 +25,10 @@ struct CueMenuBarUsage {
     let raw: [String: Any]
     let receivedAt: Date
     let error: String
+    let schedule: CueUsageSchedulePreferences
 
-    init(raw: [String: Any] = [:], receivedAt: Date = Date(), error: String = "") {
-        self.raw = raw; self.receivedAt = receivedAt; self.error = error
+    init(raw: [String: Any] = [:], receivedAt: Date = Date(), error: String = "", schedule: CueUsageSchedulePreferences = CueUsageSchedulePreferences()) {
+        self.raw = raw; self.receivedAt = receivedAt; self.error = error; self.schedule = schedule
     }
     static func day(_ date: Date) -> String {
         let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -83,7 +84,7 @@ struct CueMenuBarUsage {
             if !(sync["errors"] as? [String] ?? []).isEmpty || !(sync["warnings"] as? [String] ?? []).isEmpty { lines.append("部分来源存在读取或覆盖提示，请在用量统计查看数据说明。") }
         } else { lines.append(raw["message"] as? String ?? "今日用量正在读取，尚未确认的数字显示为 —。") }
         if !error.isEmpty { lines.append("最近查询未完成：\(error)；显示上次已确认的本日数据。") }
-        lines.append("与用量统计共用本地账本；每 30 秒刷新显示，后台每 10 分钟同步历史。费用为 API 估算。")
+        lines.append("与用量统计共用本地账本；" + schedule.summary + "费用为 API 估算。")
         return lines.joined(separator: "\n")
     }
 }
@@ -92,22 +93,36 @@ struct CueMenuBarUsage {
 /// introduced by this timer; completed scans and preference saves refresh early.
 final class CueMenuBarUsageMonitor {
     private let client: CueUsageClient
+    private let home: URL
+    private var schedule = CueUsageSchedulePreferences()
+    private var started = false
     private var timer: Timer?
     private var observers: [NSObjectProtocol] = []
     private var wakeObserver: NSObjectProtocol?
     private var inFlight = false, pending = false, stopped = false
     private(set) var snapshot = CueMenuBarUsage()
     var onChange: (() -> Void)?
-    init(home: URL) { client = CueUsageClient(home: home) }
+    init(home: URL) { self.home = home; client = CueUsageClient(home: home); schedule = CueUsageSchedulePreferences(home: home) }
     func start() {
-        guard timer == nil, !stopped else { return }
-        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
-        RunLoop.main.add(timer, forMode: .common); self.timer = timer
+        guard !started, !stopped else { return }; started = true
+        configureTimer()
+        observers.append(NotificationCenter.default.addObserver(forName: .cueUsageScheduleDidChange, object: nil, queue: .main) { [weak self] note in
+            guard let self, note.userInfo?["home"] as? String == self.home.path else { return }
+            self.configureTimer(); self.refresh()
+        })
         for name in [Notification.Name.NSCalendarDayChanged, .NSSystemTimeZoneDidChange] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.refresh() })
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.refresh() }
         refresh()
+    }
+    private func configureTimer() {
+        timer?.invalidate(); timer = nil
+        schedule = CueUsageSchedulePreferences(home: home)
+        snapshot = CueMenuBarUsage(raw: snapshot.raw, receivedAt: snapshot.receivedAt, error: snapshot.error, schedule: schedule)
+        guard started, !stopped else { return }
+        let timer = Timer(timeInterval: schedule.displayInterval, repeats: true) { [weak self] _ in self?.refresh() }
+        RunLoop.main.add(timer, forMode: .common); self.timer = timer
     }
     func refresh() {
         guard !stopped else { return }
@@ -117,8 +132,8 @@ final class CueMenuBarUsageMonitor {
         client.run(["today-summary"]) { [weak self] result in
             guard let self, !self.stopped else { return }; self.inFlight = false
             switch result {
-            case .success(let data): self.snapshot = CueMenuBarUsage(raw: data)
-            case .failure(let error): self.snapshot = CueMenuBarUsage(raw: self.snapshot.raw, receivedAt: self.snapshot.receivedAt, error: error.localizedDescription)
+            case .success(let data): self.snapshot = CueMenuBarUsage(raw: data, schedule: self.schedule)
+            case .failure(let error): self.snapshot = CueMenuBarUsage(raw: self.snapshot.raw, receivedAt: self.snapshot.receivedAt, error: error.localizedDescription, schedule: self.schedule)
             }
             self.onChange?()
             if self.pending { self.pending = false; self.refresh() }
@@ -130,6 +145,25 @@ final class CueMenuBarUsageMonitor {
         if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }; wakeObserver = nil
     }
     deinit { stop() }
+
+    static func validationReport() -> [String: Bool] {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-menu-schedule-" + UUID().uuidString)
+        try? FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let monitor = CueMenuBarUsageMonitor(home: home)
+        defer { monitor.stop() }
+        let prefs = CueUsageSchedulePreferences(autoSync: false, syncInterval: 1200, displayInterval: 17)
+        let data = try! JSONSerialization.data(withJSONObject: prefs.dictionary)
+        try? data.write(to: home.appendingPathComponent("usage-schedule.json"), options: .atomic)
+        monitor.started = true; monitor.configureTimer()
+        let prior = monitor.timer
+        let custom = prior?.timeInterval == 17 && monitor.snapshot.schedule.autoSync == false
+        let changed = CueUsageSchedulePreferences(autoSync: false, syncInterval: 1200, displayInterval: 23)
+        try? JSONSerialization.data(withJSONObject: changed.dictionary).write(to: home.appendingPathComponent("usage-schedule.json"), options: .atomic)
+        monitor.configureTimer()
+        return ["menu_usage_display_timer_uses_custom_frequency_in_manual_mode": custom,
+                "menu_usage_frequency_change_replaces_old_timer": prior?.isValid == false && monitor.timer?.timeInterval == 23]
+    }
 }
 
 extension CueMenuBarUsage {
@@ -149,7 +183,7 @@ extension CueMenuBarUsage {
         var shifted = raw; shifted["day_start"] = start.addingTimeInterval(-3600).timeIntervalSince1970
         var zero = raw; zero["summary"] = ["total_tokens": 0, "cost_usd": 0, "cost_cny": 0]
         var large = raw; large["summary"] = ["total_tokens": 1_234_567, "cost_usd": 55_000, "cost_cny": 390_700]
-        return ["menu_counts_deduplicate_and_exclude_active_pending": work.running == 1 && work.pending == 2 && work.unread == 2 && work.interrupted == 1,
+        var report = ["menu_counts_deduplicate_and_exclude_active_pending": work.running == 1 && work.pending == 2 && work.unread == 2 && work.interrupted == 1,
                 "menu_today_tokens_compact": snapshot.title(work: work, now: now).contains("1.2M T"),
                 "menu_follows_cny_currency_with_partial_marker": snapshot.cost(now: now) == "≈8.75 ¥*",
                 "menu_follows_usd_currency": CueMenuBarUsage(raw: usd).cost(now: now) == "≈$1.25*",
@@ -162,5 +196,7 @@ extension CueMenuBarUsage {
                 "menu_invalid_token_boolean_rejected": !CueMenuBarUsage(raw: invalid).isCurrent(now: now),
                 "menu_confirmed_zero_stays_zero": CueMenuBarUsage(raw: zero).title(work: work, now: now).contains("今日 0 T"),
                 "menu_tooltip_has_exact_tokens_and_estimation_scope": snapshot.tooltip(work: work, health: "测试", now: now).contains("1,234,567") && snapshot.tooltip(work: work, health: "测试", now: now).contains("API 参考费用")]
+        report.merge(CueMenuBarUsageMonitor.validationReport()) { _, new in new }
+        return report
     }
 }

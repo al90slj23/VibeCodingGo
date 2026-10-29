@@ -7,6 +7,7 @@ in usage.sqlite3; price changes only affect the displayed estimate.
 from __future__ import annotations
 
 import argparse
+import fcntl
 from contextlib import closing
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
@@ -21,6 +22,7 @@ import time
 import urllib.request
 
 from .events import vibecue_directory
+from . import usage_pricing
 
 RATE_URL = 'https://api.frankfurter.dev/v2/rate/usd/cny'
 RATE_SOURCE = 'Frankfurter · USD/CNY 每日参考汇率'
@@ -32,7 +34,8 @@ RATE_KEYS = ('input', 'output', 'cache_read', 'cache_creation')
 TOKEN_KEYS = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens')
 CC_COLUMNS = ('input_cost_per_million', 'output_cost_per_million',
               'cache_read_cost_per_million', 'cache_creation_cost_per_million')
-DEFAULTS = {'currency': 'CNY', 'fx_mode': 'auto', 'manual_rate': None, 'model_overrides': {}}
+DEFAULTS = {'currency': 'CNY', 'fx_mode': 'auto', 'manual_rate': None, 'model_overrides': {},
+            'pricing_sources': usage_pricing.defaults(), 'pricing_refresh_seconds': usage_pricing.REFRESH_SECONDS}
 
 
 class MoneyError(ValueError):
@@ -89,6 +92,15 @@ def validate_patch(value):
             if not isinstance(raw, dict) or len(raw) > 2000:
                 raise MoneyError('自定义模型单价列表无效或过长')
             result[key] = {model_id(model): validate_rates(rates) for model, rates in raw.items()}
+        elif key == 'pricing_sources':
+            try:
+                result[key] = usage_pricing.validate_sources(raw)
+            except ValueError as error:
+                raise MoneyError(str(error)) from None
+        elif key == 'pricing_refresh_seconds':
+            if type(raw) is not int or not 1800 <= raw <= 604800:
+                raise MoneyError('公开价格更新间隔应在 30 分钟至 7 天之间')
+            result[key] = raw
     return result
 
 
@@ -123,7 +135,7 @@ def private_write(path, value):
 
 def preferences(home=None):
     home = vibecue_directory(home)
-    result = dict(DEFAULTS, model_overrides={})
+    result = dict(DEFAULTS, model_overrides={}, pricing_sources=usage_pricing.defaults())
     warning = None
     try:
         result.update(validate_patch(read_json(home / 'usage-display.json', MAX_SETTINGS)))
@@ -132,7 +144,7 @@ def preferences(home=None):
     except FileNotFoundError:
         pass
     except (OSError, ValueError, TypeError):
-        result = dict(DEFAULTS, model_overrides={})
+        result = dict(DEFAULTS, model_overrides={}, pricing_sources=usage_pricing.defaults())
         warning = '费用显示设置不可读，当前使用默认显示；未修改原文件'
     return result, warning
 
@@ -140,18 +152,25 @@ def preferences(home=None):
 def save_preferences(home, patch):
     home = vibecue_directory(home)
     checked = validate_patch(patch)
-    current, _ = preferences(home)
-    current.update(checked)
-    if current['fx_mode'] == 'manual' and current['manual_rate'] is None:
-        raise MoneyError('请填写大于零的手动汇率')
-    private_write(home / 'usage-display.json', current)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (home / 'usage-display.lock').open('a') as lock:
+        os.chmod(lock.name, 0o600); fcntl.flock(lock, fcntl.LOCK_EX)
+        current, _ = preferences(home)
+        current.update(checked)
+        if current['fx_mode'] == 'manual' and current['manual_rate'] is None:
+            raise MoneyError('请填写大于零的手动汇率')
+        private_write(home / 'usage-display.json', current)
     return settings(home)
 
 
-def catalog(home=None, cc_path=None, prefs=None):
+def catalog(home=None, cc_path=None, prefs=None, now=None):
     """Exact model IDs only; never infer a price from a similar model name."""
     home = vibecue_directory(home)
     prefs = preferences(home)[0] if prefs is None else prefs
+    # No account/settings tables are inspected, and a disabled CC source does
+    # not open its database at all.
+    if not any(row['enabled'] and row['kind'] == 'ccswitch' for row in prefs['pricing_sources']):
+        return usage_pricing.combine(home, prefs, {}, False, 0, now)
     path = Path(cc_path) if cc_path is not None else Path.home() / '.cc-switch/cc-switch.db'
     prices = {}
     available, invalid = False, 0
@@ -174,15 +193,7 @@ def catalog(home=None, cc_path=None, prefs=None):
     except (OSError, sqlite3.Error, ValueError):
         available = False
         prices = {}
-    for identifier, rates in prefs['model_overrides'].items():
-        prices[identifier] = dict(model=identifier, name=identifier, source='custom', **rates)
-    state = 'partial' if invalid or (prices and not available) else 'available' if available else 'unavailable'
-    note = ('按精确模型标识匹配 CC Switch 单价；自定义单价优先。未知模型保持未定价。' if available else
-            'CC Switch 模型单价当前不可读；仅使用已有自定义单价，未知模型保持未定价。')
-    if invalid:
-        note += ' 部分无效单价已跳过。'
-    return prices, {'pricing_status': state, 'pricing_source': 'CC Switch model_pricing / 自定义',
-                    'pricing_note': note, 'invalid_prices': invalid}
+    return usage_pricing.combine(home, prefs, prices, available, invalid, now)
 
 
 def validate_rate_payload(value, now=None):
@@ -281,10 +292,17 @@ def refresh(home=None, force=False, now=None):
 
 def settings(home=None, cc_path=None, now=None):
     prefs, warning = preferences(home)
-    prices, info = catalog(home, cc_path, prefs)
+    prices, info = catalog(home, cc_path, prefs, now)
     return {'schema_version': 1, 'prefs': prefs, 'fx': exchange(home, prefs, now),
             'pricing': [prices[key] for key in sorted(prices)], 'settings_warning': warning,
+            'default_pricing_sources': usage_pricing.defaults(),
             'estimated': True, **info}
+
+
+def refresh_pricing(home=None, force=False, now=None):
+    home = vibecue_directory(home)
+    usage_pricing.refresh(home, preferences(home)[0], force=force, now=now)
+    return settings(home, now=now)
 
 
 def price_decimal(row, prices):
@@ -297,6 +315,10 @@ def price_decimal(row, prices):
         for token, key in zip(TOKEN_KEYS, RATE_KEYS):
             raw = row.get(token, 0)
             if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw < 0 or int(raw) != raw:
+                return None
+            if raw == 0:
+                continue
+            if selected.get(key) is None:
                 return None
             cost += Decimal(int(raw)) * Decimal(str(selected[key]))
         return cost / Decimal(1_000_000)
@@ -350,7 +372,7 @@ def decorate(home, result, aggregate_groups, cc_path=None, now=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='VibeCue API 估算费用与参考汇率')
-    parser.add_argument('command', choices=('settings', 'save', 'refresh'))
+    parser.add_argument('command', choices=('settings', 'save', 'refresh', 'refresh-pricing'))
     parser.add_argument('--home')
     parser.add_argument('--force', action='store_true')
     args = parser.parse_args(argv)
@@ -360,6 +382,8 @@ def main(argv=None):
             result = settings(args.home)
         elif args.command == 'refresh':
             result = refresh(args.home, args.force)
+        elif args.command == 'refresh-pricing':
+            result = refresh_pricing(args.home, args.force)
         else:
             raw = sys.stdin.buffer.read(MAX_SETTINGS + 1)
             if len(raw) > MAX_SETTINGS:

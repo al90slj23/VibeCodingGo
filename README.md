@@ -26,7 +26,21 @@
 
 0.21 调整用量窗口的日历热力图、摘要卡片和请求表布局，避免月标签相撞与滚动条遮住数据。金额始终使用完整货币单位，人民币采用千分位和后置 `¥`，不再缩写为 K/M。悬停预览会先清理内部提问回复包装，再显示 Markdown 排版，同时保留文字选择、跟随最新和悬停暂停滚动。
 
-- **菜单栏概览**：图标旁常驻显示“运行 N · 待办 N | 今日 N T · ≈费用”。运行按对话 ID 去重；待处理合并未读、待续与中断对话并排除正在运行的对话，同一对话只计一次。今日用量按本机时区统计全部已接入应用，和用量统计窗口共用账本与 API 单价、货币及汇率设置。每 30 秒只读刷新显示，后台仍每 10 分钟同步源历史；同步结束、费用设置变更、唤醒或日期／时区变化会提前刷新。尚未成功同步或读取失败时显示“—”，跨日不沿用昨天的数值。费用含未定价记录时显示星号，悬停查看精确数字、同步时间、汇率和覆盖提示。
+0.22 在用量窗口的“统计设置”加入同步频率与模型价格来源。历史同步可设 30 秒至 24 小时，也可仅手动；统计显示可设 5 秒至 1 小时，保存后即时生效并跨重启保留。任务秒级计时不受影响。
+
+模型价格按可编辑的优先级队列逐模型回退，默认依次为手动单价、CC Switch 本机价格、BaseLLM、models.dev、LiteLLM、OpenRouter、Vercel。支持添加公开 HTTPS JSON 来源、编辑、启停、上下移动和删除；原厂 models.dev 价格保留原厂身份，其他平台保留命名空间，避免同名优惠价串入基础参考价。来源界面可查看模型数、读取时间、缓存状态和实际 URL；模型单价编辑器显示最终采用的来源。
+
+公开价格默认每 6 小时更新，可设 30 分钟至 7 天，独立于历史同步频率。更新失败保留最后成功快照并标明缓存，后台有失败退避与进程去重；普通统计查询只读本地缓存。仅匿名获取目录，不上传对话、用量或账号授权。NACP 的多个来源适配和来源快照作为参考，VibeCue 新增跨来源优先级策略。BaseLLM 的固定线性 Token 表达式通过严格语法识别，不执行表达式；复杂分层、按次/图片/秒价格会跳过交给后续来源。未知缓存单价保持未知，显式零价与未定价分别处理，费用仍是基础 API 参考估算。
+
+自定义“标准 JSON”格式（单位均为 USD / 百万 Tokens）：
+
+```json
+{"models":{"example-model":{"input":2,"output":10,"cache_read":0.2,"cache_creation":2.5}}}
+```
+
+输入和输出单价必填；缓存字段缺失时，实际使用了该类 Token 的记录保持未定价。公开格式参考：[models.dev](https://models.dev/)、[LiteLLM](https://docs.litellm.ai/docs/completion/token_usage)、[OpenRouter](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties)。
+
+- **菜单栏概览**：图标旁常驻显示“运行 N · 待办 N | 今日 N T · ≈费用”。运行按对话 ID 去重；待处理合并未读、待续与中断对话并排除正在运行的对话，同一对话只计一次。今日用量按本机时区统计全部已接入应用，和用量统计窗口共用账本与 API 单价、货币及汇率设置。默认每 30 秒只读刷新显示、每 10 分钟同步源历史，间隔可在统计设置中修改；同步结束、费用设置变更、唤醒或日期／时区变化会提前刷新。尚未成功同步或读取失败时显示“—”，跨日不沿用昨天的数值。费用含未定价记录时显示星号，悬停查看精确数字、同步时间、汇率和覆盖提示。
 - **秒级耗时**：本轮耗时独立放在列表右侧、状态下方，运行中每秒更新到秒；完成、等待和中断后固定在已记录的工作时间。计时只更新文字，不重建行，不影响勾选、滚动与悬停；列表关闭后停止计时刷新。
 
 - **最近提醒**：左键菜单栏图标打开可滚动面板，每次最多显示 12 条（随屏幕高度调整）。未读提醒自动置顶，手动置顶在打开后仍保留；置顶项不占普通历史的 50 条额度。普通历史按最近打开时间保留，老任务刚打开也可再次标为未读。蓝色表示未读，灰色表示已查看；提醒的查看状态按每条独立记录，待续按对话独立记录，均在重启后保留。关闭提示卡、提醒超时或批准请求解除都不会冒充“已打开”。右键提醒可选择“标为未读”“置顶／取消置顶”“删除”；删除只移除 VibeCue 提醒记录，不删除原对话。右键菜单栏图标仍提供快捷菜单。
@@ -150,6 +164,7 @@ build/VibeCue.app/Contents/MacOS/VibeCue --recent-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --conversation-renderer-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --usage-dashboard-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --usage-money-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --usage-schedule-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --window-preview-self-test  # 短暂显示无声测试窗口
 /usr/bin/python3 scripts/check-lighting.py --output /private/tmp/vibecue-lighting-review
 build/VibeCue.app/Contents/MacOS/VibeCue --resolution-self-test

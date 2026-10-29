@@ -48,7 +48,8 @@ class MoneyTests(unittest.TestCase):
         before = hashlib.sha256(self.cc.read_bytes()).hexdigest()
         snapshot = self.settings()
         self.assertEqual(snapshot['pricing_status'], 'available')
-        self.assertEqual(snapshot['pricing'], [dict(model='model-a',name='Model A',source='ccswitch',input=2,output=10,cache_read=.5,cache_creation=3)])
+        self.assertEqual(snapshot['pricing'], [dict(model='model-a',name='Model A',source='ccswitch',input=2,output=10,cache_read=.5,cache_creation=3,
+                                                  source_name='CC Switch 本机价格',source_updated_at=None,source_stale=False)])
         self.assertNotIn('DO-NOT-READ', json.dumps(snapshot))
         self.assertEqual(hashlib.sha256(self.cc.read_bytes()).hexdigest(), before)
         prices, _ = money.catalog(self.home, self.cc)
@@ -271,7 +272,7 @@ class MoneyTests(unittest.TestCase):
             before = db.execute('SELECT * FROM usage_requests ORDER BY id').fetchall()
         # Use a test CC catalog and reject any network: this exercises the real
         # query SQL/filter/page pipeline without the user's files or prices.
-        with patch.object(money,'catalog',side_effect=lambda home=None,cc_path=None,prefs=None: original_catalog(home,self.cc,prefs)), \
+        with patch.object(money,'catalog',side_effect=lambda home=None,cc_path=None,prefs=None,now=None: original_catalog(home,self.cc,prefs,now)), \
              patch.object(money,'fetch_rate',side_effect=AssertionError('queries never fetch')):
             first = usage.query(self.home,period='7d',app='codex',page_size=1,page=1,now=self.now)
             second = usage.query(self.home,period='7d',app='codex',page_size=1,page=2,now=self.now)
@@ -295,7 +296,7 @@ class MoneyTests(unittest.TestCase):
     def test_full_query_unpriced_and_empty_filters_remain_distinct(self):
         usage = self.ledger()
         original_catalog = money.catalog
-        with patch.object(money,'catalog',side_effect=lambda home=None,cc_path=None,prefs=None: original_catalog(home,self.cc,prefs)), \
+        with patch.object(money,'catalog',side_effect=lambda home=None,cc_path=None,prefs=None,now=None: original_catalog(home,self.cc,prefs,now)), \
              patch.object(money,'fetch_rate',side_effect=AssertionError('queries never fetch')):
             unknown = usage.query(self.home,model='unknown-model',now=self.now)
             absent = usage.query(self.home,source='missing-provider',now=self.now)

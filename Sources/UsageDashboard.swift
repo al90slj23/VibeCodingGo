@@ -60,11 +60,12 @@ final class CueUsageClient {
                 }
                 let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + (arguments.first == "sync" ? 1800 : 60), execute: timeout)
+                let outputLimit = module == "vibecue.usage_money" ? 25_165_824 : 8_388_608
                 var bytes = Data(), exceeded = false
                 while true {
                     let chunk = output.fileHandleForReading.readData(ofLength: 65_536)
                     if chunk.isEmpty { break }
-                    if bytes.count + chunk.count <= 8_388_608 { bytes.append(chunk) }
+                    if bytes.count + chunk.count <= outputLimit { bytes.append(chunk) }
                     else { exceeded = true; if process.isRunning { process.terminate() } }
                 }
                 process.waitUntilExit(); timeout.cancel(); group.wait()
@@ -285,7 +286,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private let range = NSPopUpButton(), app = NSPopUpButton(), model = NSPopUpButton(), source = NSPopUpButton()
     private let syncButton = NSButton(title: "立即同步", target: nil, action: nil)
     private let infoButton = NSButton(title: "数据说明", target: nil, action: nil)
-    private let moneyButton = NSButton(title: "费用与汇率…", target: nil, action: nil)
+    private let moneyButton = NSButton(title: "统计设置…", target: nil, action: nil)
     private let accountsButton = NSButton(title: "Codex 账号额度…", target: nil, action: nil)
     private let syncLabel = NSTextField(labelWithString: "尚未同步")
     private let status = NSTextField(wrappingLabelWithString: "")
@@ -307,6 +308,16 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var backendRunning = false
     private var syncMetadata: [String: Any] = [:]
     private var backgroundTimer: Timer?, visibleTimer: Timer?
+    private var backgroundStarted = false, stopped = false
+    private var schedule = CueUsageSchedulePreferences()
+    private var scheduleObserver: NSObjectProtocol?
+    private var lastSyncAttempt: Date?
+    private var initialAutomaticCheck = false
+    private var pricingTimer: Timer?
+    private var pricingRefreshing = false
+    private var pricingNextRefreshAt: Date?
+    private var pricingScheduleKnown = false
+    private var pricingRetryAfter: Date?
     private var lastSync = Date.distantPast
     private var syncError = ""
     private var queryError = ""
@@ -318,7 +329,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var currentView: String { ["logs", "models", "sources"][max(0, min(2, tabs.selectedSegment))] }
 
     init(home: URL) {
-        self.home = home; client = CueUsageClient(home: home)
+        self.home = home; client = CueUsageClient(home: home); schedule = CueUsageSchedulePreferences(home: home)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 850), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "VibeCue · 用量统计"; window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 1000, height: 760); window.center()
@@ -359,31 +370,58 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         surface.onLayout = { [weak self] in self?.layout() }
         surface.onAppearance = { [weak self] in self?.metrics.forEach { $0.needsDisplay = true }; self?.heatmap.needsDisplay = true }
         configureColumns(); layout(); updateStatus()
+        scheduleObserver = NotificationCenter.default.addObserver(forName: .cueUsageScheduleDidChange, object: nil, queue: .main) { [weak self] note in
+            guard let self, note.userInfo?["home"] as? String == self.home.path else { return }
+            self.schedule = CueUsageSchedulePreferences(home: self.home)
+            self.configureBackgroundTimer(); self.configureVisibleTimer(); self.query(); self.usageDidChange?()
+        }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    deinit { backgroundTimer?.invalidate(); visibleTimer?.invalidate() }
+    deinit {
+        backgroundTimer?.invalidate(); visibleTimer?.invalidate(); pricingTimer?.invalidate()
+        if let scheduleObserver { NotificationCenter.default.removeObserver(scheduleObserver) }
+    }
 
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender); window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-        query()
-        refreshExchange()
-        if Date().timeIntervalSince(lastSync) > 60 { synchronize() }
-        visibleTimer?.invalidate()
-        visibleTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        query(); refreshExchange(); configureVisibleTimer()
+    }
+    private func configureVisibleTimer() {
+        visibleTimer?.invalidate(); visibleTimer = nil
+        guard !stopped, window?.isVisible == true else { return }
+        let timer = Timer(timeInterval: schedule.displayInterval, repeats: true) { [weak self] _ in
             guard let self, self.window?.isVisible == true, !self.window!.isMiniaturized else { return }
-            self.query()
-            self.refreshExchange()
-            if Date().timeIntervalSince(self.lastSync) > 60 { self.synchronize() }
+            self.query(); self.refreshExchange()
         }
-        if let visibleTimer { RunLoop.main.add(visibleTimer, forMode: .common) }
+        RunLoop.main.add(timer, forMode: .common); visibleTimer = timer
+    }
+    private func configureBackgroundTimer() {
+        backgroundTimer?.invalidate(); backgroundTimer = nil
+        guard backgroundStarted, !stopped,
+              let due = schedule.nextSync(lastSync: lastSync == .distantPast ? nil : lastSync, lastAttempt: lastSyncAttempt) else { return }
+        // A separate process can already own the import lock. Poll its numeric
+        // status without rapidly retrying the expensive history scan.
+        let fire = (syncing || backendRunning) ? Date().addingTimeInterval(max(5, min(schedule.displayInterval, schedule.syncInterval))) : max(Date().addingTimeInterval(0.2), due)
+        let timer = Timer(fire: fire, interval: 0, repeats: false) { [weak self] _ in
+            guard let self else { return }; self.backgroundTimer = nil
+            if self.syncing || self.backendRunning { self.query() }
+            else { self.synchronize() }
+            self.configureBackgroundTimer()
+        }
+        RunLoop.main.add(timer, forMode: .common); backgroundTimer = timer
     }
     func startBackgroundSync() {
-        guard backgroundTimer == nil else { return }
-        synchronize()
-        backgroundTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.synchronize() }
-        if let backgroundTimer { RunLoop.main.add(backgroundTimer, forMode: .common) }
+        guard !backgroundStarted, !stopped else { return }; backgroundStarted = true
+        initialAutomaticCheck = true
+        // Read the persisted ledger timestamp before deciding whether a scan is
+        // due, so restarting the app respects the selected history interval.
+        query(); refreshPricing()
     }
-    func stopBackgroundSync() { backgroundTimer?.invalidate(); backgroundTimer = nil; visibleTimer?.invalidate(); visibleTimer = nil; client.stop() }
+    func stopBackgroundSync() {
+        stopped = true; backgroundStarted = false
+        backgroundTimer?.invalidate(); backgroundTimer = nil; visibleTimer?.invalidate(); visibleTimer = nil
+        pricingTimer?.invalidate(); pricingTimer = nil; client.stop()
+    }
     func windowWillClose(_ notification: Notification) { visibleTimer?.invalidate(); visibleTimer = nil }
 
     /// Explicit offline visual QA: renders a supplied numeric snapshot without
@@ -406,7 +444,38 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     }
 
     static func validationReport() -> [String: Bool] {
-        var report: [String: Bool] = [:]
+        var report = CueUsageScheduleController.validationReport()
+        let scheduled = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
+        scheduled.backgroundStarted = true
+        scheduled.schedule = CueUsageSchedulePreferences(autoSync: false)
+        scheduled.configureBackgroundTimer()
+        report["usage_schedule_manual_has_no_history_timer"] = scheduled.backgroundTimer == nil
+        scheduled.lastSync = Date().addingTimeInterval(-100)
+        scheduled.schedule = CueUsageSchedulePreferences(syncInterval: 1200, displayInterval: 17)
+        scheduled.configureBackgroundTimer()
+        let prior = scheduled.backgroundTimer
+        report["usage_schedule_history_timer_respects_custom_interval"] = abs((prior?.fireDate.timeIntervalSinceNow ?? 0) - 1100) < 1
+        scheduled.schedule = CueUsageSchedulePreferences(syncInterval: 300, displayInterval: 17)
+        scheduled.configureBackgroundTimer()
+        report["usage_schedule_reconfiguration_replaces_timer"] = prior?.isValid == false && abs((scheduled.backgroundTimer?.fireDate.timeIntervalSinceNow ?? 0) - 200) < 1
+        scheduled.schedule = CueUsageSchedulePreferences(autoSync: false)
+        scheduled.configureBackgroundTimer()
+        report["usage_schedule_manual_toggle_cancels_existing_timer"] = scheduled.backgroundTimer == nil
+        scheduled.backgroundStarted = false
+        let priced = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
+        priced.backgroundStarted = true
+        let dueMetadata: [String: Any] = ["pricing_next_refresh_at": Date().addingTimeInterval(-1).timeIntervalSince1970, "pricing_refresh_due": true]
+        priced.readPricingSchedule(dueMetadata)
+        let priceTimer = priced.pricingTimer, priceDate = priceTimer?.fireDate
+        priced.readPricingSchedule(dueMetadata)
+        report["usage_schedule_repeated_queries_do_not_delay_price_refresh"] = priceTimer != nil && priceTimer === priced.pricingTimer && priceDate == priced.pricingTimer?.fireDate
+        priced.pricingTimer?.invalidate(); priced.pricingTimer = nil
+        priced.pricingRetryAfter = Date().addingTimeInterval(900)
+        priced.readPricingSchedule(dueMetadata)
+        report["usage_schedule_failed_price_worker_keeps_retry_delay"] = (priced.pricingTimer?.fireDate.timeIntervalSinceNow ?? 0) > 899
+        priced.readPricingSchedule(["pricing_next_refresh_at": NSNull(), "pricing_refresh_due": false])
+        report["usage_schedule_no_remote_sources_cancel_price_timer"] = priced.pricingTimer == nil && priced.pricingNextRefreshAt == nil && priceTimer?.isValid == false
+        priced.backgroundStarted = false
         for size in [NSSize(width: 1000, height: 760), NSSize(width: 1120, height: 850), NSSize(width: 1440, height: 900)] {
             for currency in ["CNY", "USD", "both"] {
                 let controller = fixtureController(size: size, currency: currency, dark: true)
@@ -516,8 +585,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
 
     @objc private func syncNow() { synchronize() }
     private func synchronize() {
-        guard !syncing, !backendRunning else { return }
-        syncing = true; syncError = ""; updateStatus()
+        guard !stopped, !syncing, !backendRunning else { return }
+        syncing = true; lastSyncAttempt = Date(); syncError = ""; configureBackgroundTimer(); updateStatus()
         client.run(["sync"]) { [weak self] result in
             guard let self else { return }; self.syncing = false
             switch result {
@@ -525,7 +594,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
                 self.lastSync = Date(); self.readSync(data)
             case .failure(let error): self.syncError = error.localizedDescription
             }
-            self.updateStatus(); self.query(); self.usageDidChange?()
+            self.updateStatus(); self.configureBackgroundTimer(); self.query(); self.usageDidChange?()
         }
     }
     private func query(invalidate: Bool = false) {
@@ -552,6 +621,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
                 case .failure(let error): self.queryError = error.localizedDescription
                 }
                 self.updateStatus()
+                if self.initialAutomaticCheck { self.initialAutomaticCheck = false; self.configureBackgroundTimer() }
             }
             if self.queryPending { self.queryPending = false; self.query() }
         }
@@ -564,6 +634,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     }
     private func apply(_ data: [String: Any]) {
         snapshot = data; readSync(data)
+        if backgroundStarted { configureBackgroundTimer() }
+        readPricingSchedule(data["money"] as? [String: Any] ?? [:])
         let filters = data["filters"] as? [String: Any] ?? [:]
         updatePopup(app, rows: filters["apps"] as? [[String: Any]] ?? [], all: "全部应用")
         updatePopup(model, rows: filters["models"] as? [[String: Any]] ?? [], all: "全部模型")
@@ -650,6 +722,41 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     @objc func showAccounts() {
         if accountController == nil { accountController = CueCCAccountsController(home: home) }
         accountController?.showWindow(nil)
+    }
+    private func readPricingSchedule(_ data: [String: Any]) {
+        guard data.keys.contains("pricing_next_refresh_at") || data["pricing_refresh_due"] is Bool else { return }
+        pricingScheduleKnown = true
+        if let raw = data["pricing_next_refresh_at"] as? NSNumber, raw.doubleValue.isFinite, raw.doubleValue > 0 {
+            pricingNextRefreshAt = Date(timeIntervalSince1970: raw.doubleValue)
+        } else if data["pricing_refresh_due"] as? Bool == true { pricingNextRefreshAt = Date() }
+        else { pricingNextRefreshAt = nil }
+        configurePricingTimer()
+    }
+    private func configurePricingTimer() {
+        guard backgroundStarted, !stopped, !pricingRefreshing, !(pricingScheduleKnown && pricingNextRefreshAt == nil) else {
+            pricingTimer?.invalidate(); pricingTimer = nil; return
+        }
+        let due = max(max(Date().addingTimeInterval(0.2), pricingNextRefreshAt ?? Date().addingTimeInterval(900)), pricingRetryAfter ?? .distantPast)
+        // A display query can arrive every five seconds. Keep an already due
+        // refresh rather than pushing its deadline forward on every query.
+        if let pricingTimer, pricingTimer.isValid, pricingTimer.fireDate <= due { return }
+        pricingTimer?.invalidate(); pricingTimer = nil
+        let timer = Timer(fire: due, interval: 0, repeats: false) { [weak self] _ in self?.refreshPricing() }
+        RunLoop.main.add(timer, forMode: .common); pricingTimer = timer
+    }
+    private func refreshPricing() {
+        guard !stopped, !pricingRefreshing else { return }
+        pricingTimer?.invalidate(); pricingTimer = nil; pricingRefreshing = true
+        client.run(["refresh-pricing"], module: "vibecue.usage_money") { [weak self] result in
+            guard let self, !self.stopped else { return }; self.pricingRefreshing = false
+            switch result {
+            case .success(let data): self.pricingRetryAfter = nil; self.pricingNextRefreshAt = nil; self.readPricingSchedule(data)
+            case .failure:
+                self.pricingScheduleKnown = true; self.pricingRetryAfter = Date().addingTimeInterval(900)
+                self.pricingNextRefreshAt = self.pricingRetryAfter; self.configurePricingTimer()
+            }
+            self.query(); self.usageDidChange?()
+        }
     }
     private func refreshExchange() {
         guard !exchangeRefreshing, Date().timeIntervalSince(lastExchangeRefresh) > 900 else { return }
