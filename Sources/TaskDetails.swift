@@ -286,6 +286,7 @@ final class CueTaskHoverController: NSObject {
     private var provider: (() -> CueTaskDetail?)?
     private var currentTitle = ""
     private var currentBody = ""
+    private var renderedMessages = ""
     private var currentDetail = CueTaskDetail(raw: [:])
     private var overRow = false
     private var overPanel = false
@@ -317,7 +318,7 @@ final class CueTaskHoverController: NSObject {
         showWork?.cancel(); hideWork?.cancel(); timer?.invalidate(); timer = nil
         if let panel { panel.parent?.removeChildWindow(panel); panel.orderOut(nil) }
         provider = nil; anchor = nil; activeThreadID = nil; overRow = false; overPanel = false
-        currentBody = ""; text.string = ""; currentDetail = CueTaskDetail(raw: [:])
+        currentBody = ""; renderedMessages = ""; text.string = ""; currentDetail = CueTaskDetail(raw: [:])
     }
 
     func refresh() {
@@ -384,7 +385,7 @@ final class CueTaskHoverController: NSObject {
         scroll.autohidesScrollers = true
         text.frame = NSRect(x: 0, y: 0, width: 448, height: 258)
         text.isEditable = false; text.isSelectable = true; text.drawsBackground = false
-        text.isRichText = false; text.isVerticallyResizable = true; text.isHorizontallyResizable = false
+        text.isRichText = true; text.importsGraphics = false; text.isVerticallyResizable = true; text.isHorizontallyResizable = false
         text.minSize = NSSize(width: 0, height: 258); text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         text.textContainerInset = NSSize(width: 0, height: 7)
         text.textContainer?.widthTracksTextView = true; text.textContainer?.lineFragmentPadding = 0
@@ -397,7 +398,7 @@ final class CueTaskHoverController: NSObject {
     }
 
     private func showNow() {
-        makePanel(); currentBody = ""; refresh(); positionPanel()
+        makePanel(); currentBody = ""; renderedMessages = ""; refresh(); positionPanel()
         guard let panel else { return }
         if let parent = anchor?.window, panel.parent !== parent {
             panel.parent?.removeChildWindow(panel); parent.addChildWindow(panel, ordered: .above)
@@ -428,25 +429,26 @@ final class CueTaskHoverController: NSObject {
         let result = NSMutableAttributedString()
         let date = DateFormatter(); date.locale = Locale(identifier: "zh_CN"); date.dateFormat = "HH:mm:ss"
         let headingStyle = NSMutableParagraphStyle(); headingStyle.paragraphSpacing = 5
-        let bodyStyle = NSMutableParagraphStyle(); bodyStyle.lineSpacing = 3; bodyStyle.paragraphSpacing = 4
+        let signature = messages.map { $0.role + "\u{0}" + $0.text + "\u{0}" + ($0.date?.description ?? "") }.joined(separator: "\u{1}")
         var latest = NSRange(location: 0, length: 0)
         for message in messages {
             latest = NSRange(location: result.length, length: 0)
             let heading = (message.role == "user" ? "你" : "Codex") + (message.date.map { " · " + date.string(from: $0) } ?? "") + "\n"
             result.append(NSAttributedString(string: heading, attributes: [.font: NSFont.systemFont(ofSize: 10.5, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: headingStyle]))
-            result.append(NSAttributedString(string: message.text + "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor, .paragraphStyle: bodyStyle]))
+            result.append(CueHoverMarkdown.render(message.text))
+            result.append(NSAttributedString(string: "\n", attributes: [.font: NSFont.systemFont(ofSize: 13)]))
             latest.length = result.length - latest.location
         }
         if messages.isEmpty {
             result.append(NSAttributedString(string: "暂未读取到可显示的最近对话。", attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor]))
         }
-        guard result.string != currentBody else { return }
+        guard signature != renderedMessages || result.string != currentBody else { return }
         let origin = scroll.contentView.bounds.origin
         let wasAtEnd = text.frame.height - scroll.contentView.bounds.maxY < 10
         let selection = text.selectedRange()
         let selected = selection.length > 0 && NSMaxRange(selection) <= (currentBody as NSString).length ? (currentBody as NSString).substring(with: selection) : ""
         let wasEmpty = currentBody.isEmpty
-        currentBody = result.string; latestMessageRange = latest
+        currentBody = result.string; renderedMessages = signature; latestMessageRange = latest
         text.textStorage?.setAttributedString(result)
         text.setFrameSize(NSSize(width: scroll.contentSize.width, height: max(scroll.contentSize.height, text.frame.height)))
         text.layoutManager?.ensureLayout(for: text.textContainer!)
@@ -546,10 +548,25 @@ final class CueTaskHoverController: NSObject {
                        "task_detail_only_user_and_assistant_are_previewed": messages.messages.map(\.role) == ["user", "assistant"],
                        "task_detail_preview_text_stays_bounded": long.messages.count <= 8 && long.messages.reduce(0) { $0 + $1.text.count } <= 12000 && long.contentTruncated]
         _ = NSApplication.shared
+        results.merge(CueHoverMarkdown.validationReport()) { _, new in new }
         let hover = CueTaskHoverController(); hover.makePanel(); hover.update(detail: messages, title: "测试标题")
         results["task_hover_text_is_selectable_and_not_editable"] = hover.text.isSelectable && !hover.text.isEditable
         results["task_hover_initial_update_does_not_make_key"] = hover.panel?.isKeyWindow == false
         results["task_hover_contains_only_visible_conversation"] = hover.currentBody.contains("可见回复") && !hover.currentBody.contains("NOT-VISIBLE")
+        let styled = CueTaskDetail(raw: ["messages": [["role": "assistant", "text": "**Same 同样文字**"]]])
+        hover.update(detail: styled, title: "排版")
+        let boldBody = hover.currentBody
+        // AppKit substitutes PingFang for Chinese during layout; that family has
+        // no italic face. Verify the italic trait on Latin and the removal of
+        // bold on Chinese, rather than requiring a nonexistent fallback face.
+        let styledRange = (hover.currentBody as NSString).range(of: "Same")
+        let chineseRange = (hover.currentBody as NSString).range(of: "同样文字")
+        let boldFont = hover.text.textStorage?.attribute(.font, at: styledRange.location, effectiveRange: nil) as? NSFont
+        let boldChineseFont = hover.text.textStorage?.attribute(.font, at: chineseRange.location, effectiveRange: nil) as? NSFont
+        hover.update(detail: CueTaskDetail(raw: ["messages": [["role": "assistant", "text": "*Same 同样文字*"]]]), title: "排版")
+        let italicFont = hover.text.textStorage?.attribute(.font, at: styledRange.location, effectiveRange: nil) as? NSFont
+        let emphasisChineseFont = hover.text.textStorage?.attribute(.font, at: chineseRange.location, effectiveRange: nil) as? NSFont
+        results["task_hover_style_only_change_refreshes_native_attributes"] = hover.currentBody == boldBody && boldFont?.fontDescriptor.symbolicTraits.contains(.bold) == true && italicFont?.fontDescriptor.symbolicTraits.contains(.italic) == true && italicFont?.fontDescriptor.symbolicTraits.contains(.bold) == false && boldChineseFont?.fontDescriptor.symbolicTraits.contains(.bold) == true && emphasisChineseFont?.fontDescriptor.symbolicTraits.contains(.bold) == false
         let reading = CueTaskDetail(raw: ["messages": [["role": "assistant", "text": String(repeating: "这是用于滚动验收的可见回复。\n", count: 80)]]])
         hover.update(detail: reading, title: "长回复")
         hover.text.setSelectedRange(NSRange(location: 0, length: 0))
@@ -573,17 +590,20 @@ final class CueTaskHoverController: NSObject {
         results["task_hover_leaving_before_delay_cancels_open"] = hover.showWork?.isCancelled == true
         hover.hide()
         results["task_hover_hide_discards_preview_memory"] = hover.currentBody.isEmpty && hover.text.string.isEmpty
+        hover.update(detail: styled, title: "重新打开")
+        results["task_hover_reopening_same_markdown_is_not_blank"] = hover.currentBody.contains("同样文字") && !hover.renderedMessages.isEmpty
+        hover.hide()
         return results
     }
 
-    @discardableResult static func captureFixture(to output: URL) -> Bool {
+    @discardableResult static func captureFixture(to output: URL, dark: Bool = true) -> Bool {
         _ = NSApplication.shared
         let now = Date()
-        let reply = "已按对话去重整理任务。当前这轮已经运行 12 分钟，模型设置会用于后续请求。\n\n正在执行的工具会继续完成；你可以先查看任务的实时用量，再决定是否调整模型和强度。\n\n" + String(repeating: "任务的最新回复会继续在这里更新。移入浮窗后暂停自动滚动，可以选择文字、手动滚动并阅读上下文。\n\n", count: 4)
+        let reply = "## 本轮进展\n\n已保留 **当前对话** 和待续记录。\n\n- 问题回复显示为正常文字\n- 移入浮窗暂停滚动，可选择复制\n\n```swift\nlet status = \"继续处理\"\n```\n\n可先核对 `当前模型`，再决定下一步。"
         let detail = CueTaskDetail(raw: ["status": "running", "started_at": now.addingTimeInterval(-754).timeIntervalSince1970, "elapsed_status": "complete", "model": "gpt-6.1-sol", "reasoning_effort": "high", "service_tier": "fast", "total_tokens": 182476, "input_tokens": 8476, "output_tokens": 12000, "cache_read_tokens": 162000, "cache_creation_tokens": 0, "tokens_status": "complete", "messages": [["role": "user", "text": "每周额度已重置，请整理接下来要继续的任务。", "created_at": now.addingTimeInterval(-754).timeIntervalSince1970], ["role": "assistant", "text": reply, "created_at": now.addingTimeInterval(-20).timeIntervalSince1970]]])
         let hover = CueTaskHoverController(); hover.makePanel(); hover.update(detail: detail, title: "界面验收样例 · 当前任务详情")
         guard let window = hover.panel, let view = window.contentView else { return false }
-        window.appearance = NSAppearance(named: .darkAqua); window.displayIfNeeded()
+        window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua); window.displayIfNeeded()
         guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return false }
         view.cacheDisplay(in: view.bounds, to: bitmap)
         guard let data = bitmap.representation(using: .png, properties: [:]) else { return false }

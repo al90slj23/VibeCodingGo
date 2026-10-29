@@ -8,6 +8,7 @@ import json
 import re
 
 from ..usage import codex_counts, fresh_counts, digest, label
+from ..message_display import question_reply_text
 
 MAX_MESSAGES = 8
 MAX_THREAD_TEXT = 12_000
@@ -38,12 +39,17 @@ def visible_text(value):
 def message_text(payload):
     content = payload.get('content')
     if isinstance(content, str):
-        return visible_text(content)
-    if not isinstance(content, list):
+        text = content
+    elif isinstance(content, list):
+        text = '\n'.join(part['text'] for part in content
+                         if isinstance(part, dict) and part.get('type') in ('text', 'input_text', 'output_text')
+                         and isinstance(part.get('text'), str))
+    else:
         return ''
-    return visible_text('\n'.join(part['text'] for part in content
-                                  if isinstance(part, dict) and part.get('type') in ('text', 'input_text', 'output_text')
-                                  and isinstance(part.get('text'), str)))
+    # Decode transport JSON before redaction can alter its escaped strings.
+    if payload.get('role') == 'user':
+        text = question_reply_text(text)
+    return visible_text(text)
 
 
 class TaskDetails:
@@ -112,6 +118,8 @@ class TaskDetails:
                         break
 
     def _message(self, role, text, timestamp, mirror=False):
+        if role == 'user':
+            text = question_reply_text(text)
         text = visible_text(text)
         if not text:
             return

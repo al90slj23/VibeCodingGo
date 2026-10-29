@@ -34,7 +34,7 @@ final class CueUsagePreferencesController: NSWindowController {
             field.frame = NSRect(x: 26, y: y, width: 598, height: 22); root.addSubview(field)
         }
         label("费用显示", 22, size: 19, weight: .semibold)
-        label("按模型 API 单价估算；订阅额度请在 CC Switch 查看。", 53)
+        label("按模型 API 单价估算；与订阅额度是不同口径。", 53)
         label("显示货币", 98); currency.frame = NSRect(x: 167, y: 94, width: 240, height: 28)
         for (id, text) in [("CNY", "人民币 CNY"), ("USD", "美元 USD"), ("both", "人民币 + 美元")] { currency.addItem(withTitle: text); currency.lastItem?.representedObject = id }
         label("美元兑人民币", 139); exchangeMode.frame = NSRect(x: 167, y: 135, width: 240, height: 28)
@@ -168,9 +168,16 @@ final class CueUsagePreferencesController: NSWindowController {
         return ["unknown_cost_never_displays_zero": CueUsageMoney.display([:], currency: "USD") == "未定价",
                 "zero_price_displays_zero": CueUsageMoney.display(["cost_usd": 0], currency: "USD") == "$0.0000",
                 "missing_fx_is_explicit": CueUsageMoney.display(["cost_usd": 1], currency: "CNY") == "汇率未获取",
-                "dual_currency_display": CueUsageMoney.display(["cost_usd": 1, "cost_cny": 7.1], currency: "both") == "¥7.10 / $1.00",
+                "dual_currency_display": CueUsageMoney.display(["cost_usd": 1, "cost_cny": 7.1], currency: "both") == "7.10 ¥ / $1.00",
                 "tiny_positive_cost_is_not_zero": CueUsageMoney.display(["cost_usd": 0.0000002], currency: "USD") == "$<0.0001",
                 "small_summary_cost_is_not_rounded_to_zero": CueUsageMoney.display(["cost_usd": 0.003], currency: "USD", compact: true) == "$0.0030",
+                "large_cny_summary_keeps_full_yuan_and_trailing_symbol": CueUsageMoney.display(["cost_usd": 55_000, "cost_cny": 390_700], currency: "CNY", compact: true) == "390,700.00 ¥",
+                "million_cny_never_uses_scientific_or_compact_notation": CueUsageMoney.display(["cost_cny": 1_234_567.89], currency: "CNY", compact: true) == "1,234,567.89 ¥",
+                "tiny_positive_cny_preserves_nonzero_lower_bound": CueUsageMoney.display(["cost_cny": 0.0000002], currency: "CNY") == "<0.0001 ¥",
+                "small_cny_request_keeps_four_decimal_places": CueUsageMoney.display(["cost_cny": 0.3224], currency: "CNY") == "0.3224 ¥",
+                "zero_cny_is_an_explicit_yuan_value": CueUsageMoney.display(["cost_cny": 0], currency: "CNY") == "0.0000 ¥",
+                "large_usd_summary_also_keeps_full_currency_amount": CueUsageMoney.display(["cost_usd": 12_345.67], currency: "USD", compact: true) == "$12,345.67",
+                "invalid_money_numbers_never_become_a_cost": CueUsageMoney.display(["cost_cny": true], currency: "CNY") == "未定价" && CueUsageMoney.display(["cost_cny": Double.nan], currency: "CNY") == "未定价",
                 "unpriced_logged_models_can_be_customized": controller.pricing.contains { $0["model"] as? String == "unknown-model" },
                 "manual_fx_field_enabled_only_for_manual_mode": manual && !controller.rate.isEnabled,
                 "model_zero_rate_preserved_in_editor": controller.fields.last?.stringValue == "0"]
@@ -183,18 +190,25 @@ private final class CuePreferencesSurface: NSView {
 }
 
 enum CueUsageMoney {
+    /// Money always stays in base currency units, including narrow summaries.
+    /// `compact` remains in the shared API for callers that compact token counts.
     static func display(_ row: [String: Any], currency: String, compact: Bool = false) -> String {
-        func amount(_ key: String, prefix: String) -> String? {
-            guard let value = row[key] as? NSNumber, value.doubleValue.isFinite else { return nil }
+        func amount(_ key: String, prefix: String = "", suffix: String = "") -> String? {
+            guard let value = row[key] as? NSNumber,
+                  CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite else { return nil }
             let number = value.doubleValue
-            if number > 0 && number < 0.0001 { return prefix + "<0.0001" }
-            if compact && number >= 10_000 {
-                let divisor = number >= 1_000_000 ? 1_000_000.0 : 1000.0
-                return prefix + String(format: "%.1f%@", number / divisor, divisor == 1000 ? "K" : "M")
-            }
-            return prefix + String(format: number >= 1 ? "%.2f" : "%.4f", number)
+            if number > 0 && number < 0.0001 { return prefix + "<0.0001" + suffix }
+            let precision = number >= 1 ? 2 : 4
+            let formatter = NumberFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.numberStyle = .decimal
+            formatter.usesGroupingSeparator = true; formatter.groupingSeparator = ","; formatter.decimalSeparator = "."
+            formatter.usesSignificantDigits = false; formatter.maximumIntegerDigits = 309
+            formatter.minimumFractionDigits = precision; formatter.maximumFractionDigits = precision
+            formatter.roundingMode = .halfUp
+            guard let formatted = formatter.string(from: value) else { return nil }
+            return prefix + formatted + suffix
         }
-        let usd = amount("cost_usd", prefix: "$"), cny = amount("cost_cny", prefix: "¥")
+        let usd = amount("cost_usd", prefix: "$"), cny = amount("cost_cny", suffix: " ¥")
         if currency == "USD" { return usd ?? "未定价" }
         if currency == "both" { return [cny, usd].compactMap { $0 }.joined(separator: " / ").nilIfEmpty ?? "未定价" }
         return cny ?? (usd == nil ? "未定价" : "汇率未获取")

@@ -24,6 +24,8 @@
 
 0.20 为 CC Switch 官方升级增加自动维护：每分钟检查已安装版本及二进制指纹，同一官方版本可恢复已验证缓存；新版从对应官方 tag 取源码，经结构适配、桥接测试、构建与验签后，在后台空闲时正常重启并恢复共享。不会把旧版覆盖到新版，也不会强制结束应用。升级、接口暂不兼容、导出被覆盖或查询失败期间，两个账号的最后成功额度由 VibeCue 独立私有缓存保留，明确标注读取时间与非实时状态；新鲜配置已删除的账号不会复活。
 
+0.21 调整用量窗口的日历热力图、摘要卡片和请求表布局，避免月标签相撞与滚动条遮住数据。金额始终使用完整货币单位，人民币采用千分位和后置 `¥`，不再缩写为 K/M。悬停预览会先清理内部提问回复包装，再显示 Markdown 排版，同时保留文字选择、跟随最新和悬停暂停滚动。
+
 - **菜单栏概览**：图标旁常驻显示“运行 N · 待办 N | 今日 N T · ≈费用”。运行按对话 ID 去重；待处理合并未读、待续与中断对话并排除正在运行的对话，同一对话只计一次。今日用量按本机时区统计全部已接入应用，和用量统计窗口共用账本与 API 单价、货币及汇率设置。每 30 秒只读刷新显示，后台仍每 10 分钟同步源历史；同步结束、费用设置变更、唤醒或日期／时区变化会提前刷新。尚未成功同步或读取失败时显示“—”，跨日不沿用昨天的数值。费用含未定价记录时显示星号，悬停查看精确数字、同步时间、汇率和覆盖提示。
 - **秒级耗时**：本轮耗时独立放在列表右侧、状态下方，运行中每秒更新到秒；完成、等待和中断后固定在已记录的工作时间。计时只更新文字，不重建行，不影响勾选、滚动与悬停；列表关闭后停止计时刷新。
 
@@ -146,6 +148,8 @@ build/VibeCue.app/Contents/MacOS/VibeCue --sound-source-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --preview-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --recent-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --conversation-renderer-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --usage-dashboard-self-test
+build/VibeCue.app/Contents/MacOS/VibeCue --usage-money-self-test
 build/VibeCue.app/Contents/MacOS/VibeCue --window-preview-self-test  # 短暂显示无声测试窗口
 /usr/bin/python3 scripts/check-lighting.py --output /private/tmp/vibecue-lighting-review
 build/VibeCue.app/Contents/MacOS/VibeCue --resolution-self-test

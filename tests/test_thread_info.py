@@ -162,6 +162,28 @@ class ThreadInfoTests(unittest.TestCase):
         self.assertEqual(self.read()['messages'][0]['text'], '只有画面，没有声音')
         self.assertNotIn('PRIVATE REQUEST ID', json.dumps(self.read()['messages']))
 
+    def test_structured_answer_and_event_mirror_decode_before_credential_redaction(self):
+        answer='已确认，可以继续。\npassword="SYNTHETIC-PASSWORD"\nAPI_KEY="SYNTHETIC-API-KEY"\n保留这段说明。'
+        wrapper='<send_user_message_question_reply>'+json.dumps([
+            {'questionItemId':'SYNTHETIC-ID','answer':answer}],ensure_ascii=False)+'</send_user_message_question_reply>'
+        expected='已确认，可以继续。\npassword=[已隐藏凭据]"\nAPI_KEY=[已隐藏凭据]"\n保留这段说明。'
+        for rows in ([message('user',wrapper,1000)],
+                     [event('user_message',1000,message=wrapper)],
+                     [event('user_message',1000,message=wrapper),message('user',wrapper,1001)]):
+            with self.subTest(record_types=[row['type'] for row in rows]):
+                self.write(rows)
+                messages=self.read()['messages']
+                self.assertEqual(len(messages),1)
+                self.assertEqual(messages[0]['text'],expected)
+                self.assertNotIn('SYNTHETIC',json.dumps(messages))
+
+    def test_user_json_and_fenced_transport_example_are_not_unwrapped(self):
+        for body in ('{"questionItemId":"example","answer":"example answer"}',
+                     '```xml\n<send_user_message_question_reply>[{"answer":"example"}]</send_user_message_question_reply>\n```'):
+            with self.subTest(body=body):
+                self.write([message('user',body,1000)])
+                self.assertEqual(self.read()['messages'][0]['text'],body)
+
     def test_explicit_host_wrapper_before_human_request_does_not_hide_request(self):
         self.write([message('user', '<skills_instructions>PRIVATE AMBIENT CONTEXT</skills_instructions>\n请检查这个问题。', 1000)])
         self.assertEqual(self.read()['messages'][0]['text'], '请检查这个问题。')

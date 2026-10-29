@@ -167,6 +167,50 @@ class TaskDetailsTests(unittest.TestCase):
         self.assertEqual([message['role'] for message in row['messages']], ['user', 'assistant'])
         self.assertIn('[已隐藏凭据]', row['last_message'])
 
+    def test_structured_answer_is_decoded_before_preview_truncation(self):
+        envelope='<send_user_message_question_reply>'+json.dumps([{
+            'questionItemId':'PRIVATE-'+('x'*20_000),
+            'question':'该使用哪个账号？','answer':'我切换到普通账号了'}],ensure_ascii=False)+'</send_user_message_question_reply>'
+        self.send('response_item',message('user',envelope),1001)
+        row=self.snapshot()
+        self.assertEqual(row['last_message'],'我切换到普通账号了')
+        self.assertFalse(row['content_truncated'])
+        self.assertNotIn('questionItemId',json.dumps(row,ensure_ascii=False))
+        self.assertNotIn('send_user_message_question_reply',json.dumps(row,ensure_ascii=False))
+
+    def test_multiple_structured_answers_keep_question_context_and_redact_secrets(self):
+        rows=[{'question':'颜色？','answer':'蓝色','questionItemId':'PRIVATE-ONE'},
+              {'question':'凭据？','answer':'API_KEY=secret-value','questionItemId':'PRIVATE-TWO'}]
+        value='<send_user_message_question_reply>'+json.dumps(rows,ensure_ascii=False)+'</send_user_message_question_reply>'
+        self.send('response_item',message('user',value),1001)
+        text=self.snapshot()['last_message']
+        self.assertIn('颜色？\n蓝色',text)
+        self.assertIn('凭据？\nAPI_KEY=[已隐藏凭据]',text)
+        self.assertNotIn('PRIVATE',text)
+
+    def test_structured_answer_with_quoted_credentials_is_decoded_before_redaction(self):
+        answer='已确认，可以继续。\npassword="SYNTHETIC-PASSWORD"\nAPI_KEY="SYNTHETIC-API-KEY"\n保留这段说明。'
+        value='<send_user_message_question_reply>'+json.dumps([
+            {'questionItemId':'SYNTHETIC-ID','answer':answer}],ensure_ascii=False)+'</send_user_message_question_reply>'
+        for content in (value, [{'type':'input_text','text':value}]):
+            with self.subTest(content_type=type(content).__name__):
+                self.send('response_item',{'type':'message','role':'user','content':content},1001)
+                text=self.snapshot()['last_message']
+                self.assertEqual(text,'已确认，可以继续。\npassword=[已隐藏凭据]"\nAPI_KEY=[已隐藏凭据]"\n保留这段说明。')
+                self.assertNotIn('SYNTHETIC',text)
+
+    def test_literal_json_and_fenced_transport_example_remain_visible(self):
+        for value in ['{"questionItemId":"example","answer":"example answer"}',
+                      '```xml\n<send_user_message_question_reply>[{"answer":"example"}]</send_user_message_question_reply>\n```',
+                      '请解释 <send_user_message_question_reply> 这个标签。']:
+            self.send('response_item',message('user',value),1001)
+            self.assertEqual(self.snapshot()['last_message'],value)
+
+    def test_malformed_question_envelope_does_not_leak_transport_ids(self):
+        value='<send_user_message_question_reply>[{"questionItemId":"PRIVATE"}]</send_user_message_question_reply>'
+        self.send('response_item',message('user',value),1001)
+        self.assertEqual(self.snapshot()['last_message'],'问题回复暂无法预览。')
+
     def test_bounded_content_preserves_last_message_and_numbers(self):
         for offset in range(12):
             self.send('response_item', message('assistant', str(offset) + '中' * 2000), 1001 + offset)

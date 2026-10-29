@@ -148,11 +148,13 @@ extension CueMenuBarUsage {
         var unavailable = raw; unavailable["available"] = false
         var shifted = raw; shifted["day_start"] = start.addingTimeInterval(-3600).timeIntervalSince1970
         var zero = raw; zero["summary"] = ["total_tokens": 0, "cost_usd": 0, "cost_cny": 0]
+        var large = raw; large["summary"] = ["total_tokens": 1_234_567, "cost_usd": 55_000, "cost_cny": 390_700]
         return ["menu_counts_deduplicate_and_exclude_active_pending": work.running == 1 && work.pending == 2 && work.unread == 2 && work.interrupted == 1,
                 "menu_today_tokens_compact": snapshot.title(work: work, now: now).contains("1.2M T"),
-                "menu_follows_cny_currency_with_partial_marker": snapshot.cost(now: now) == "≈¥8.75*",
+                "menu_follows_cny_currency_with_partial_marker": snapshot.cost(now: now) == "≈8.75 ¥*",
                 "menu_follows_usd_currency": CueMenuBarUsage(raw: usd).cost(now: now) == "≈$1.25*",
-                "menu_follows_dual_currency": CueMenuBarUsage(raw: both).cost(now: now) == "≈¥8.75 / $1.25*",
+                "menu_follows_dual_currency": CueMenuBarUsage(raw: both).cost(now: now) == "≈8.75 ¥ / $1.25*",
+                "menu_large_cost_keeps_yuan_without_compact_notation": CueMenuBarUsage(raw: large).cost(now: now) == "≈390,700.00 ¥",
                 "menu_midnight_invalidates_yesterday": !snapshot.isCurrent(now: end),
                 "menu_timezone_boundary_change_invalidates": !CueMenuBarUsage(raw: shifted).isCurrent(now: now),
                 "menu_unknown_does_not_show_zero": CueMenuBarUsage().title(work: work, now: now).contains("今日 — T · —"),

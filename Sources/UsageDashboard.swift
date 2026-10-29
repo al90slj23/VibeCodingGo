@@ -114,72 +114,163 @@ private final class CueUsageSurface: NSView {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true; onAppearance?() }
 }
 
+private final class CueUsageScrollView: NSScrollView {
+    override func tile() {
+        super.tile()
+        guard scrollerStyle == .legacy, let table = documentView as? NSTableView else { return }
+        // AppKit can expand the clip view behind the header and scrollers when
+        // a table is wider than its viewport. Keep a real reserved viewport so
+        // the last visible row never sits underneath a horizontal scroller.
+        let border: CGFloat = borderType == .noBorder ? 0 : 1
+        let top = border + (table.headerView?.frame.height ?? 0)
+        let right = verticalScroller.flatMap { $0.isHidden ? nil : $0.frame.minX } ?? (bounds.width - border)
+        let bottom = horizontalScroller.flatMap { $0.isHidden ? nil : $0.frame.minY } ?? (bounds.height - border)
+        contentView.automaticallyAdjustsContentInsets = false; contentView.contentInsets = NSEdgeInsetsZero
+        contentView.frame = NSRect(x: border, y: top, width: max(0, right - border), height: max(0, bottom - top))
+        contentView.setBoundsOrigin(NSPoint(x: max(0, contentView.bounds.minX), y: max(0, contentView.bounds.minY)))
+        reflectScrolledClipView(contentView)
+    }
+}
+
 private final class CueUsageMetric: NSView {
     let title = NSTextField(labelWithString: ""), value = NSTextField(labelWithString: "—"), detail = NSTextField(labelWithString: "")
+    var preferredValueSize: CGFloat = 25
     override var isFlipped: Bool { true }
     init(title: String) {
         super.init(frame: .zero)
         self.title.stringValue = title
         self.title.font = .systemFont(ofSize: 11, weight: .medium); self.title.textColor = .secondaryLabelColor
         value.font = .monospacedDigitSystemFont(ofSize: 25, weight: .semibold)
+        value.maximumNumberOfLines = 2; value.lineBreakMode = .byClipping
+        value.cell?.wraps = true; value.cell?.usesSingleLineMode = false
         detail.font = .systemFont(ofSize: 10); detail.textColor = .secondaryLabelColor
         detail.lineBreakMode = .byTruncatingTail
         [self.title, value, detail].forEach { addSubview($0) }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func layout() {
-        super.layout(); title.frame = NSRect(x: 16, y: 12, width: bounds.width - 28, height: 17)
-        value.frame = NSRect(x: 16, y: 34, width: bounds.width - 28, height: 33)
-        detail.frame = NSRect(x: 16, y: 73, width: bounds.width - 28, height: 16)
+        super.layout()
+        let contentWidth = max(20, bounds.width - 28)
+        title.frame = NSRect(x: 14, y: 12, width: contentWidth, height: 17)
+        let lines = value.stringValue.components(separatedBy: "\n")
+        var size = preferredValueSize
+        while size > 12 {
+            let font = NSFont.monospacedDigitSystemFont(ofSize: size, weight: .semibold)
+            if lines.allSatisfy({ ($0 as NSString).size(withAttributes: [.font: font]).width <= contentWidth }) { break }
+            size -= 0.5
+        }
+        value.font = .monospacedDigitSystemFont(ofSize: size, weight: .semibold)
+        value.frame = NSRect(x: 14, y: lines.count > 1 ? 31 : 34, width: contentWidth, height: lines.count > 1 ? 43 : 32)
+        detail.frame = NSRect(x: 14, y: bounds.height - 24, width: contentWidth, height: 17)
+        detail.toolTip = detail.stringValue
     }
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.controlBackgroundColor.setFill(); NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10).fill()
-        NSColor.separatorColor.withAlphaComponent(0.45).setStroke(); NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10).stroke()
+        NSColor.controlBackgroundColor.withAlphaComponent(0.70).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10).fill()
+        NSColor.separatorColor.withAlphaComponent(0.28).setStroke()
+        let border = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10)
+        border.lineWidth = 0.5; border.stroke()
     }
 }
 
 private final class CueUsageHeatmap: NSView {
+    struct MonthLabel { let value: String; let frame: NSRect }
+    struct Geometry {
+        let grid: NSRect
+        let cell: CGFloat
+        let gap: CGFloat
+        let monthLabels: [MonthLabel]
+        var stride: CGFloat { cell + gap }
+    }
     var days: [[String: Any]] = [] { didSet { needsDisplay = true } }
+    var currency = "CNY" { didSet { needsDisplay = true } }
+    var referenceDate: Date?
     private var tooltips: [Int: String] = [:]
     override var isFlipped: Bool { true }
+    static func cellSize(width: CGFloat) -> CGFloat { min(22, max(9, (width - 56 - 52 * 3) / 53)) }
+    static func preferredHeight(width: CGFloat) -> CGFloat { ceil(22 + cellSize(width: width) * 7 + 6 * 3 + 30) }
+    private func range() -> (Calendar, Date, Date) {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: referenceDate ?? Date())
+        let weekday = (calendar.component(.weekday, from: today) + 5) % 7
+        let monday = calendar.date(byAdding: .day, value: -weekday, to: today)!
+        return (calendar, calendar.date(byAdding: .day, value: -52 * 7, to: monday)!, today)
+    }
+    var rangeDescription: String {
+        let (_, start, end) = range()
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "yyyy.MM.dd"
+        return formatter.string(from: start) + " — " + formatter.string(from: end)
+    }
+    func geometry(width: CGFloat) -> Geometry {
+        let (calendar, start, _) = range(), gap: CGFloat = 3
+        let cell = Self.cellSize(width: width), gridWidth = 53 * cell + 52 * gap
+        let grid = NSRect(x: 40 + max(0, (width - 56 - gridWidth) / 2), y: 22, width: gridWidth, height: 7 * cell + 6 * gap)
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9.5), .foregroundColor: NSColor.secondaryLabelColor]
+        var candidates: [MonthLabel] = [], priorMonth = -1
+        for week in 0..<53 {
+            let date = calendar.date(byAdding: .day, value: week * 7, to: start)!
+            let month = calendar.component(.month, from: date)
+            guard month != priorMonth else { continue }
+            priorMonth = month
+            let text = month == 1 ? "\(calendar.component(.year, from: date))年1月" : "\(month)月"
+            let labelWidth = ceil((text as NSString).size(withAttributes: attributes).width)
+            let x = min(grid.maxX - labelWidth, grid.minX + CGFloat(week) * (cell + gap))
+            candidates.append(MonthLabel(value: text, frame: NSRect(x: x, y: 3, width: labelWidth, height: 15)))
+        }
+        var accepted: [MonthLabel] = []
+        for (index, label) in candidates.enumerated() {
+            // A one-week partial first month should not collide with the first
+            // full month. Keep the full month label instead of squeezing text.
+            if index == 0, candidates.count > 1, label.frame.maxX + 8 > candidates[1].frame.minX { continue }
+            if let previous = accepted.last, previous.frame.maxX + 8 > label.frame.minX { continue }
+            accepted.append(label)
+        }
+        return Geometry(grid: grid, cell: cell, gap: gap, monthLabels: accepted)
+    }
     override func draw(_ dirtyRect: NSRect) {
         removeAllToolTips(); tooltips = [:]
-        let calendar = Calendar.current, formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd"
-        let today = calendar.startOfDay(for: Date())
-        // Exactly 53 calendar-week columns, including the current partial week.
-        let weekday = (calendar.component(.weekday, from: today) + 5) % 7
-        guard let monday = calendar.date(byAdding: .day, value: -weekday, to: today),
-              let start = calendar.date(byAdding: .day, value: -52 * 7, to: monday) else { return }
+        NSColor.controlBackgroundColor.withAlphaComponent(0.45).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill()
+        let (calendar, start, today) = range(), layout = geometry(width: bounds.width)
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "yyyy-MM-dd"
         let values = Dictionary(days.compactMap { row -> (String, [String: Any])? in guard let date = row["date"] as? String else { return nil }; return (date, row) }, uniquingKeysWith: { _, new in new })
-        let maximum = max(1, days.map { ($0["tokens"] as? NSNumber)?.doubleValue ?? 0 }.max() ?? 1)
-        let weeks = 53
-        let gap: CGFloat = 3, cell = min(15, max(9, (bounds.width - 45) / CGFloat(weeks) - gap))
-        let rowLabels = [(0, "一"), (2, "三"), (4, "五"), (6, "日")]
-        for (row, text) in rowLabels {
-            text.draw(at: NSPoint(x: 1, y: 23 + CGFloat(row) * (cell + gap)), withAttributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.tertiaryLabelColor])
+        let firstKey = formatter.string(from: start), lastKey = formatter.string(from: today)
+        let maximum = max(1, values.filter { $0.key >= firstKey && $0.key <= lastKey }.values.map { max(0, ($0["tokens"] as? NSNumber)?.doubleValue ?? 0) }.filter(\.isFinite).max() ?? 1)
+        let labelAttributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9.5), .foregroundColor: NSColor.secondaryLabelColor]
+        for label in layout.monthLabels { (label.value as NSString).draw(in: label.frame, withAttributes: labelAttributes) }
+        for (row, title) in [(0, "周一"), (2, "周三"), (4, "周五"), (6, "周日")] {
+            let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .right
+            (title as NSString).draw(in: NSRect(x: layout.grid.minX - 31, y: layout.grid.minY + CGFloat(row) * layout.stride + (layout.cell - 13) / 2, width: 24, height: 15), withAttributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: paragraph])
         }
-        var priorMonth = -1
-        for week in 0..<weeks {
+        for week in 0..<53 {
             for day in 0..<7 {
-                let index = week * 7 + day
-                guard let date = calendar.date(byAdding: .day, value: index, to: start), date <= today else { continue }
+                let date = calendar.date(byAdding: .day, value: week * 7 + day, to: start)!
+                let rect = NSRect(x: layout.grid.minX + CGFloat(week) * layout.stride, y: layout.grid.minY + CGFloat(day) * layout.stride, width: layout.cell, height: layout.cell)
+                let future = date > today
                 let key = formatter.string(from: date), row = values[key] ?? [:]
-                let count = (row["tokens"] as? NSNumber)?.doubleValue ?? 0
-                let requests = (row["requests"] as? NSNumber)?.int64Value ?? 0
+                let rawCount = (row["tokens"] as? NSNumber)?.doubleValue ?? 0
+                let count = rawCount.isFinite ? max(0, rawCount) : 0
+                let requests = max(0, (row["requests"] as? NSNumber)?.int64Value ?? 0)
                 let level = count <= 0 ? 0 : min(1, max(0.15, sqrt(count / maximum)))
-                let rect = NSRect(x: 26 + CGFloat(week) * (cell + gap), y: 23 + CGFloat(day) * (cell + gap), width: cell, height: cell)
-                let color = count <= 0 ? NSColor.quaternaryLabelColor.withAlphaComponent(0.10) : NSColor.controlAccentColor.withAlphaComponent(CGFloat(0.20 + level * 0.78))
-                color.setFill(); NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+                let color = future ? NSColor.quaternaryLabelColor.withAlphaComponent(0.035) : count <= 0 ? NSColor.quaternaryLabelColor.withAlphaComponent(0.16) : NSColor.controlAccentColor.withAlphaComponent(CGFloat(0.22 + level * 0.74))
+                color.setFill(); NSBezierPath(roundedRect: rect, xRadius: 2.5, yRadius: 2.5).fill()
+                guard !future else { continue }
                 let tag = addToolTip(rect, owner: self, userData: nil)
-                tooltips[tag] = "\(key) · \(CueUsageDashboardController.integer(count)) Tokens · \(requests) 条用量记录"
-                if day == 0 {
-                    let month = calendar.component(.month, from: date)
-                    if month != priorMonth {
-                        "\(month)月".draw(at: NSPoint(x: rect.minX, y: 2), withAttributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor]); priorMonth = month
-                    }
-                }
+                var message = "\(key)\n\(CueUsageDashboardController.integer(count)) Tokens · \(CueUsageDashboardController.integer(Double(requests))) 条用量记录"
+                if row["cost_usd"] is NSNumber || row["cost_cny"] is NSNumber { message += "\nAPI 参考费用：" + CueUsageMoney.display(row, currency: currency) }
+                tooltips[tag] = message
             }
         }
+        let legendY = layout.grid.maxY + 12
+        ("颜色越深，用量越高" as NSString).draw(at: NSPoint(x: layout.grid.minX, y: legendY), withAttributes: labelAttributes)
+        let legendX = layout.grid.maxX - 113
+        ("少" as NSString).draw(at: NSPoint(x: legendX, y: legendY), withAttributes: labelAttributes)
+        for index in 0..<5 {
+            let rect = NSRect(x: legendX + 19 + CGFloat(index) * 14, y: legendY + 1, width: 10, height: 10)
+            (index == 0 ? NSColor.quaternaryLabelColor.withAlphaComponent(0.16) : NSColor.controlAccentColor.withAlphaComponent(CGFloat(0.22 + Double(index) / 4 * 0.74))).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+        }
+        ("多" as NSString).draw(at: NSPoint(x: legendX + 97, y: legendY), withAttributes: labelAttributes)
     }
     @objc func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String { tooltips[tag] ?? "" }
 }
@@ -200,9 +291,10 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private let status = NSTextField(wrappingLabelWithString: "")
     private let metrics = [CueUsageMetric(title: "Tokens 总量"), CueUsageMetric(title: "新增输入"), CueUsageMetric(title: "输出"), CueUsageMetric(title: "缓存命中"), CueUsageMetric(title: "用量记录"), CueUsageMetric(title: "API 参考费用")]
     private let heatmapTitle = NSTextField(labelWithString: "最近 53 周")
+    private let heatmapRange = NSTextField(labelWithString: "")
     private let heatmap = CueUsageHeatmap()
     private let tabs = NSSegmentedControl(labels: ["请求日志", "模型", "来源"], trackingMode: .selectOne, target: nil, action: nil)
-    private let table = NSTableView(), scroll = NSScrollView()
+    private let table = NSTableView(), scroll = CueUsageScrollView()
     private let pageLabel = NSTextField(labelWithString: ""), detail = NSTextField(labelWithString: "")
     private let previous = NSButton(title: "上一页", target: nil, action: nil), next = NSButton(title: "下一页", target: nil, action: nil)
     private var rows: [[String: Any]] = []
@@ -236,6 +328,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         syncLabel.font = .systemFont(ofSize: 11); syncLabel.textColor = .secondaryLabelColor; syncLabel.alignment = .right
         status.font = .systemFont(ofSize: 11); status.maximumNumberOfLines = 2
         heatmapTitle.font = .systemFont(ofSize: 12, weight: .medium); heatmapTitle.textColor = .secondaryLabelColor
+        heatmapRange.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular); heatmapRange.textColor = .secondaryLabelColor; heatmapRange.alignment = .right
         pageLabel.font = .systemFont(ofSize: 11); pageLabel.textColor = .secondaryLabelColor
         detail.font = .systemFont(ofSize: 10.5); detail.textColor = .secondaryLabelColor; detail.lineBreakMode = .byTruncatingTail
         for control in [syncButton, infoButton, moneyButton, accountsButton, previous, next] { control.bezelStyle = .rounded; control.target = self }
@@ -252,13 +345,16 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         tabs.selectedSegment = 0; tabs.target = self; tabs.action = #selector(changeTab)
         tabs.identifier = NSUserInterfaceItemIdentifier("usage.tabs")
         table.delegate = self; table.dataSource = self; table.rowHeight = 27
-        table.usesAlternatingRowBackgroundColors = true; table.style = .inset
+        table.usesAlternatingRowBackgroundColors = true; table.style = .plain
         table.allowsMultipleSelection = false; table.columnAutoresizingStyle = .noColumnAutoresizing
         table.intercellSpacing = NSSize(width: 4, height: 2)
         table.setAccessibilityLabel("历史用量请求日志")
         scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
-        scroll.autohidesScrollers = true; scroll.borderType = .bezelBorder
-        let views: [NSView] = [titleLabel, subtitle, range, app, model, source, syncButton, infoButton, moneyButton, accountsButton, syncLabel, status, heatmapTitle, heatmap, tabs, scroll, pageLabel, previous, next, detail] + metrics
+        // Reserved native scroller tracks keep the final row and final header
+        // visible; overlay scrollers previously covered the numbers themselves.
+        scroll.scrollerStyle = .legacy; scroll.autohidesScrollers = false; scroll.borderType = .lineBorder
+        scroll.automaticallyAdjustsContentInsets = false; scroll.contentInsets = NSEdgeInsetsZero
+        let views: [NSView] = [titleLabel, subtitle, range, app, model, source, syncButton, infoButton, moneyButton, accountsButton, syncLabel, status, heatmapTitle, heatmapRange, heatmap, tabs, scroll, pageLabel, previous, next, detail] + metrics
         views.forEach { surface.addSubview($0) }
         surface.onLayout = { [weak self] in self?.layout() }
         surface.onAppearance = { [weak self] in self?.metrics.forEach { $0.needsDisplay = true }; self?.heatmap.needsDisplay = true }
@@ -296,34 +392,124 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         window?.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         apply(snapshot); updateStatus(); surface.layoutSubtreeIfNeeded()
         guard let bitmap = surface.bitmapImageRepForCachingDisplay(in: surface.bounds) else { throw CocoaError(.fileWriteUnknown) }
-        surface.cacheDisplay(in: surface.bounds, to: bitmap)
+        surface.effectiveAppearance.performAsCurrentDrawingAppearance { surface.cacheDisplay(in: surface.bounds, to: bitmap) }
         guard let png = bitmap.representation(using: .png, properties: [:]) else { throw CocoaError(.fileWriteUnknown) }
         try png.write(to: url)
+    }
+
+    /// Deterministic offline fixture. No collector, network request, timer, or
+    /// user database is started by creating or rendering this controller.
+    static func captureFixture(to url: URL, dark: Bool, size: NSSize = NSSize(width: 1120, height: 850), currency: String = "CNY") throws {
+        let controller = fixtureController(size: size, currency: currency, dark: dark)
+        defer { controller.window?.orderOut(nil) }
+        try controller.capture(snapshot: controller.snapshot, to: url, dark: dark)
+    }
+
+    static func validationReport() -> [String: Bool] {
+        var report: [String: Bool] = [:]
+        for size in [NSSize(width: 1000, height: 760), NSSize(width: 1120, height: 850), NSSize(width: 1440, height: 900)] {
+            for currency in ["CNY", "USD", "both"] {
+                let controller = fixtureController(size: size, currency: currency, dark: true)
+                defer { controller.window?.orderOut(nil) }
+                let prefix = "usage.layout.\(Int(size.width))x\(Int(size.height)).\(currency)"
+                let chart = controller.heatmap.geometry(width: controller.heatmap.bounds.width)
+                report[prefix + ".monthsSeparated"] = zip(chart.monthLabels, chart.monthLabels.dropFirst()).allSatisfy { $0.0.frame.maxX + 7.9 <= $0.1.frame.minX }
+                report[prefix + ".monthsWithinCalendar"] = chart.monthLabels.allSatisfy { $0.frame.minX >= chart.grid.minX && $0.frame.maxX <= chart.grid.maxX + 0.1 }
+                report[prefix + ".calendar53x7"] = abs(chart.grid.width - (53 * chart.cell + 52 * chart.gap)) < 0.1 && abs(chart.grid.height - (7 * chart.cell + 6 * chart.gap)) < 0.1
+                report[prefix + ".calendarLegendFits"] = chart.grid.maxY + 27 <= controller.heatmap.bounds.height
+                report[prefix + ".sectionSpacing"] = controller.metrics.allSatisfy { $0.frame.maxY + 12 <= controller.heatmapTitle.frame.minY } && controller.heatmap.frame.maxY + 12 <= controller.tabs.frame.minY && controller.tabs.frame.maxY + 10 <= controller.scroll.frame.minY && controller.scroll.frame.maxY + 8 <= controller.detail.frame.minY && controller.detail.frame.maxY + 6 <= controller.previous.frame.minY
+                report[prefix + ".filterSpacing"] = zip([controller.range, controller.app, controller.model], [controller.app, controller.model, controller.source]).allSatisfy { $0.0.frame.maxX + 11 <= $0.1.frame.minX } && abs(controller.source.frame.maxX - (size.width - 24)) < 0.1
+                report[prefix + ".metricSpacing"] = zip(controller.metrics, controller.metrics.dropFirst()).allSatisfy { $0.0.frame.maxX + 9 <= $0.1.frame.minX } && controller.metrics.last!.frame.maxX <= size.width - 23
+                let value = controller.metrics[5].value, font = controller.metrics[5].value.font!
+                report[prefix + ".fullCurrencyFits"] = value.stringValue.components(separatedBy: "\n").allSatisfy { ($0 as NSString).size(withAttributes: [.font: font]).width <= value.bounds.width + 0.1 } && !value.stringValue.contains("K") && !value.stringValue.contains("M") && !value.stringValue.contains("…")
+                report[prefix + ".currencyLines"] = value.stringValue.components(separatedBy: "\n").count == (currency == "both" ? 2 : 1)
+                controller.scroll.tile()
+                let clip = controller.scroll.contentView.frame
+                report[prefix + ".scrollerReserved"] = controller.scroll.scrollerStyle == .legacy && controller.scroll.horizontalScroller.map { !$0.isHidden && !$0.frame.intersects(clip) } == true && controller.scroll.verticalScroller.map { !$0.isHidden && !$0.frame.intersects(clip) } == true
+                report[prefix + ".verticalScrollRange"] = controller.scroll.verticalScroller.map { $0.isEnabled && $0.knobProportion > 0 && $0.knobProportion < 1 } == true
+                report[prefix + ".horizontalScrollRange"] = controller.table.frame.width <= clip.width || controller.scroll.horizontalScroller.map { $0.isEnabled && $0.knobProportion > 0 && $0.knobProportion < 1 } == true
+                report[prefix + ".tableViewport"] = controller.scroll.contentSize.height >= 115 && controller.table.frame.height >= CGFloat(controller.rows.count) * (controller.table.rowHeight + controller.table.intercellSpacing.height)
+                if let cost = controller.table.tableColumns.first(where: { $0.identifier.rawValue == "cost" }) {
+                    report[prefix + ".tableCurrencyFits"] = controller.rows.allSatisfy { (CueUsageMoney.display($0, currency: currency) as NSString).size(withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)]).width + 8 <= cost.width }
+                }
+            }
+        }
+        return report
+    }
+
+    private static func fixtureController(size: NSSize, currency: String, dark: Bool) -> CueUsageDashboardController {
+        let controller = CueUsageDashboardController(home: FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-usage-fixture-\(UUID().uuidString)", isDirectory: true))
+        controller.window?.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        controller.window?.setContentSize(size)
+        controller.surface.frame = NSRect(origin: .zero, size: size)
+        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = .current
+        let reference = calendar.date(from: DateComponents(year: 2026, month: 10, day: 29, hour: 12))!
+        controller.heatmap.referenceDate = reference
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "yyyy-MM-dd"
+        let first = calendar.date(byAdding: .day, value: -367, to: reference)!
+        let days: [[String: Any]] = (0..<368).map { index in
+            let date = calendar.date(byAdding: .day, value: index, to: first)!
+            return ["date": formatter.string(from: date), "tokens": index < 80 ? (index % 17 == 0 ? 200_000 : 0) : (1_000_000 + (index * 2_321_123) % 800_000_000), "requests": (index * 37) % 4500]
+        }
+        var logs: [[String: Any]] = []
+        for index in 0..<50 {
+            var row: [String: Any] = ["app": "codex", "source": "codex_session", "thread_id": "offline-fixture", "priced_requests": 1, "unpriced_requests": 0]
+            row["timestamp"] = reference.timeIntervalSince1970 - Double(index * 13)
+            row["model"] = index % 6 == 0 ? "codex-auto-review" : "gpt-6.1-sol"
+            row["input_tokens"] = 4702 + index * 32; row["output_tokens"] = 502 + index * 7
+            row["cache_read_tokens"] = 169728 + index * 11; row["cache_creation_tokens"] = 0
+            row["total_tokens"] = 174932 + index * 50
+            row["cost_usd"] = index == 2 ? 55000.0 : 0.0454 + Double(index) / 100
+            row["cost_cny"] = index == 2 ? 390700.22 : 0.3224 + Double(index) * 0.071
+            logs.append(row)
+        }
+        controller.apply([
+            "summary": ["total_tokens": 126_000_000_000.0, "input_tokens": 3_600_000_000.0, "output_tokens": 372_000_000, "cache_read_tokens": 121_000_000_000.0, "cache_creation_tokens": 468_000_000, "cache_hit_rate": 0.967, "requests": 772639, "cost_usd": 55000.0, "cost_cny": 390700.22, "priced_requests": 698063, "unpriced_requests": 74576],
+            "days": days, "logs": logs,
+            "pagination": ["page": 1, "pages": 15453, "total": 772639],
+            "money": ["prefs": ["currency": currency], "fx": ["rate": 7.10364, "date": "2026-10-29", "stale": false]],
+            "sync": ["last_synced_at": reference.timeIntervalSince1970, "errors": [], "warnings": []]
+        ])
+        controller.updateStatus(); controller.surface.layoutSubtreeIfNeeded(); controller.scroll.tile()
+        return controller
     }
 
     private func layout() {
         let width = surface.bounds.width, height = surface.bounds.height, right = width - 24
         titleLabel.frame = NSRect(x: 24, y: 23, width: 260, height: 32)
-        subtitle.frame = NSRect(x: 25, y: 62, width: 650, height: 20)
+        subtitle.frame = NSRect(x: 25, y: 62, width: max(300, width - 400), height: 20)
         syncButton.frame = NSRect(x: right - 112, y: 23, width: 112, height: 32)
         infoButton.frame = NSRect(x: right - 214, y: 23, width: 96, height: 32)
         moneyButton.frame = NSRect(x: right - 348, y: 23, width: 128, height: 32)
         accountsButton.frame = NSRect(x: right - 505, y: 23, width: 151, height: 32)
         syncLabel.frame = NSRect(x: right - 330, y: 65, width: 330, height: 18)
-        let sizes: [CGFloat] = [150, 175, 290, 250], controls = [range, app, model, source]
+        let controls = [range, app, model, source]
+        let filterWidth = width - 48 - 36
+        let sizes: [CGFloat] = [0.16, 0.19, 0.35, 0.30].map { filterWidth * $0 }
         var x: CGFloat = 24
         for (index, popup) in controls.enumerated() { popup.frame = NSRect(x: x, y: 100, width: sizes[index], height: 29); x += sizes[index] + 12 }
-        let metricWidth = (width - 48 - 50) / 6
-        for (index, metric) in metrics.enumerated() { metric.frame = NSRect(x: 24 + CGFloat(index) * (metricWidth + 10), y: 145, width: metricWidth, height: 101) }
-        heatmapTitle.frame = NSRect(x: 25, y: 264, width: 800, height: 19)
-        heatmap.frame = NSRect(x: 25, y: 292, width: width - 50, height: 155)
-        tabs.frame = NSRect(x: 24, y: 453, width: 284, height: 29)
-        status.frame = NSRect(x: 326, y: 451, width: width - 350, height: 34)
-        scroll.frame = NSRect(x: 24, y: 495, width: width - 48, height: max(165, height - 583))
-        let tableWidth = table.tableColumns.reduce(CGFloat(0)) { $0 + $1.width + table.intercellSpacing.width } + 24
-        table.setFrameSize(NSSize(width: max(scroll.contentView.bounds.width, tableWidth), height: table.frame.height))
-        detail.frame = NSRect(x: 27, y: height - 77, width: width - 54, height: 17)
-        pageLabel.frame = NSRect(x: 27, y: height - 43, width: 600, height: 22)
+        let metricWidth = (width - 48 - 50) / 6.4
+        var metricX: CGFloat = 24
+        for (index, metric) in metrics.enumerated() {
+            let cardWidth = metricWidth * (index == 5 ? 1.4 : 1)
+            metric.frame = NSRect(x: metricX, y: 142, width: cardWidth, height: 101)
+            metric.needsLayout = true; metric.layoutSubtreeIfNeeded(); metricX += cardWidth + 10
+        }
+        heatmapTitle.frame = NSRect(x: 25, y: 260, width: max(350, width - 340), height: 19)
+        heatmapRange.frame = NSRect(x: width - 285, y: 260, width: 260, height: 19)
+        heatmapRange.stringValue = heatmap.rangeDescription
+        let calendarHeight = CueUsageHeatmap.preferredHeight(width: width - 48)
+        heatmap.frame = NSRect(x: 24, y: 287, width: width - 48, height: calendarHeight)
+        let tabsY = heatmap.frame.maxY + 16
+        tabs.frame = NSRect(x: 24, y: tabsY, width: 284, height: 29)
+        status.frame = NSRect(x: 326, y: tabsY, width: width - 350, height: 29)
+        let tableY = tabsY + 41
+        scroll.frame = NSRect(x: 24, y: tableY, width: width - 48, height: max(120, height - tableY - 86))
+        let tableWidth = table.tableColumns.reduce(CGFloat(0)) { $0 + $1.width } + CGFloat(max(0, table.tableColumns.count - 1)) * table.intercellSpacing.width
+        table.setFrameSize(NSSize(width: max(scroll.contentView.bounds.width, tableWidth), height: max(scroll.contentSize.height, CGFloat(rows.count) * (table.rowHeight + table.intercellSpacing.height))))
+        scroll.tile()
+        detail.frame = NSRect(x: 27, y: height - 75, width: width - 54, height: 17)
+        pageLabel.frame = NSRect(x: 27, y: height - 43, width: max(300, width - 260), height: 22)
         previous.frame = NSRect(x: right - 176, y: height - 46, width: 85, height: 29)
         next.frame = NSRect(x: right - 85, y: height - 46, width: 85, height: 29)
     }
@@ -398,8 +584,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         metrics[4].detail.stringValue = "已解析的请求用量记录"
         let money = data["money"] as? [String: Any] ?? [:], prefs = money["prefs"] as? [String: Any] ?? [:]
         let currency = prefs["currency"] as? String ?? "CNY"
-        metrics[5].value.font = .monospacedDigitSystemFont(ofSize: currency == "both" ? 14 : 21, weight: .semibold)
-        metrics[5].value.stringValue = CueUsageMoney.display(summary, currency: currency, compact: true)
+        metrics[5].preferredValueSize = currency == "both" ? 18 : 21
+        metrics[5].value.stringValue = CueUsageMoney.display(summary, currency: currency).replacingOccurrences(of: " / ", with: "\n")
         let unpriced = Int(number(summary, "unpriced_requests"))
         metrics[5].detail.stringValue = unpriced > 0 ? "\(Self.integer(Double(unpriced))) 条未定价 · 已定价小计" : "按模型 API 单价估算"
         let fx = money["fx"] as? [String: Any] ?? [:]
@@ -409,8 +595,18 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             if currency != "USD" { metrics[5].detail.stringValue += " · 缓存汇率" }
         }
         heatmap.days = data["days"] as? [[String: Any]] ?? []
-        heatmapTitle.stringValue = "最近 53 周 · 当前应用、模型和来源"
+        heatmap.currency = currency
+        heatmapTitle.stringValue = "每日用量 · 最近 53 周"
+        heatmap.setAccessibilityLabel("最近 53 周每日 Token 用量日历，" + heatmap.rangeDescription)
+        heatmapRange.stringValue = heatmap.rangeDescription
         rows = data[currentView] as? [[String: Any]] ?? []
+        // Give complete currency strings their measured native column width;
+        // horizontal scrolling is preferable to silently clipping an amount.
+        if let column = table.tableColumns.first(where: { $0.identifier.rawValue == "cost" }) {
+            let font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
+            let amountWidth = rows.map { (CueUsageMoney.display($0, currency: currency) as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+            column.width = max(column.width, ceil(amountWidth) + 20)
+        }
         let pagination = data["pagination"] as? [String: Any] ?? [:]
         page = max(1, Int(number(pagination, "page"))); pages = max(1, Int(number(pagination, "pages")))
         let total = Int(number(pagination, "total"))
@@ -418,6 +614,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         previous.isEnabled = page > 1; next.isEnabled = page < pages
         detail.stringValue = rows.isEmpty ? "当前筛选暂无记录。可点“立即同步”，或查看“数据说明”。" : "用量来自本机会话日志；原日志未记录供应商时，来源显示为“会话日志”。"
         table.reloadData()
+        layout()
     }
     private func updateStatus() {
         let busy = syncing || backendRunning

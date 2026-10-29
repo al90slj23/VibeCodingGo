@@ -2430,6 +2430,10 @@ if let index = CommandLine.arguments.firstIndex(of: "--capture-conversation"), C
     do { try CueConversationController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")); exit(0) }
     catch { print("对话详情窗口截图失败"); exit(1) }
 }
+if let index = CommandLine.arguments.firstIndex(of: "--capture-task-hover"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    exit(CueTaskHoverController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")) ? 0 : 1)
+}
 if CommandLine.arguments.contains("--menu-bar-self-test") {
     _ = NSApplication.shared
     let results = CueMenuBarUsage.validationReport()
@@ -2441,6 +2445,24 @@ if CommandLine.arguments.contains("--usage-money-self-test") {
     let results = CueUsagePreferencesController.validationReport()
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
     exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+if CommandLine.arguments.contains("--usage-dashboard-self-test") {
+    _ = NSApplication.shared
+    let results = CueUsageDashboardController.validationReport()
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-dashboard"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    func dimension(_ flag: String, fallback: CGFloat) -> CGFloat {
+        guard let i = CommandLine.arguments.firstIndex(of: flag), CommandLine.arguments.indices.contains(i + 1),
+              let value = Double(CommandLine.arguments[i + 1]), value.isFinite else { return fallback }
+        return CGFloat(min(2400, max(600, value)))
+    }
+    let size = NSSize(width: dimension("--width", fallback: 1120), height: dimension("--height", fallback: 850))
+    let currency = CommandLine.arguments.contains("--both-currencies") ? "both" : "CNY"
+    do { try CueUsageDashboardController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light"), size: size, currency: currency); exit(0) }
+    catch { print("用量统计窗口截图失败"); exit(1) }
 }
 if let index = CommandLine.arguments.firstIndex(of: "--capture-usage-preferences"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared

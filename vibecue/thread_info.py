@@ -24,6 +24,7 @@ from .events import clean_text, is_main_source, state_databases
 from .providers.task_details import message_text, visible_text
 from .providers.codex import record_time
 from .usage import zstd_program
+from .message_display import question_reply_text
 
 ID = re.compile(r'[A-Za-z0-9_-]{1,160}\Z')
 INITIAL_TAIL = 2 * 1024 * 1024
@@ -57,7 +58,6 @@ _FILE_HEADER = '# Files mentioned by the user:'
 _FILE_ROW = re.compile(r'^## (.+?): (/[^\n]+)\n(?:Image attachment: (true|false)\n)?', re.M)
 _IMAGE_WRAPPER = re.compile(r'<image\b[^>]*\bpath="([^"\n]+)"[^>]*>\s*</image\s*>', re.I)
 _TOOL_NAME = re.compile(r'[A-Za-z0-9_.:-]{1,160}\Z')
-_QUESTION_REPLY = re.compile(r'\A\s*<send_user_message_question_reply>\s*([\s\S]*?)\s*</send_user_message_question_reply>\s*\Z')
 
 
 class ThreadInfoError(ValueError):
@@ -227,14 +227,7 @@ def user_content(value):
     value = _outside_fences(value, lambda text: _CONTEXT.sub('', text)).strip()
     if not value or value.startswith(_HOST_ONLY):
         return '', []
-    reply = _QUESTION_REPLY.fullmatch(value)
-    if reply and len(reply.group(1)) <= 65_536:
-        try:
-            answers = json.loads(reply.group(1))
-            if isinstance(answers, list) and 0 < len(answers) <= 20 and all(isinstance(row, dict) and isinstance(row.get('answer'), str) for row in answers):
-                value = '\n\n'.join((row.get('question', '') + '\n' if len(answers) > 1 and isinstance(row.get('question'), str) else '') + row['answer'] for row in answers)
-        except (ValueError, TypeError):
-            pass
+    value = question_reply_text(value)
     attachments = []
     if value.startswith(_FILE_HEADER) and '\n## My request:' in value:
         header, value = value.split('\n## My request:', 1)
@@ -314,10 +307,11 @@ def conversation(records, include_activities=False):
                 status = 'complete'; last_terminal = at
         elif category == 'event_msg' and kind in ('agent_message', 'user_message'):
             role = 'assistant' if kind == 'agent_message' else 'user'
-            text = display_text(str(payload.get('message') or ''))
+            text = str(payload.get('message') or '')
             if role == 'user':
                 text, attachments = user_content(text)
             else:
+                text = display_text(text)
                 phase = payload.get('phase') if payload.get('phase') in ('commentary', 'final_answer') else 'final_answer'
             mirror = True
         elif category == 'event_msg' and kind in ('task_complete', 'task_completed'):
