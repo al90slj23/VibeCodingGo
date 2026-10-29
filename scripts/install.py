@@ -196,13 +196,16 @@ def install(start=True, with_hooks=True, user_home=None):
         private_write(agents / (job['Label'] + '.plist'), plistlib.dumps(job))
     # Preserve config.toml and the existing computer-use notify command verbatim.
     hooks = install_hooks(user_home / '.codex', control, home) if with_hooks else previous.get('hooks')
-    record = {'version': '0.18.0', 'app': str(app), 'home': str(home), 'hooks': hooks,
+    record = {'version': '0.19.1', 'app': str(app), 'home': str(home), 'hooks': hooks,
               'source_dir': str(PROJECT),
               'labels': list(LABELS), 'installed_at': datetime.now(timezone.utc).isoformat()}
     json_write(home / 'install.json', record)
     if start:
         for label in LABELS:
             subprocess.run(['/bin/launchctl', 'bootstrap', domain, str(agents / (label + '.plist'))], check=True)
+            # A successful bootstrap can leave a newly replaced interactive job
+            # registered but not started yet. Explicitly start this owned job.
+            subprocess.run(['/bin/launchctl', 'kickstart', domain + '/' + label], check=True)
     print(json.dumps(record, ensure_ascii=False, indent=2))
 
 

@@ -88,7 +88,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     private let summary = NSTextField(labelWithString: "")
     private let project = NSTextField(labelWithString: "项目目录读取中…")
     private let source = NSTextField(labelWithString: "最近对话")
-    private let connection = NSTextField(wrappingLabelWithString: "正在检查 Codex 对话连接…")
+    private let connection = NSTextField(wrappingLabelWithString: "正在自动连接 Codex…")
     private let feedback = NSTextField(wrappingLabelWithString: "")
     private let draftHint = NSTextField(labelWithString: "草稿仅保存在本机；点击发送后才会交给 Codex。")
     private let count = NSTextField(labelWithString: "")
@@ -119,7 +119,14 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     private var canSend = false, canLoad = false, messageLimit = 8192
     private var activeTurnID = "", chatState = "unknown", chatTransport = "", pendingRequestID = ""
     private var fingerprint = "", bodySignature = ""
-    private var lastStatusCheck = Date.distantPast
+    private var nextStatusCheck = Date.distantPast
+    private var connectionFailures = 0
+    private var automaticReconnect = true, needsLegacyConnectionSetup = false, connectionSupported = false
+    private var connectionRefreshQueued = false
+    private var connectionGeneration = 0
+    private var connectionDiagnostic = ""
+    private var applicationObservers: [NSObjectProtocol] = []
+    private var workspaceObservers: [NSObjectProtocol] = []
     private var lastRead = Date.distantPast
     private var readDelay: TimeInterval = 1.5
     private var loadGeneration = 0
@@ -169,12 +176,15 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         sendButton.identifier = NSUserInterfaceItemIdentifier("conversation.send"); doneButton.identifier = NSUserInterfaceItemIdentifier("conversation.handled"); laterButton.identifier = NSUserInterfaceItemIdentifier("conversation.later")
         noteToggle.identifier = NSUserInterfaceItemIdentifier("conversation.notes"); noteToggle.target = self; noteToggle.action = #selector(toggleNotes)
         noteToggle.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "备注"); noteToggle.imagePosition = .imageOnly; noteToggle.isBordered = false; noteToggle.toolTip = "下次从这里继续 · 备注"; noteToggle.setAccessibilityLabel("展开或收起待续备注")
-        codexButton.image = NSImage(systemSymbolName: "arrow.up.forward.square", accessibilityDescription: nil); codexButton.imagePosition = .imageOnly; codexButton.isBordered = false; codexButton.toolTip = "在 Codex 打开此对话"; codexButton.setAccessibilityLabel("在 Codex 打开")
+        codexButton.image = NSImage(systemSymbolName: "arrow.up.forward.square", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12, weight: .medium))
+        codexButton.imagePosition = .imageLeft; codexButton.isBordered = true; codexButton.font = .systemFont(ofSize: 12, weight: .medium)
+        codexButton.identifier = NSUserInterfaceItemIdentifier("conversation.open-codex")
+        codexButton.toolTip = "在 Codex 打开此对话"; codexButton.setAccessibilityLabel("在 Codex 打开此对话")
         doneButton.title = "标记完成"; doneButton.font = .systemFont(ofSize: 11); doneButton.isBordered = false
         sendButton.isBordered = false; sendButton.setAccessibilityLabel("发送到当前对话")
         moreButton.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "更多对话操作"); moreButton.imagePosition = .imageOnly; moreButton.isBordered = false; moreButton.target = self; moreButton.action = #selector(showMore)
         moreButton.menu = NSMenu()
-        for (title, selector) in [("刷新对话", #selector(refresh)), ("在访达中打开项目", #selector(revealProject)), ("稍后继续", #selector(closeForLater))] { let item = NSMenuItem(title: title, action: selector, keyEquivalent: ""); item.target = self; moreButton.menu?.addItem(item) }
+        for (title, selector) in [("刷新对话", #selector(refresh)), ("重新检查连接", #selector(retryConnection)), ("在访达中打开项目", #selector(revealProject)), ("稍后继续", #selector(closeForLater))] { let item = NSMenuItem(title: title, action: selector, keyEquivalent: ""); item.target = self; moreButton.menu?.addItem(item) }
         moreButton.setAccessibilityLabel("更多对话操作")
         inputPlaceholder.font = .systemFont(ofSize: 14); inputPlaceholder.textColor = .tertiaryLabelColor; inputPlaceholder.isSelectable = false
         sendButton.keyEquivalent = "\r"; sendButton.keyEquivalentModifierMask = [.command]
@@ -193,7 +203,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         refreshMetrics(); layout(); updateControls()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    deinit { timer?.invalidate(); saveWork?.cancel() }
+    deinit { timer?.invalidate(); saveWork?.cancel(); stopLifecycleObservers() }
 
     override func showWindow(_ sender: Any?) {
         remembersWindowGeometry = false
@@ -201,6 +211,9 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         super.showWindow(sender); handled = false; window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         guard !fixtureMode else { return }
         remembersWindowGeometry = true
+        startLifecycleObservers()
+        connectionGeneration += 1
+        if checking { connectionRefreshQueued = true }
         readConversation(); checkConnection(force: true)
         timer?.invalidate(); timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self, self.window?.isVisible == true, self.window?.isMiniaturized != true else { return }
@@ -208,9 +221,43 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
-    func windowWillClose(_ notification: Notification) { remembersWindowGeometry = false; windowGeometry.flush(); timer?.invalidate(); timer = nil; saveDraft(); if !hasInFlightOperation { onClosed?() }; /* Closing never handles a task. */ }
+    func windowWillClose(_ notification: Notification) { remembersWindowGeometry = false; windowGeometry.flush(); timer?.invalidate(); timer = nil; stopLifecycleObservers(); saveDraft(); if !hasInFlightOperation { onClosed?() }; /* Closing never handles a task. */ }
     func windowShouldClose(_ sender: NSWindow) -> Bool { saveDraft() }
-    func stop() { windowGeometry.flush(); timer?.invalidate(); timer = nil; saveDraft(); client.stop() }
+    func stop() { windowGeometry.flush(); timer?.invalidate(); timer = nil; stopLifecycleObservers(); saveDraft(); client.stop() }
+    private func startLifecycleObservers() {
+        guard applicationObservers.isEmpty, workspaceObservers.isEmpty else { return }
+        applicationObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshConnectionAfterLifecycle(invalidate: false)
+        })
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshConnectionAfterLifecycle(invalidate: true)
+        })
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      app.bundleIdentifier == "com.openai.codex" else { return }
+                self?.refreshConnectionAfterLifecycle(invalidate: true)
+            })
+        }
+    }
+    private func stopLifecycleObservers() {
+        applicationObservers.forEach { NotificationCenter.default.removeObserver($0) }; applicationObservers.removeAll()
+        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }; workspaceObservers.removeAll()
+    }
+    private func refreshConnectionAfterLifecycle(invalidate: Bool) {
+        guard !fixtureMode, window?.isVisible == true, window?.isMiniaturized != true else { return }
+        nextStatusCheck = .distantPast
+        if invalidate {
+            connectionGeneration += 1
+            canSend = false; canLoad = false; automaticReconnect = true
+            connection.stringValue = "正在自动恢复 Codex 连接…"
+            connectionDiagnostic = "Codex 或系统刚重新启动，正在重新发现当前对话。"
+            updateControls()
+            if checking { connectionRefreshQueued = true }
+        }
+        if !checking { checkConnection(force: true) }
+    }
     func windowDidMove(_ notification: Notification) { rememberWindowGeometry() }
     func windowDidResize(_ notification: Notification) { rememberWindowGeometry() }
     func windowDidEndLiveResize(_ notification: Notification) { rememberWindowGeometry(); if !fixtureMode { windowGeometry.flush() } }
@@ -236,11 +283,11 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         let sidebar: CGFloat = notesVisible ? min(248, max(210, w * 0.28)) : 0
         let mainWidth = w - sidebar
         let column = min(768, mainWidth - 40), left = (mainWidth - column) / 2
-        titleField.frame = NSRect(x: 24, y: 12, width: max(160, w - 296), height: 22)
+        titleField.frame = NSRect(x: 24, y: 12, width: max(120, w - 398), height: 22)
         summary.frame = NSRect(x: 24, y: 40, width: max(120, mainWidth - 210), height: 17)
         project.frame = NSRect(x: max(24, mainWidth - 179), y: 40, width: 155, height: 17)
         project.alignment = .right
-        codexButton.frame = NSRect(x: w - 244, y: 8, width: 30, height: 28)
+        codexButton.frame = NSRect(x: w - 350, y: 7, width: 132, height: 30)
         noteToggle.frame = NSRect(x: w - 209, y: 8, width: 30, height: 28)
         doneButton.frame = NSRect(x: w - 174, y: 9, width: 112, height: 27)
         moreButton.frame = NSRect(x: w - 53, y: 8, width: 30, height: 28)
@@ -264,7 +311,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         count.isHidden = composer.string.utf8.count < 1024
         let actionWidth: CGFloat = (!loadButton.isHidden ? 90 : 0) + (!connectButton.isHidden ? 112 : 0) + (!unlockButton.isHidden ? 165 : 0)
         connection.frame = NSRect(x: left + 2, y: composeY - 25, width: max(140, column - actionWidth - 12), height: 18)
-        connection.toolTip = connection.stringValue
+        connection.toolTip = connectionDiagnostic.isEmpty ? connection.stringValue : connectionDiagnostic
         var actionX = left + column
         for (button, width) in [(unlockButton, CGFloat(160)), (connectButton, 107), (loadButton, 85)] where !button.isHidden {
             actionX -= width; button.frame = NSRect(x: actionX, y: composeY - 31, width: width - 4, height: 26)
@@ -345,25 +392,56 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         guard let date else { return "" }; let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm"; return formatter.string(from: date)
     }
     private func checkConnection(force: Bool = false) {
-        guard !checking, force || Date().timeIntervalSince(lastStatusCheck) >= 8 else { return }
-        checking = true; lastStatusCheck = Date()
+        guard !fixtureMode, !checking, window?.isVisible == true, window?.isMiniaturized != true,
+              force || Date() >= nextStatusCheck else { return }
+        checking = true; nextStatusCheck = Date().addingTimeInterval(8)
+        let generation = connectionGeneration
         client.run(["status"], module: "vibecue.codex_chat", input: payload(["thread_id": event.threadID])) { [weak self] result in
-            guard let self else { return }; self.checking = false
-            switch result {
-            case .success(let data): self.applyChatStatus(data)
-            case .failure(let error): self.canSend = false; self.canLoad = false; self.connection.stringValue = error.localizedDescription; self.updateControls()
-            }
+            self?.finishConnectionCheck(result, generation: generation)
+        }
+    }
+    private func finishConnectionCheck(_ result: Result<[String: Any], Error>, generation: Int) {
+        checking = false
+        guard generation == connectionGeneration else {
+            // A reply issued before a wake/restart cannot make the old owner
+            // look ready again. Only a new discovery may restore sending.
+            connectionRefreshQueued = false; checkConnection(force: true); return
+        }
+        switch result {
+        case .success(let data): applyChatStatus(data)
+        case .failure(let error): applyChatStatus(["supported": false, "connected": false, "state": "reconnecting", "can_send": false, "auto_reconnect": true, "retry_after_seconds": 2, "message": error.localizedDescription])
+        }
+        if connectionRefreshQueued {
+            connectionRefreshQueued = false
+            checkConnection(force: true)
         }
     }
     private func applyChatStatus(_ data: [String: Any]) {
         canSend = data["can_send"] as? Bool == true; chatState = data["state"] as? String ?? "unknown"
+        connectionSupported = data["supported"] as? Bool == true
         chatTransport = data["transport"] as? String ?? ""
         canLoad = data["supported"] as? Bool == true && data["connected"] as? Bool == true && (data["needs_load"] as? Bool == true || chatState == "not_loaded")
         activeTurnID = data["active_turn_id"] as? String ?? ""
         if let value = data["max_text_bytes"] as? Int, value > 0 { messageLimit = value }
-        connection.stringValue = data["message"] as? String ?? "尚未接通对话输入。"
-        connectButton.isHidden = data["supported"] as? Bool == true
+        connectionDiagnostic = data["message"] as? String ?? "尚未接通对话输入。"
+        automaticReconnect = data["auto_reconnect"] as? Bool == true
+        needsLegacyConnectionSetup = chatState == "legacy_bridge"
+        if automaticReconnect {
+            connectionFailures = min(connectionFailures + 1, 5)
+            let requested = (data["retry_after_seconds"] as? Double) ?? 2
+            let delay = Self.reconnectDelay(failures: connectionFailures, requested: requested)
+            nextStatusCheck = Date().addingTimeInterval(delay)
+            connection.stringValue = chatState == "not_open" ? "正在自动查找此对话；在 Codex 打开后会自动接通。" : "正在自动恢复 Codex 连接…"
+        } else {
+            connectionFailures = 0
+            nextStatusCheck = Date().addingTimeInterval(data["supported"] as? Bool == true ? 8 : 30)
+            connection.stringValue = connectionDiagnostic
+        }
         updateControls()
+    }
+    private static func reconnectDelay(failures: Int, requested: Double) -> TimeInterval {
+        let initial = requested.isFinite ? min(4, max(1, requested)) : 2
+        return min(15, initial * pow(2, Double(min(4, max(0, failures - 1)))))
     }
     private func updateControls() {
         let length = composer.string.utf8.count, hasText = !composer.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -375,7 +453,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         loadButton.isEnabled = canLoad && !loading && !sending; loadButton.isHidden = !canLoad; loadButton.title = loading ? "正在载入…" : "载入对话"
         doneButton.isEnabled = !sending && !loading; doneButton.title = handled ? "已标记完成" : "标记完成"
         doneButton.attributedTitle = NSAttributedString(string: doneButton.title, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: doneButton.isEnabled ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor])
-        connectButton.title = "重试连接"
+        connectButton.isHidden = automaticReconnect || connectionSupported
+        connectButton.title = needsLegacyConnectionSetup ? "连接设置…" : "检查连接"
         unlockButton.isHidden = pendingRequestID.isEmpty || sending
         unlockButton.isEnabled = !sending && !loading
         sendButton.needsDisplay = true; layout()
@@ -449,7 +528,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     @objc private func showMore() { moreButton.menu?.popUp(positioning: nil, at: NSPoint(x: 0, y: moreButton.bounds.maxY + 4), in: moreButton) }
     @objc private func toggleNotes() { notesVisible.toggle(); noteToggle.contentTintColor = notesVisible ? .controlAccentColor : .secondaryLabelColor; layout(); if notesVisible { window?.makeFirstResponder(note) } }
     @objc private func openCodex() { saveDraft(); onCodex() }
-    @objc private func connectCodex() { onConnect() }
+    @objc private func connectCodex() { if needsLegacyConnectionSetup { onConnect() } else { retryConnection() } }
+    @objc private func retryConnection() { nextStatusCheck = .distantPast; if checking { connectionRefreshQueued = true } else { checkConnection(force: true) } }
     @objc private func revealProject() { onPathAction("reveal_project") }
     @objc private func refresh() { fingerprint = ""; readDelay = 1.5; lastRead = .distantPast; if !transcript.renderError.isEmpty { transcript.reload() }; readConversation(); checkConnection(force: true) }
     private func handleTranscriptAction(_ action: String, value: String) {
@@ -491,8 +571,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-conversation-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
         let event = CueEvent(runningThreadID: "conversation-fixture", title: "对话查看与待续验收", date: Date())
-        var handledCalls = 0
-        let controller = CueConversationController(home: home, event: event, detailProvider: { nil }, onHandled: { handledCalls += 1 }, onCodex: {}, onConnect: {}, onPathAction: { _ in })
+        var handledCalls = 0, codexOpenCalls = 0, connectionSetupCalls = 0
+        let controller = CueConversationController(home: home, event: event, detailProvider: { nil }, onHandled: { handledCalls += 1 }, onCodex: { codexOpenCalls += 1 }, onConnect: { connectionSetupCalls += 1 }, onPathAction: { _ in })
         controller.fixtureMode = true
         controller.composer.string = "下次要继续的消息"; controller.note.string = "先保留，方便时补验收。"
         let closed = controller.windowShouldClose(controller.window!)
@@ -517,6 +597,27 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         results["legacy_connection_does_not_enable_send_or_load"] = !controller.sendButton.isEnabled && !controller.loadButton.isEnabled
         controller.applyChatStatus(["supported": true, "connected": true, "transport": "desktop_ipc", "state": "active", "can_send": true, "active_turn_id": "current-turn", "message": "已接通当前对话"])
         results["existing_desktop_owner_enables_send_without_restart_or_load"] = controller.sendButton.isEnabled && controller.sendButton.title == "发送到当前对话" && controller.connectButton.isHidden && controller.loadButton.isHidden
+        controller.pendingRequestID = "unconfirmed-before-restart"
+        let retainedDraft = controller.composer.string, retainedNote = controller.note.string
+        let disconnected: [String: Any] = ["supported": false, "connected": false, "state": "reconnecting", "can_send": false, "auto_reconnect": true, "retry_after_seconds": 2, "message": "Codex 本机对话连接已中断"]
+        controller.applyChatStatus(disconnected)
+        results["restart_disconnect_automatically_recovers_without_a_retry_button"] = controller.automaticReconnect && controller.connectButton.isHidden && controller.connection.stringValue == "正在自动恢复 Codex 连接…" && !controller.sendButton.isEnabled && !controller.canLoad
+        results["automatic_reconnect_retains_original_diagnostic_for_inspection"] = controller.connection.toolTip == "Codex 本机对话连接已中断"
+        for _ in 0..<8 { controller.applyChatStatus(disconnected) }
+        let nextDelay = controller.nextStatusCheck.timeIntervalSinceNow
+        results["automatic_status_retries_back_off_with_a_finite_bound"] = nextDelay > 14 && nextDelay <= 15 && Self.reconnectDelay(failures: 1, requested: .infinity) == 2
+        controller.applyChatStatus(["supported": true, "connected": true, "transport": "desktop_ipc", "state": "active", "can_send": true, "active_turn_id": "new-turn", "message": "已自动接通当前对话"])
+        results["reconnected_status_never_clears_drafts_or_unlocks_an_unconfirmed_send"] = controller.pendingRequestID == "unconfirmed-before-restart" && controller.composer.string == retainedDraft && controller.note.string == retainedNote && !controller.sendButton.isEnabled && !controller.automaticReconnect && controller.connectionFailures == 0
+        controller.pendingRequestID = ""; controller.updateControls()
+        results["reconnected_owner_restores_reply_after_status_validation"] = controller.sendButton.isEnabled && controller.activeTurnID == "new-turn" && controller.connection.stringValue == "已自动接通当前对话"
+        results["automatic_status_recovery_never_starts_load_send_or_setup"] = !controller.hasInFlightOperation && controller.loadGeneration == 0 && codexOpenCalls == 0 && connectionSetupCalls == 0
+        controller.applyChatStatus(disconnected)
+        let oldGeneration = controller.connectionGeneration
+        controller.connectionGeneration += 1; controller.checking = true
+        controller.finishConnectionCheck(.success(["supported": true, "connected": true, "state": "active", "can_send": true, "message": "过期 owner 的迟到结果"]), generation: oldGeneration)
+        results["status_reply_from_before_a_restart_cannot_reenable_sending"] = controller.automaticReconnect && !controller.canSend && !controller.checking && controller.connection.stringValue == "正在自动恢复 Codex 连接…"
+        controller.applyChatStatus(["supported": false, "connected": false, "state": "unavailable", "can_send": false, "auto_reconnect": false, "message": "此版本协议需要更新 VibeCue"])
+        results["nonretryable_connection_reasons_are_not_hidden_as_a_restart"] = !controller.automaticReconnect && !controller.connectButton.isHidden && controller.connection.stringValue == "此版本协议需要更新 VibeCue"
         controller.applyChatStatus(["supported": true, "connected": true, "transport": "desktop_ipc", "state": "waiting", "can_send": false, "message": "请先在 Codex 回答当前问题"])
         results["desktop_pending_input_blocks_send_with_actionable_reason"] = !controller.sendButton.isEnabled && controller.sendButton.toolTip == "请先在 Codex 回答当前问题"
         var released = 0
@@ -540,6 +641,21 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         let canClose = failing.windowShouldClose(failing.window!)
         failing.markHandled()
         results["failed_draft_save_prevents_close_and_handled_action"] = !canClose && handledCalls == 1
+        let previousFrame = controller.window!.frame
+        var separatedHeader = true
+        for width: CGFloat in [640, 1000] {
+            controller.window?.setContentSize(NSSize(width: width, height: 820))
+            for shown in [false, true] {
+                controller.notesVisible = shown; controller.layout()
+                let controls = [controller.titleField, controller.codexButton, controller.noteToggle, controller.doneButton, controller.moreButton] as [NSView]
+                for (index, control) in controls.enumerated() {
+                    separatedHeader = separatedHeader && controller.root.bounds.contains(control.frame)
+                    for other in controls.dropFirst(index + 1) { separatedHeader = separatedHeader && !control.frame.intersects(other.frame) }
+                }
+            }
+        }
+        results["conversation_header_actions_do_not_overlap_at_minimum_width_or_with_notes"] = separatedHeader
+        controller.notesVisible = false; controller.window?.setFrame(previousFrame, display: false); controller.layout()
         results.merge(CueConversationWindowState.validationReport()) { _, value in value }
         let geometryHome = home.appendingPathComponent("shared-geometry")
         let geometry = CueConversationWindowState.shared(home: geometryHome)

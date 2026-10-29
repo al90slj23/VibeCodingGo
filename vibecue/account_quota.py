@@ -399,6 +399,92 @@ class QuotaStore:
             return self.status()
 
 
+def merge_shared_accounts(current, shared, *, now=None):
+    """Merge numeric snapshots exported by CC Switch, never its credentials.
+
+    The exporting process owns the auth lifecycle. Its individual observation
+    times determine freshness independently of which account Codex has open.
+    Failed or stale exports must not make a retained balance look current.
+    """
+    now=time.time() if now is None else now
+    result=dict(current)
+    current_key=current.get('current_account_key')
+    rows={row['account_key']:dict(row) for row in current.get('accounts',[])}
+    for row in rows.values():
+        row['is_live']=row.get('status')=='current' and row.get('expires_at',0)>=now
+    def identity(row):
+        workspace=label(row.get('account_id'),180)
+        email=label(row.get('email'),254).casefold()
+        return (workspace,email) if workspace and email else None
+    # A workspace can contain multiple people. Only alias one uniquely
+    # identified CC Switch user to one direct Codex account, never by workspace
+    # alone. Otherwise retain CC Switch's separate local identity.
+    candidates={row['account_key']:row for field in ('identities','accounts','history')
+                for row in shared.get(field,[]) if isinstance(row,dict) and row.get('account_key')} if isinstance(shared,dict) else {}
+    aliases={}
+    for key,row in candidates.items():
+        who=identity(row)
+        matches=[other for other in rows.values() if who is not None and identity(other)==who]
+        peers=[other for other in candidates.values() if who is not None and identity(other)==who]
+        if len(matches)==1 and len(peers)==1:
+            aliases[key]=matches[0]['account_key']
+    for historical in shared.get('history',[])[:MAX_ACCOUNTS] if isinstance(shared,dict) else []:
+        if not isinstance(historical,dict) or not historical.get('account_key'):
+            continue
+        row=dict(historical)
+        row['account_key']=aliases.get(row['account_key'],row['account_key'])
+        row.update(current_account=row['account_key']==current_key,status='last_read',is_live=False)
+        previous=rows.get(row['account_key'])
+        if previous is None or (not previous.get('is_live') and row.get('observed_at',0)>previous.get('observed_at',0)):
+            rows[row['account_key']]=row
+    bridge_rows=shared.get('accounts',[]) if isinstance(shared,dict) else []
+    for exported in bridge_rows[:MAX_ACCOUNTS]:
+        if not isinstance(exported,dict) or not exported.get('account_key'):
+            continue
+        row=dict(exported)
+        row['account_key']=aliases.get(row['account_key'],row['account_key'])
+        expired_reset=any(window.get('reset_status')!='not_started' and window.get('resets_at') is not None and window['resets_at']<=now
+                          for bucket in row.get('buckets',[]) for window in bucket.get('windows',[]))
+        live=row.get('expires_at',0)>=now and not expired_reset
+        row.update(current_account=row['account_key']==current_key,
+                   status='current' if live else 'last_read',is_live=live)
+        previous=rows.get(row['account_key'])
+        if previous is None or row.get('observed_at',0)>previous.get('observed_at',0) or (live and not previous.get('is_live')):
+            rows[row['account_key']]=row
+    errors=shared.get('errors',[]) if isinstance(shared,dict) else []
+    for error in errors[:MAX_ACCOUNTS]:
+        if not isinstance(error,dict) or not error.get('account_key'):
+            continue
+        original=label(error['account_key'],220)
+        key=aliases.get(original,original)
+        previous=rows.get(key)
+        message=label(error.get('message'),300) or '本次额度读取未完成。'
+        if previous is not None:
+            # A fresh direct Codex reading is still valid when only the CC
+            # Switch reading failed; otherwise explicitly retain history.
+            previous['read_error']=message
+            if previous.get('source')!='codex_app_server' or not previous.get('is_live'):
+                previous.update(status='last_read',is_live=False)
+        else:
+            rows[key]={'account_key':key,'label':label(error.get('label')) or 'Codex 账号',
+                       'source':'ccswitch_quota_bridge','current_account':key==current_key,
+                       'status':'unavailable','is_live':False,'buckets':[],
+                       'read_error':message,'observed_at':None,'expires_at':0}
+    ordered=sorted(rows.values(),key=lambda row:(not row.get('is_live'),not row.get('current_account'),
+                                                 (row.get('label') or '').casefold()))[:MAX_ACCOUNTS]
+    live_count=sum(bool(row.get('is_live')) for row in ordered)
+    bridge_status=shared.get('bridge_status','unavailable') if isinstance(shared,dict) else 'unavailable'
+    result.update(accounts=ordered,account_count=len(ordered),available=live_count>0,
+                  multi_account_live=live_count>1,live_account_count=live_count,
+                  ccswitch_bridge_status=bridge_status,
+                  ccswitch_configured_count=shared.get('configured_count',0) if isinstance(shared,dict) else 0,
+                  status='current' if live_count else 'stale' if ordered else 'unavailable')
+    if bridge_rows or errors:
+        result['message']=f'已读取 {live_count} 个账号的当前额度。CC Switch 负责已有授权与刷新，不切换 Codex 账号。'
+        result['scope_note']='各账号独立显示读取时间；读取失败或过期会明确标记。'
+    return result
+
+
 def main(argv=None):
     parser=argparse.ArgumentParser(description='通过官方 Codex 只读查询当前账号订阅额度')
     parser.add_argument('command',choices=('status','refresh'),nargs='?',default='status')
@@ -411,6 +497,8 @@ def main(argv=None):
     try:
         store=QuotaStore()
         result=store.refresh(force=args.force) if args.command=='refresh' else store.status()
+        from .ccswitch_quota import read_all_accounts
+        result=merge_shared_accounts(result,read_all_accounts())
         print(json.dumps(result,ensure_ascii=False,separators=(',',':')))
         return 0
     except KeyboardInterrupt:

@@ -30,7 +30,7 @@ final class CueUsageClient {
                 // Keep path/locale settings needed to find logs, but do not
                 // propagate unrelated API keys or authorization variables.
                 var environment: [String: String] = [:]
-                for key in ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "OPENCODE_DB"] {
+                for key in ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "OPENCODE_DB", "VIBECUE_CC_SWITCH_QUOTA_FILE"] {
                     if let value = inherited[key] { environment[key] = value }
                 }
                 environment["VIBECUE_HOME"] = home.path

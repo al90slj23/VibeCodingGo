@@ -71,10 +71,11 @@ def send_params(params):
 def unavailable(state='disconnected', connected=False):
     messages = {
         'legacy_bridge': '当前 Codex 连接尚不支持窗口回复。请在方便时正常退出，再通过 VibeCue 接通 Codex；不会自动重启。',
-        'disconnected': 'Codex 回复连接尚未接通。可以先查看内容、保留待续，或在 Codex 中打开。',
+        'disconnected': '正在自动连接 Codex，恢复后即可发送；可以继续查看对话和编辑草稿。',
         'ambiguous_owner': '存在多个 Codex 实例，无法确认此对话的载入归属。请先在对应 Codex 实例打开。',
     }
     return {'schema_version': 1, 'connected': connected, 'supported': False, 'can_send': False,
+            'auto_reconnect': state == 'disconnected', 'retry_after_seconds': 2 if state == 'disconnected' else None,
             **prompt_suggestion_metadata(connected=False),
             'needs_load': False, 'state': state, 'max_text_bytes': MAX_TEXT_BYTES,
             'message': messages.get(state, messages['disconnected'])}
@@ -252,7 +253,8 @@ class DesktopChatController(ChatController):
                 'max_text_bytes': MAX_TEXT_BYTES, 'transport': 'desktop_ipc'}
         runtime = snapshot.get('thread_runtime_status')
         if snapshot.get('resume_state') != 'resumed' or not isinstance(runtime, dict):
-            return dict(base, state='unknown', message='Codex 尚未就绪，请在 Codex 中打开此对话后刷新。')
+            return dict(base, state='reconnecting', auto_reconnect=True, retry_after_seconds=2,
+                        message='Codex 对话尚未就绪，正在自动检查连接。可以继续查看内容和编辑草稿。')
         kind = runtime.get('type')
         flags = runtime.get('activeFlags', [] if kind == 'idle' else None)
         if not isinstance(flags, list) or not all(isinstance(flag, str) for flag in flags) or type(snapshot.get('requests_pending')) is not bool:
@@ -288,28 +290,52 @@ class DesktopChatController(ChatController):
 
 
 def desktop_run(operation, params, home=None):
-    from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable
+    from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable, DesktopConnectionInterrupted
     from .events import codex_directory
     if not (codex_directory() / 'ipc/ipc.sock').exists():
         return None
     identifier = params['thread_id']
-    try:
-        with DesktopChannel(identifier) as channel:
-            controller = DesktopChatController(channel, home=home)
-            return getattr(controller, operation)(params)
-    except DesktopOwnerUnavailable:
-        return {'schema_version': 1, 'thread_id': identifier, 'connected': True,
+    readonly = operation == 'status'
+    deadline = time.monotonic() + 20 if readonly else None
+    # A desktop restart replaces the router socket and owner/client IDs. Retry
+    # only a status read, on an entirely fresh channel with new discovery; never
+    # repeat a load, submitted message, approval or other mutation.
+    for attempt in range(2 if readonly else 1):
+        try:
+            with DesktopChannel(identifier, deadline=deadline) as channel:
+                controller = DesktopChatController(channel, home=home)
+                result = getattr(controller, operation)(params)
+                if readonly:
+                    result.setdefault('auto_reconnect', False)
+                    result.setdefault('retry_after_seconds', None)
+                return result
+        except (DesktopConnectionInterrupted, DesktopOwnerUnavailable) as error:
+            if readonly and attempt == 0 and time.monotonic() + .15 < deadline:
+                time.sleep(.15)
+                continue
+            if isinstance(error, DesktopOwnerUnavailable):
+                return {'schema_version': 1, 'thread_id': identifier, 'connected': True,
                 'supported': True, 'can_send': False, 'needs_load': False,
+                'auto_reconnect': readonly, 'retry_after_seconds': 2 if readonly else None,
                 **prompt_suggestion_metadata(connected=False),
                 'state': 'not_open', 'transport': 'desktop_ipc',
                 'status': 'unavailable' if operation == 'status' else 'failed',
                 'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,
-                'message': '请先点击“在 Codex 打开”此对话；窗口就绪后会自动接通，草稿会保留。'}
-    except ControlError as error:
-        return {'schema_version': 1, 'thread_id': identifier, 'connected': False,
+                'message': '正在等待 Codex 恢复此对话的连接，将自动重试；也可以点击“在 Codex 打开”。'}
+            return {'schema_version': 1, 'thread_id': identifier, 'connected': False,
+                    'supported': False, 'can_send': False, 'needs_load': False,
+                    'auto_reconnect': readonly, 'retry_after_seconds': 2 if readonly else None,
+                    **prompt_suggestion_metadata(connected=False),
+                    'state': 'reconnecting' if readonly else 'disconnected', 'transport': 'desktop_ipc',
+                    'status': 'unavailable' if readonly else 'failed',
+                    'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,
+                    'message': '正在自动重新连接 Codex，恢复后即可发送。' if readonly else str(error)}
+        except ControlError as error:
+            return {'schema_version': 1, 'thread_id': identifier, 'connected': False,
                 'supported': False, 'can_send': False, 'needs_load': False,
+                'auto_reconnect': False, 'retry_after_seconds': None,
                 **prompt_suggestion_metadata(connected=False),
-                'state': 'disconnected', 'transport': 'desktop_ipc',
+                'state': 'unavailable', 'transport': 'desktop_ipc',
                 'status': 'unavailable' if operation == 'status' else 'failed',
                 'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,
                 'message': str(error)}
@@ -354,16 +380,27 @@ def run(operation, params, home=None):
                     status='failed' if operation != 'status' else 'unavailable')
     if len(capable) != len(live):
         return dict(unavailable('ambiguous_owner', True), thread_id=identifier, status='failed')
-    owners, unloaded = [], []
+    owners, unloaded, failed_probes = [], [], 0
     for connection in capable:
         try:
             state = socket_call(connection, 'status', {'thread_id': identifier})
         except ControlError:
+            failed_probes += 1
             continue
         if state.get('state') == 'not_loaded': unloaded.append((connection, state))
         elif state.get('supported'): owners.append((connection, state))
     if len(owners) > 1:
         return dict(unavailable('ambiguous_owner', True), thread_id=identifier, status='failed')
+    if failed_probes == len(capable):
+        # A relay can remain alive for a moment while its old backend is gone.
+        # It must not mask the restarted desktop's newly created owner router.
+        # All probes above were metadata reads; only that read can fall back.
+        if operation == 'status':
+            desktop = desktop_run(operation, params, home=home)
+            if desktop is not None:
+                return desktop
+        return dict(unavailable('disconnected'), thread_id=identifier,
+                    state='reconnecting', status='unavailable' if operation == 'status' else 'failed')
     if owners:
         connection, state = owners[0]
     elif len(capable) == 1 and unloaded:

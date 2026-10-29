@@ -22,6 +22,10 @@ from .events import codex_directory
 
 
 MAX_FRAME = 8 * 1024 * 1024
+# The desktop sends the entire conversation when a follower subscribes. The
+# read-only attention adapter already permits this same finite snapshot budget.
+# Ordinary RPC responses keep MAX_FRAME; no outbound request limit is raised.
+MAX_STREAM_FRAME = 32 * 1024 * 1024
 MAX_SEND = 32 * 1024
 DESKTOP_BUILDS = {('26.1021.31345', '21828')}
 VERSIONS = {'initialize': 0, 'thread-owner-discovery': 1,
@@ -31,6 +35,10 @@ VERSIONS = {'initialize': 0, 'thread-owner-discovery': 1,
 
 class DesktopOwnerUnavailable(ControlError):
     """The desktop router is reachable, but no current window owns this chat."""
+
+
+class DesktopConnectionInterrupted(ControlError):
+    """A read-only operation may retry using a fresh desktop/client identity."""
 
 
 def _private_socket(path):
@@ -149,22 +157,24 @@ def _snapshot_metadata(state, thread, owner, revision):
 class DesktopChannel:
     method_versions = VERSIONS
     max_frame_size = MAX_FRAME
-    def __init__(self, thread_id, codex_home=None, timeout=8):
+    def __init__(self, thread_id, codex_home=None, timeout=8, deadline=None):
         if not _identifier(thread_id):
             raise ControlError('对话标识无效')
         self.thread_id = thread_id
         self.path = codex_directory(codex_home) / 'ipc/ipc.sock'
         self.timeout = min(15, max(.1, float(timeout)))
+        self.deadline = deadline
         self.socket = None
         self.client_id = None
         self.owner = None
         self.subscribed = False
+        self._stream_requested = False
 
     def __enter__(self):
         try:
             _private_socket(self.path)
             self.socket = socket.socket(socket.AF_UNIX)
-            self.socket.settimeout(self.timeout)
+            self.socket.settimeout(self._remaining_timeout())
             self.socket.connect(str(self.path))
             if _peer_uid(self.socket) != os.getuid():
                 raise ControlError('Codex 连接用户与当前用户不一致')
@@ -177,8 +187,10 @@ class DesktopChannel:
             return self
         except ControlError:
             self.close(); raise
-        except (OSError, ValueError, TypeError):
-            self.close(); raise ControlError('Codex 本机回复连接尚未就绪') from None
+        except OSError:
+            self.close(); raise DesktopConnectionInterrupted('Codex 本机回复连接尚未就绪') from None
+        except (ValueError, TypeError):
+            self.close(); raise ControlError('Codex 本机回复连接无效') from None
 
     def __exit__(self, *_):
         self.close()
@@ -191,13 +203,27 @@ class DesktopChannel:
                 except (OSError, ControlError):
                     pass
             self.socket.close()
-        self.socket = None; self.subscribed = False
+        self.socket = None; self.subscribed = False; self._stream_requested = False
 
     def _send(self, value):
         data = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
         if len(data) > MAX_SEND:
             raise ControlError('本机对话请求过大')
+        if self.deadline is not None:
+            self.socket.settimeout(self._remaining_timeout())
         self.socket.sendall(struct.pack('<I', len(data)) + data)
+
+    def _remaining_timeout(self):
+        if self.deadline is None:
+            return self.timeout
+        remaining = min(self.timeout, self.deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError()
+        return remaining
+
+    def _read_deadline(self):
+        deadline = time.monotonic() + self.timeout
+        return min(deadline, self.deadline) if self.deadline is not None else deadline
 
     def _read_exact(self, length, deadline):
         pieces = []
@@ -214,7 +240,8 @@ class DesktopChannel:
 
     def _receive(self, deadline):
         length = struct.unpack('<I', self._read_exact(4, deadline))[0]
-        if not 0 < length <= self.max_frame_size:
+        limit = max(self.max_frame_size, MAX_STREAM_FRAME) if self._stream_requested else self.max_frame_size
+        if not 0 < length <= limit:
             raise ControlError('Codex 本机连接返回的数据过大或无效')
         try:
             value = json.loads(self._read_exact(length, deadline))
@@ -222,11 +249,28 @@ class DesktopChannel:
             raise ControlError('Codex 本机连接返回了无效数据') from None
         if not isinstance(value, dict):
             raise ControlError('Codex 本机连接返回了无效数据')
+        # A subscribed owner can have a final stream frame in flight after we
+        # unsubscribe. Consume that bounded frame before a subsequent RPC reply,
+        # while keeping oversized RPC/unrelated broadcasts rejected. Bodies are
+        # never returned to the UI or persisted by this adapter.
+        if length > self.max_frame_size and not self._own_stream(value):
+            raise ControlError('Codex 本机连接返回的数据过大或无效')
         # We expose no server capabilities; discovery by other clients must not
         # wait for this narrow sender to provide a handler.
         if value.get('type') == 'client-discovery-request':
             self._send({'type': 'client-discovery-response', 'requestId': value.get('requestId'), 'response': {'canHandle': False}})
         return value
+
+    def _own_stream(self, message):
+        if (message.get('type') != 'broadcast' or message.get('method') != 'thread-stream-state-changed' or
+                message.get('version') != 11 or message.get('sourceClientId') != self.owner or
+                not isinstance(message.get('targetClientIds'), list) or self.client_id not in message['targetClientIds']):
+            return False
+        params = message.get('params')
+        if not isinstance(params, dict) or params.get('hostId') != 'local' or params.get('conversationId') != self.thread_id:
+            return False
+        change = params.get('change')
+        return isinstance(change, dict) and change.get('type') in ('snapshot', 'patches')
 
     def _call(self, method, params, *, target=None, mutation=False):
         if method not in self.method_versions:
@@ -243,7 +287,7 @@ class DesktopChannel:
         try:
             attempted = True
             self._send(message)
-            deadline = time.monotonic() + self.timeout
+            deadline = self._read_deadline()
             while True:
                 response = self._receive(deadline)
                 if response.get('type') != 'response' or response.get('requestId') != request:
@@ -252,6 +296,8 @@ class DesktopChannel:
                     error = response.get('error')
                     if error in ('request-timeout', 'client-disconnected', 'server-closed') and mutation:
                         raise UnconfirmedUpdate('消息已提交，桌面确认尚未返回，请核对对话')
+                    if error in ('request-timeout', 'client-disconnected', 'server-closed'):
+                        raise DesktopConnectionInterrupted('Codex 正在恢复本机对话连接')
                     if error == 'no-client-found':
                         rejected = True
                         raise DesktopOwnerUnavailable('Codex 当前没有此对话的可用窗口连接，请先在 Codex 打开')
@@ -276,7 +322,7 @@ class DesktopChannel:
         except (OSError, TimeoutError, ConnectionError):
             if attempted and mutation:
                 raise UnconfirmedUpdate('消息已提交，连接确认中断；请核对对话，不会重发') from None
-            raise ControlError('Codex 本机对话连接已中断') from None
+            raise DesktopConnectionInterrupted('Codex 本机对话连接已中断') from None
 
     def discover(self):
         result = self._call('thread-owner-discovery', {'hostId': 'local', 'conversationId': self.thread_id})
@@ -295,13 +341,15 @@ class DesktopChannel:
                     'sourceClientId': self.client_id, 'targetClientIds': [self.owner],
                     'version': 1, 'params': {'conversationId': self.thread_id, 'hostId': 'local', 'following': following}})
         self.subscribed = following
+        if following:
+            self._stream_requested = True
 
     def runtime_snapshot(self):
         if not self.owner:
             self.discover()
         self._following(True)
         try:
-            deadline = time.monotonic() + self.timeout
+            deadline = self._read_deadline()
             while True:
                 message = self._receive(deadline)
                 if (message.get('type') != 'broadcast' or message.get('method') != 'thread-stream-state-changed' or
@@ -319,7 +367,7 @@ class DesktopChannel:
                     raise ControlError('Codex 对话快照版本无效')
                 return _snapshot_metadata(change.get('conversationState'), self.thread_id, self.owner, revision)
         except (OSError, TimeoutError, ConnectionError):
-            raise ControlError('Codex 对话状态读取尚未完成') from None
+            raise DesktopConnectionInterrupted('Codex 对话状态读取尚未完成') from None
         finally:
             try:
                 self._following(False)

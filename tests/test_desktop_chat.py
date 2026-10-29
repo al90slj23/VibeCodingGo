@@ -4,8 +4,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from vibecue.codex_chat import DesktopChatController, run
+from vibecue.codex_chat import DesktopChatController, desktop_run, run
 from vibecue.codex_control import ControlError, UnconfirmedUpdate
+from vibecue.codex_desktop_ipc import DesktopConnectionInterrupted, DesktopOwnerUnavailable
 
 
 REQUEST = '51d32d31-6afc-4e54-bcb8-b9390df6cf99'
@@ -144,6 +145,97 @@ class DesktopChatTests(unittest.TestCase):
                 patch('vibecue.codex_chat.desktop_run', return_value=result) as desktop:
             self.assertIs(run('status', {'thread_id': 'thread-one'}, home=self.home), result)
         desktop.assert_called_once_with('status', {'thread_id': 'thread-one'}, home=self.home)
+
+
+class ManagedFixture(DesktopFixture):
+    def __enter__(self):
+        self.closed = False
+        return self
+
+    def __exit__(self, *_):
+        self.closed = True
+
+
+class DesktopReconnectTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        (self.home / 'ipc').mkdir()
+        (self.home / 'ipc/ipc.sock').touch()
+        directory = patch('vibecue.events.codex_directory', return_value=self.home)
+        directory.start(); self.addCleanup(directory.stop)
+        delay = patch('vibecue.codex_chat.time.sleep')
+        delay.start(); self.addCleanup(delay.stop)
+
+    def test_status_reconnects_with_a_new_channel_after_router_restart(self):
+        first, second = ManagedFixture(), ManagedFixture()
+        first.runtime_snapshot = lambda: (_ for _ in ()).throw(DesktopConnectionInterrupted('connection closed'))
+        with patch('vibecue.codex_desktop_ipc.DesktopChannel', side_effect=[first, second]) as connect:
+            result = desktop_run('status', {'thread_id': 'thread-one'}, home=self.home)
+        self.assertEqual(connect.call_count, 2)
+        self.assertTrue(result['can_send'])
+        self.assertFalse(result['auto_reconnect'])
+        self.assertTrue(first.closed and second.closed)
+        self.assertEqual(first.sent + second.sent, [])
+        self.assertEqual(connect.call_args_list[0].kwargs['deadline'], connect.call_args_list[1].kwargs['deadline'])
+
+    def test_unready_router_has_bounded_retries_and_explicit_auto_reconnect_state(self):
+        with patch('vibecue.codex_desktop_ipc.DesktopChannel', side_effect=DesktopConnectionInterrupted('closed')) as connect:
+            result = desktop_run('status', {'thread_id': 'thread-one'}, home=self.home)
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual(result['state'], 'reconnecting')
+        self.assertTrue(result['auto_reconnect'])
+        self.assertEqual(result['retry_after_seconds'], 2)
+        self.assertFalse(result['can_send'])
+
+    def test_owned_conversation_restoring_after_restart_is_polled_without_loading(self):
+        first, second = ManagedFixture(), ManagedFixture()
+        first.snapshot['resume_state'] = 'loading'
+        with patch('vibecue.codex_desktop_ipc.DesktopChannel', side_effect=[first, second]) as connect:
+            restoring = desktop_run('status', {'thread_id': 'thread-one'}, home=self.home)
+            ready = desktop_run('status', {'thread_id': 'thread-one'}, home=self.home)
+        self.assertEqual(connect.call_count, 2)
+        self.assertTrue(restoring['auto_reconnect'])
+        self.assertEqual(restoring['state'], 'reconnecting')
+        self.assertFalse(restoring['can_send'])
+        self.assertTrue(ready['can_send'])
+        self.assertFalse(ready['auto_reconnect'])
+        self.assertEqual(first.sent + second.sent, [])
+
+    def test_missing_owner_is_rechecked_without_loading_or_sending(self):
+        with patch('vibecue.codex_desktop_ipc.DesktopChannel', side_effect=DesktopOwnerUnavailable('not owned')) as connect:
+            result = desktop_run('status', {'thread_id': 'thread-one'}, home=self.home)
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual(result['state'], 'not_open')
+        self.assertTrue(result['auto_reconnect'])
+        self.assertFalse(result['needs_load'])
+
+    def test_protocol_or_permission_rejection_is_not_blindly_retried(self):
+        with patch('vibecue.codex_desktop_ipc.DesktopChannel', side_effect=ControlError('version not audited')) as connect:
+            result = desktop_run('status', {'thread_id': 'thread-one'}, home=self.home)
+        connect.assert_called_once()
+        self.assertFalse(result['auto_reconnect'])
+        self.assertEqual(result['state'], 'unavailable')
+
+    def test_load_and_send_transport_failures_are_never_retried(self):
+        for operation in ('load', 'send'):
+            with self.subTest(operation=operation), patch('vibecue.codex_desktop_ipc.DesktopChannel', side_effect=DesktopConnectionInterrupted('closed')) as connect:
+                result = desktop_run(operation, {'thread_id': 'thread-one'}, home=self.home)
+                connect.assert_called_once()
+                self.assertFalse(result['auto_reconnect'])
+
+    def test_uncertain_sent_message_remains_locked_after_a_new_connection(self):
+        first, second = ManagedFixture(), ManagedFixture()
+        first.error = UnconfirmedUpdate('lost response')
+        params = {'thread_id': 'thread-one', 'text': 'do not resend', 'request_id': REQUEST}
+        with patch('vibecue.codex_desktop_ipc.DesktopChannel', side_effect=[first, second]):
+            result = desktop_run('send', params, home=self.home)
+            duplicate = desktop_run('send', params, home=self.home)
+        self.assertEqual(result['status'], 'unverified')
+        self.assertEqual(duplicate['status'], 'unverified')
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(len(first.sent), 1)
+        self.assertEqual(second.sent, [])
 
 
 if __name__ == '__main__':

@@ -169,6 +169,32 @@ class ChatRoutingTests(unittest.TestCase):
             result = socket_call({'socket_path': '/fixture'}, 'send', {'request_id': REQUEST})
         self.assertEqual(result['status'], 'unverified')
 
+    def test_failed_old_relay_status_can_discover_the_restarted_desktop(self):
+        recovered = {'supported': True, 'connected': True, 'can_send': True, 'transport': 'desktop_ipc'}
+        with patch('vibecue.codex_chat.connections', return_value=[{'chat_version': 1}]), \
+             patch('vibecue.codex_chat.socket_call', side_effect=ControlError('old backend closed')) as old, \
+             patch('vibecue.codex_chat.desktop_run', return_value=recovered) as desktop:
+            result = run('status', {'thread_id': 'thread-one'})
+        self.assertIs(result, recovered)
+        old.assert_called_once(); desktop.assert_called_once()
+        self.assertEqual(old.call_args.args[1], 'status')
+
+    def test_failed_relay_does_not_route_a_mutation_through_a_new_transport(self):
+        with patch('vibecue.codex_chat.connections', return_value=[{'chat_version': 1}]), \
+             patch('vibecue.codex_chat.socket_call', side_effect=ControlError('old backend closed')) as old, \
+             patch('vibecue.codex_chat.desktop_run') as desktop:
+            result = run('load', {'thread_id': 'thread-one'})
+        self.assertEqual(result['state'], 'reconnecting')
+        self.assertFalse(result['can_send'])
+        self.assertEqual(old.call_args.args[1], 'status')
+        desktop.assert_not_called()
+
+    def test_absent_connections_have_an_automatic_readonly_retry_hint(self):
+        with patch('vibecue.codex_chat.connections', return_value=[]):
+            result = run('status', {'thread_id': 'thread-one'})
+        self.assertTrue(result['auto_reconnect'])
+        self.assertEqual(result['retry_after_seconds'], 2)
+
 
 class ChatRelayTests(unittest.TestCase):
     def setUp(self):

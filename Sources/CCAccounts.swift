@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-/// Shared quota snapshots; Codex's official helper keeps ownership of login.
+/// Numeric snapshots only; Codex and CC Switch retain ownership of login.
 final class CueAccountQuotaMonitor {
     private static var monitors: [String: CueAccountQuotaMonitor] = [:]
     static func shared(home: URL) -> CueAccountQuotaMonitor {
@@ -41,7 +41,7 @@ final class CueAccountQuotaMonitor {
                 self.snapshot["message"] = "当前额度读取失败，已保存的数据仅供查看；稍后会自动重试。"
                 self.snapshot["available"] = false
                 if let rows = self.snapshot["accounts"] as? [[String: Any]] {
-                    self.snapshot["accounts"] = rows.map { row in var value = row; value["current_account"] = false; value["status"] = "last_read"; return value }
+                    self.snapshot["accounts"] = rows.map { row in var value = row; value["current_account"] = false; value["is_live"] = false; value["status"] = "last_read"; return value }
                 }
             }
             self.changed()
@@ -66,9 +66,9 @@ final class CueCCAccountsController: NSWindowController {
     private var observer: UUID?
     private let root = CueQuotaSurface()
     private let titleField = NSTextField(labelWithString: "Codex 账号额度")
-    private let subtitle = NSTextField(labelWithString: "每 60 秒自动刷新当前登录账号")
-    private let message = NSTextField(wrappingLabelWithString: "正在读取 Codex 当前账号的订阅额度…")
-    private let status = NSTextField(wrappingLabelWithString: "其他账号保留上次读取值，并标注时间。")
+    private let subtitle = NSTextField(labelWithString: "每 60 秒自动刷新 · 支持 CC Switch 多账号")
+    private let message = NSTextField(wrappingLabelWithString: "正在读取账号的订阅额度…")
+    private let status = NSTextField(wrappingLabelWithString: "各账号独立显示读取状态和时间。")
     private let scroll = NSScrollView()
     private let quotaDocument = CueQuotaSurface()
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
@@ -115,9 +115,10 @@ final class CueCCAccountsController: NSWindowController {
     private func update() {
         refreshButton.isEnabled = fixture == nil && !monitor.refreshing
         refreshButton.title = monitor.refreshing && fixture == nil ? "读取中…" : "刷新"
-        message.stringValue = data["message"] as? String ?? "正在读取 Codex 当前账号的订阅额度…"
+        message.stringValue = data["message"] as? String ?? "正在读取账号的订阅额度…"
         let rows = data["accounts"] as? [[String: Any]] ?? []
-        status.stringValue = rows.isEmpty ? "读取现有 Codex 登录状态，无需在 VibeCue 登录。" : "已记录 \(rows.count) 个账号。非当前账号仅显示上次读取值。"
+        let liveCount = rows.filter { Self.isLive($0) }.count
+        status.stringValue = rows.isEmpty ? "复用已有登录，无需在 VibeCue 重新授权。" : "已显示 \(rows.count) 个账号 · \(liveCount) 个实时更新。"
         renderAccounts()
     }
     @discardableResult private func label(_ value: String, x: CGFloat, y: CGFloat, width: CGFloat, size: CGFloat = 11, weight: NSFont.Weight = .regular, color: NSColor = .labelColor, in parent: NSView) -> NSTextField {
@@ -136,15 +137,19 @@ final class CueCCAccountsController: NSWindowController {
             y = 120
         }
         for row in rows.prefix(20) {
-            let expiry = row["expires_at"] as? Double ?? 0
-            let current = row["current_account"] as? Bool == true && row["status"] as? String == "current" && expiry >= Date().timeIntervalSince1970
+            let current = row["current_account"] as? Bool == true
+            let live = Self.isLive(row), shared = row["source"] as? String == "ccswitch_quota_bridge"
             let card = CueQuotaSurface(); card.radius = 12
-            card.fillColor = current ? NSColor.controlAccentColor.withAlphaComponent(0.07) : NSColor.secondaryLabelColor.withAlphaComponent(0.045)
-            label(row["label"] as? String ?? "Codex 账号", x: 16, y: 13, width: width - 205, size: 14, weight: .semibold, in: card)
-            label(current ? "当前登录 · 实时读取" : "上次读取 · 非实时", x: width - 188, y: 14, width: 169, color: current ? .systemGreen : .secondaryLabelColor, in: card).alignment = .right
+            card.fillColor = live ? NSColor.controlAccentColor.withAlphaComponent(0.07) : NSColor.secondaryLabelColor.withAlphaComponent(0.045)
+            label(row["label"] as? String ?? "Codex 账号", x: 16, y: 13, width: width - 220, size: 14, weight: .semibold, in: card)
+            let badge = live ? (shared ? "CC Switch · 实时读取" : "当前登录 · 实时读取") : row["status"] as? String == "unavailable" ? "暂不可用" : "上次读取 · 非实时"
+            label(badge, x: width - 203, y: 14, width: 184, color: live ? .systemGreen : .secondaryLabelColor, in: card).alignment = .right
             let plan = row["plan_type"] as? String ?? ""
-            label((plan.isEmpty ? "Codex" : plan.capitalized) + " · 更新于 " + Self.date(row["observed_at"]), x: 16, y: 39, width: width - 32, size: 10.5, color: .secondaryLabelColor, in: card)
+            label((plan.isEmpty ? "Codex" : plan.capitalized) + (current && shared ? " · 当前 Codex 登录" : "") + " · 更新于 " + Self.date(row["observed_at"]), x: 16, y: 39, width: width - 32, size: 10.5, color: .secondaryLabelColor, in: card)
             var inside: CGFloat = 70
+            if let error = row["read_error"] as? String, !error.isEmpty {
+                label(error, x: 16, y: inside, width: width - 32, color: .systemOrange, in: card); inside += 28
+            }
             let buckets = row["buckets"] as? [[String: Any]] ?? []
             for bucket in buckets.prefix(32) {
                 let bucketName = bucket["limit_name"] as? String ?? ""
@@ -159,7 +164,7 @@ final class CueCCAccountsController: NSWindowController {
                     guard let remaining = quota["remaining_percent"] as? Double, remaining.isFinite else { continue }
                     let weekly = quota["kind"] as? String == "weekly", minutes = quota["window_minutes"] as? Int ?? 0
                     let scope = weekly ? "本周" : minutes > 0 ? (minutes < 60 ? "\(minutes)分钟窗口" : "\(minutes / 60)小时窗口") : "额度窗口"
-                    label("\(scope)\(current ? "剩余" : "上次剩余") \(Self.percent(remaining))", x: 16, y: inside, width: width / 2 - 22, size: 14, weight: weekly ? .semibold : .medium, in: card)
+                    label("\(scope)\(live ? "剩余" : "上次剩余") \(Self.percent(remaining))", x: 16, y: inside, width: width / 2 - 22, size: 14, weight: weekly ? .semibold : .medium, in: card)
                     let reset: String
                     if quota["reset_status"] as? String == "not_started" { reset = "尚未开始计时" }
                     else if quota["reset_status"] as? String == "elapsed" { reset = "等待重置结果更新" }
@@ -177,6 +182,10 @@ final class CueCCAccountsController: NSWindowController {
         quotaDocument.frame = NSRect(x: 0, y: 0, width: width, height: max(scroll.contentSize.height, y))
         scroll.contentView.scroll(to: NSPoint(x: 0, y: min(origin.y, max(0, y - scroll.contentSize.height)))); scroll.reflectScrolledClipView(scroll.contentView)
     }
+    private static func isLive(_ row: [String: Any]) -> Bool {
+        let markedLive = row["is_live"] as? Bool ?? (row["current_account"] as? Bool == true && row["status"] as? String == "current")
+        return markedLive && row["status"] as? String == "current" && (row["expires_at"] as? Double ?? 0) >= Date().timeIntervalSince1970
+    }
     private static func percent(_ value: Double) -> String { String(format: value.rounded() == value ? "%.0f%%" : "%.1f%%", value) }
     private static func date(_ raw: Any?) -> String {
         guard let seconds = raw as? Double, seconds.isFinite, seconds > 0 else { return "—" }
@@ -186,7 +195,7 @@ final class CueCCAccountsController: NSWindowController {
     @objc private func refresh() { monitor.refresh(force: true) }
     @objc private func showInfo() {
         let alert = NSAlert(); alert.messageText = "订阅额度的来源"
-        alert.informativeText = "额度由 Codex 官方服务使用它已有的登录状态读取，每 60 秒更新当前账号；VibeCue 不获取新的登录授权。\n\nCC Switch 当前版本没有外部额度共享接口。只有当前 Codex 登录账号能够实时查询，其他已读取账号保留上次结果和时间；这里不会自动切换账号。\n\n每周剩余比例与 API 参考费用是两种不同数据，不能互相换算。"; alert.addButton(withTitle: "知道了"); alert.runModal()
+        alert.informativeText = "当前登录账号由 Codex 官方接口读取。CC Switch 账号通过本机额度共享读取，授权和刷新始终由 CC Switch 自己管理，只共享账号名称、额度数字和更新时间。\n\n无需在 VibeCue 重新授权，也不会切换账号。CC Switch 需要运行并启用额度共享；读取失败或数据过期时会明确标记。\n\n每周剩余比例与 API 参考费用是两种不同数据，不能互相换算。"; alert.addButton(withTitle: "知道了"); alert.runModal()
     }
     @objc private func openCCSwitch() {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.ccswitch.desktop") else { message.stringValue = "未找到 CC Switch，请从应用程序中打开。"; return }
@@ -199,14 +208,22 @@ final class CueCCAccountsController: NSWindowController {
             ["label": email, "plan_type": "pro", "current_account": current, "status": current ? "current" : "last_read", "observed_at": now - (current ? 3 : 3600), "expires_at": now + 120,
              "buckets": [["limit_id": "codex", "limit_name": "Codex", "windows": [["kind": "weekly", "remaining_percent": remaining, "window_minutes": 10080, "resets_at": now + 86400, "reset_status": "scheduled"]]]]]
         }
-        return ["available": true, "message": "已读取当前 Codex 登录账号的订阅额度。其他账号保留上次读取值。", "accounts": [account("account-one@example.com", current: true, remaining: 78), account("account-two@example.com", current: false, remaining: 42)]]
+        var shared = account("account-two@example.com", current: false, remaining: 42)
+        shared["source"] = "ccswitch_quota_bridge"; shared["is_live"] = true; shared["status"] = "current"; shared["observed_at"] = now - 4
+        return ["available": true, "message": "已读取 2 个账号的当前额度，无需切换账号。", "accounts": [account("account-one@example.com", current: true, remaining: 78), shared]]
     }
     static func validationReport() -> [String: Bool] {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-quota-ui-" + UUID().uuidString)
         let controller = CueCCAccountsController(home: home, fixture: fixtureData())
         let labels = controller.quotaDocument.subviews.flatMap(\.subviews).compactMap { ($0 as? NSTextField)?.stringValue }
-        return ["quota_ui_distinguishes_live_and_previous_account": labels.filter { $0 == "当前登录 · 实时读取" }.count == 1 && labels.filter { $0 == "上次读取 · 非实时" }.count == 1,
-                "quota_ui_shows_week_remaining_and_local_reset_time": labels.contains("本周剩余 78%") && labels.contains("本周上次剩余 42%") && labels.contains(where: { $0.hasPrefix("重置 ") }),
+        var historical = fixtureData()["accounts"] as! [[String: Any]]
+        historical[1]["is_live"] = true; historical[1]["status"] = "last_read"
+        let older = CueCCAccountsController(home: home, fixture: ["accounts": historical])
+        let oldLabels = older.quotaDocument.subviews.flatMap(\.subviews).compactMap { ($0 as? NSTextField)?.stringValue }
+        return ["quota_ui_distinguishes_live_and_previous_account": labels.contains("CC Switch · 实时读取") && oldLabels.contains("上次读取 · 非实时") && oldLabels.contains("本周上次剩余 42%"),
+                "quota_ui_shows_two_live_accounts_without_switching": labels.contains("当前登录 · 实时读取") && labels.contains("CC Switch · 实时读取") && controller.status.stringValue.contains("2 个实时更新"),
+                "quota_ui_failed_read_clears_the_live_badge": !Self.isLive(historical[1]) && !oldLabels.contains("CC Switch · 实时读取"),
+                "quota_ui_shows_week_remaining_and_local_reset_time": labels.contains("本周剩余 78%") && labels.contains("本周剩余 42%") && labels.contains(where: { $0.hasPrefix("重置 ") }),
                 "quota_ui_fixture_never_starts_official_helper": controller.monitor.snapshot.isEmpty && !controller.monitor.refreshing,
                 "quota_ui_retains_ccswitch_management_entry": controller.openButton.title == "打开 CC Switch"]
     }

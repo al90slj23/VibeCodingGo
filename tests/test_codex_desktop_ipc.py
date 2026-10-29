@@ -72,6 +72,13 @@ class FakeSocket:
         self.closed = True
 
 
+class LargeFrameSocket(FakeSocket):
+    def recv(self, size):
+        size = min(size, 32768, len(self.pending))
+        result = bytes(self.pending[:size]); del self.pending[:size]
+        return result
+
+
 class DesktopIPCTests(unittest.TestCase):
     def connect(self, fake=None):
         fake = fake or FakeSocket()
@@ -142,6 +149,26 @@ class DesktopIPCTests(unittest.TestCase):
             with self.assertRaises(ipc.DesktopOwnerUnavailable):
                 channel.discover()
         self.assertNotIn('thread-follower-start-turn', [row['method'] for row in fake.sent])
+
+    def test_restarted_router_errors_are_retryable_only_before_mutation(self):
+        def handler(sock, value):
+            if value.get('method') == 'thread-owner-discovery':
+                sock.pending.extend(frame({'type': 'response', 'requestId': value['requestId'], 'resultType': 'error', 'error': 'client-disconnected'})); return True
+        fake, channel = self.connect(FakeSocket(handler))
+        with channel:
+            with self.assertRaises(ipc.DesktopConnectionInterrupted):
+                channel.discover()
+        self.assertFalse(any(row.get('method') == 'thread-follower-start-turn' for row in fake.sent))
+
+    def test_status_session_deadline_expires_before_any_desktop_bytes(self):
+        fake, channel = self.connect()
+        channel.deadline = 99
+        with patch.object(ipc.time, 'monotonic', return_value=100):
+            with self.assertRaises(ipc.DesktopConnectionInterrupted):
+                with channel:
+                    pass
+        self.assertEqual(fake.sent, [])
+        self.assertTrue(fake.closed)
 
     def test_other_peer_uid_is_rejected_before_initialization(self):
         fake, channel = self.connect()
@@ -226,6 +253,53 @@ class DesktopIPCTests(unittest.TestCase):
         fake, channel = self.connect()
         with channel:
             fake.pending.extend(struct.pack('<I', ipc.MAX_FRAME + 1))
+            with self.assertRaises(ControlError): channel._receive(10**12)
+
+    def test_long_conversation_snapshot_is_reduced_to_metadata(self):
+        fake = LargeFrameSocket()
+        fake.state['turns'][0]['items'][0]['text'] = 'PRIVATE BODY ' * 700000
+        self.assertGreater(len(frame(fake.snapshot())) - 4, ipc.MAX_FRAME)
+        fake, channel = self.connect(fake)
+        with channel:
+            metadata = channel.runtime_snapshot()
+        self.assertEqual(metadata['last_turn'], {'turnId': 'turn-one', 'status': 'completed'})
+        self.assertEqual(metadata['model'], 'test-model')
+        self.assertNotIn('PRIVATE BODY', json.dumps(metadata))
+        self.assertTrue(fake.closed)
+        self.assertFalse(fake.sent[-1]['params']['following'])
+        self.assertNotIn('thread-follower-start-turn', [row.get('method') for row in fake.sent])
+
+    def test_long_stream_budget_requires_the_requested_thread_and_owner(self):
+        fake, channel = self.connect(LargeFrameSocket())
+        with channel:
+            channel.runtime_snapshot()
+            for wrong_owner in (True, False):
+                wrong = fake.snapshot()
+                wrong['params']['change']['conversationState'] = {'body': 'private ' * 1100000}
+                if wrong_owner: wrong['sourceClientId'] = OTHER
+                else: wrong['params']['conversationId'] = 'other-thread'
+                fake.pending.extend(frame(wrong))
+                with self.assertRaises(ControlError): channel._receive(10**12)
+
+    def test_late_long_stream_is_consumed_before_rpc_without_raising_rpc_limit(self):
+        fake, channel = self.connect(LargeFrameSocket())
+        with channel:
+            channel.runtime_snapshot()
+            late = fake.snapshot()
+            late['params']['change'] = {'type': 'patches', 'revision': 8, 'patches': [{'body': 'private ' * 1100000}]}
+            fake.pending.extend(frame(late))
+            self.assertEqual(channel.read_settings(), {'resumeState': 'resumed'})
+            fake.pending.extend(frame({'type': 'response', 'result': {'body': 'private ' * 1100000}}))
+            with self.assertRaises(ControlError): channel._receive(10**12)
+        self.assertEqual(sum(row.get('method') == 'thread-follower-read-model-settings' for row in fake.sent), 1)
+
+    def test_snapshot_stream_retains_finite_header_limit_and_invalid_json_rejection(self):
+        fake, channel = self.connect()
+        with channel:
+            channel.runtime_snapshot()
+            fake.pending.extend(struct.pack('<I', ipc.MAX_STREAM_FRAME + 1))
+            with self.assertRaises(ControlError): channel._receive(10**12)
+            fake.pending.extend(struct.pack('<I', 2) + b'{{')
             with self.assertRaises(ControlError): channel._receive(10**12)
 
 

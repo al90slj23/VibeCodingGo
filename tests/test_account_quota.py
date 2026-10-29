@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from vibecue.account_quota import (CodexQuotaProcess, FRESH_SECONDS, QuotaError,
                                    QuotaStore, account_identity, build_snapshot,
-                                   quota_buckets, quota_window, read_current)
+                                   quota_buckets, quota_window, read_current,
+                                   merge_shared_accounts)
 
 
 def account(email='one@example.com', identifier=None):
@@ -83,6 +84,113 @@ class NormalizationTests(unittest.TestCase):
         row=build_snapshot(before,quota,before,1000)
         self.assertNotIn('PRIVATE',json.dumps(row))
         self.assertNotIn('token',json.dumps(row).lower())
+
+
+class SharedAccountTests(unittest.TestCase):
+    def current(self):
+        row=snapshot()
+        row.update(current_account=True,status='current')
+        return {'accounts':[row],'current_account_key':row['account_key']}
+
+    def shared(self, identifier='account-two', observed=1000):
+        row=snapshot(identifier,'two@example.com',observed)
+        row['source']='ccswitch_quota_bridge'
+        return {'accounts':[row],'errors':[],'configured_count':2,'bridge_status':'ready'}
+
+    def test_two_accounts_are_live_without_changing_current_account(self):
+        result=merge_shared_accounts(self.current(),self.shared(),now=1001)
+        self.assertTrue(result['multi_account_live'])
+        self.assertEqual(result['live_account_count'],2)
+        self.assertEqual(result['current_account_key'],'account:account-one')
+        self.assertFalse(result['accounts'][1]['current_account'])
+        self.assertTrue(result['accounts'][1]['is_live'])
+
+    def test_same_service_account_is_deduplicated_across_sources(self):
+        shared=self.shared('account-one',1001)
+        shared['accounts'][0].update(account_key='ccswitch:local-one',ccswitch_account_id='local-one',email='one@example.com')
+        result=merge_shared_accounts(self.current(),shared,now=1002)
+        self.assertEqual(result['account_count'],1)
+        self.assertTrue(result['accounts'][0]['current_account'])
+        self.assertEqual(result['accounts'][0]['source'],'ccswitch_quota_bridge')
+
+    def test_same_workspace_different_people_are_kept_separate(self):
+        shared=self.shared('account-one',1001)
+        shared['accounts'][0].update(account_key='ccswitch:local-two',ccswitch_account_id='local-two')
+        result=merge_shared_accounts(self.current(),shared,now=1002)
+        self.assertEqual(result['live_account_count'],2)
+        self.assertEqual(result['account_count'],2)
+        second=next(row for row in result['accounts'] if row['account_key']=='ccswitch:local-two')
+        self.assertEqual(second['email'],'two@example.com')
+        self.assertFalse(second['current_account'])
+
+    def test_shared_failure_aliases_only_the_matching_workspace_and_user(self):
+        shared={'accounts':[],'identities':[{'account_key':'ccswitch:local-one','account_id':'account-one','email':'one@example.com'}],
+                'errors':[{'account_key':'ccswitch:local-one','message':'Read failed'}]}
+        result=merge_shared_accounts(self.current(),shared,now=1001)
+        self.assertEqual(result['account_count'],1)
+        self.assertTrue(result['accounts'][0]['is_live'])
+
+    def test_ccswitch_failure_does_not_hide_other_accounts_or_use_old_quota_as_live(self):
+        shared=self.shared()
+        shared['errors']=[{'account_key':'account:account-two','label':'two@example.com','message':'Read failed'}]
+        result=merge_shared_accounts(self.current(),shared,now=1001)
+        self.assertEqual(result['live_account_count'],1)
+        second=next(row for row in result['accounts'] if row['account_key']=='account:account-two')
+        self.assertFalse(second['is_live'])
+        self.assertIn('read_error',second)
+
+    def test_account_without_first_success_still_appears_with_reason(self):
+        shared={'accounts':[],'errors':[{'account_key':'account:account-two','label':'two@example.com','message':'Read failed'}],
+                'configured_count':2,'bridge_status':'ready'}
+        result=merge_shared_accounts(self.current(),shared,now=1001)
+        self.assertEqual(result['account_count'],2)
+        second=result['accounts'][1]
+        self.assertEqual((second['status'],second['buckets']),('unavailable',[]))
+
+    def test_direct_current_read_can_remain_live_when_its_shared_read_fails(self):
+        shared={'accounts':[],'errors':[{'account_key':'account:account-one','message':'Read failed'}]}
+        result=merge_shared_accounts(self.current(),shared,now=1001)
+        self.assertEqual(result['live_account_count'],1)
+
+    def test_expired_source_and_elapsed_reset_never_show_live(self):
+        for kind in ('expired','reset'):
+            shared=self.shared()
+            if kind=='expired':shared['accounts'][0]['expires_at']=900
+            else:shared['accounts'][0]['buckets'][0]['windows'][0]['resets_at']=999
+            result=merge_shared_accounts(self.current(),shared,now=1001)
+            self.assertEqual(result['live_account_count'],1)
+            self.assertFalse(result['multi_account_live'])
+
+    def test_expired_export_retains_a_numeric_history_without_claiming_live(self):
+        shared=self.shared()
+        shared['history']=shared.pop('accounts')
+        shared['errors']=[{'account_key':'account:account-two','message':'Snapshot expired'}]
+        result=merge_shared_accounts(self.current(),shared,now=1201)
+        row=next(row for row in result['accounts'] if row['account_key']=='account:account-two')
+        self.assertFalse(row['is_live'])
+        self.assertEqual(row['buckets'][0]['windows'][0]['remaining_percent'],75)
+
+    def test_cli_status_reads_two_shared_accounts_without_running_a_login_helper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            exported=root/'shared.json'
+            now=int(time.time())
+            rows=[{'ccswitch_account_id':'local-'+str(index),'account_id':'workspace-'+str(index),
+                   'email':str(index)+'@example.com','success':True,'observed_at':now,
+                   'tiers':[{'name':'seven_day','utilization':index*10,'resets_at':None}]}
+                  for index in (1,2)]
+            exported.write_text(json.dumps({'schema_version':1,'source':'ccswitch_quota_bridge',
+                                            'generated_at':now,'accounts':rows}))
+            exported.chmod(0o600)
+            env=os.environ.copy()
+            env.update(VIBECUE_HOME=str(root/'home'),VIBECUE_CC_SWITCH_QUOTA_FILE=str(exported))
+            command=subprocess.run([sys.executable,'-m','vibecue.account_quota','status'],
+                                   env=env,capture_output=True,text=True,timeout=10,check=True)
+            result=json.loads(command.stdout)
+            self.assertEqual(result['live_account_count'],2)
+            self.assertTrue(result['multi_account_live'])
+            self.assertIsNone(result['current_account_key'])
+            self.assertTrue(all(row['source']=='ccswitch_quota_bridge' for row in result['accounts']))
 
 
 class StoreTests(unittest.TestCase):
