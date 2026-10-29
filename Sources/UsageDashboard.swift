@@ -260,10 +260,15 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var statusInFlight = false
     private var statusRetryAfter: Date?
     private var queryPending = false
+    private var snapshotNeedsRefresh = true
+    private var queryRequiresApply = false
+    private var snapshotApplyCount = 0
+    private var lastPricingSnapshot: NSDictionary?
     private var syncing = false
     private var backendRunning = false
     private var syncMetadata: [String: Any] = [:]
-    private var backgroundTimer: Timer?, visibleTimer: Timer?
+    private var backgroundTimer: Timer?
+    private var visibleLease: CueActivityLease?
     private var backgroundStarted = false, stopped = false
     private var schedule = CueUsageSchedulePreferences()
     private var scheduleObserver: NSObjectProtocol?
@@ -381,7 +386,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit {
-        backgroundTimer?.invalidate(); visibleTimer?.invalidate(); pricingTimer?.invalidate()
+        backgroundTimer?.invalidate(); visibleLease?.cancel(); pricingTimer?.invalidate()
         if let scheduleObserver { NotificationCenter.default.removeObserver(scheduleObserver) }
         hostObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
@@ -407,7 +412,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     }
     func deactivateEmbedded() {
         embeddedVisible = false; heatmap.hidePreview()
-        visibleTimer?.invalidate(); visibleTimer = nil
+        visibleLease?.cancel(); visibleLease = nil
     }
     /// Saved settings refresh the existing page without changing the selected tag.
     func refreshAfterPreferences() {
@@ -421,14 +426,13 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         query(); refreshExchange(); configureVisibleTimer()
     }
     private func configureVisibleTimer() {
-        visibleTimer?.invalidate(); visibleTimer = nil
+        visibleLease?.cancel(); visibleLease = nil
         guard !stopped, let host = presentationWindow, isEmbedded ? embeddedVisible : host.isVisible else { return }
-        let timer = Timer(timeInterval: schedule.displayInterval, repeats: true) { [weak self] _ in
-            guard let self, let host = self.presentationWindow, host.isVisible, !host.isMiniaturized,
-                  !self.isEmbedded || self.embeddedVisible else { return }
-            self.query(); self.refreshExchange()
-        }
-        RunLoop.main.add(timer, forMode: .common); visibleTimer = timer
+        visibleLease = CueActivityScheduler.shared.observe(key: "usage.display:" + home.path, interval: schedule.displayInterval,
+            isActive: { [weak self] in self?.dashboardVisible == true && self?.stopped == false }, tick: { [weak self] in
+                guard let self else { return }
+                self.query(); self.refreshExchange()
+            })
     }
     private func configureBackgroundTimer() {
         backgroundTimer?.invalidate(); backgroundTimer = nil
@@ -456,7 +460,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     func stopBackgroundSync() {
         stopped = true; backgroundStarted = false
         heatmap.hidePreview()
-        backgroundTimer?.invalidate(); backgroundTimer = nil; visibleTimer?.invalidate(); visibleTimer = nil
+        backgroundTimer?.invalidate(); backgroundTimer = nil; visibleLease?.cancel(); visibleLease = nil
         pricingTimer?.invalidate(); pricingTimer = nil; client.stop(); statusClient.stop()
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -465,7 +469,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     }
     func windowWillClose(_ notification: Notification) {
         guard let host = notification.object as? NSWindow, host === presentationWindow else { return }
-        visibleTimer?.invalidate(); visibleTimer = nil; heatmap.hidePreview()
+        visibleLease?.cancel(); visibleLease = nil; heatmap.hidePreview()
     }
     func windowWillMiniaturize(_ notification: Notification) { heatmap.hidePreview() }
     func windowDidResignKey(_ notification: Notification) { heatmap.hidePreview() }
@@ -604,6 +608,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         report["usage_providers_have_their_own_grouping_table"] = paging.currentView == "providers" && paging.table.tableColumns.first?.identifier.rawValue == "provider_name"
         paging.tabs.selectedSegment = 0; paging.configureColumns()
         let overview = paging.metrics.map { $0.value.stringValue }, calendarDays = paging.heatmap.days.count, message = paging.status.stringValue
+        paging.window?.setFrameOrigin(NSPoint(x: -10000, y: -10000)); paging.window?.orderFront(nil)
+        defer { paging.window?.orderOut(nil) }
         paging.queryInFlight = true // Exercise invalidation without starting a worker.
         paging.nextPage()
         report["usage_pagination_changes_only_list_loading"] = paging.page == 2 && paging.rows.isEmpty && paging.pageLabel.stringValue.contains("第 2 页") && paging.metrics.map { $0.value.stringValue } == overview && paging.heatmap.days.count == calendarDays && paging.status.stringValue == message
@@ -615,18 +621,33 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         embedded.backgroundStarted = true
         embedded.backgroundTimer = Timer(timeInterval: 600, repeats: false) { _ in }
         let background = embedded.backgroundTimer
-        embedded.activateEmbedded(); let displayTimer = embedded.visibleTimer
+        embedded.activateEmbedded(); let displayTimer = embedded.visibleLease
         embedded.deactivateEmbedded()
         report["usage_embedded_page_retains_canvas_and_uses_main_host"] = embedded.embeddedContentView() === canvas && embedded.presentationWindow === host && embedded.window?.contentView !== canvas
-        report["usage_hidden_tag_stops_display_refresh_without_stopping_collector"] = displayTimer != nil && displayTimer?.isValid == false && embedded.visibleTimer == nil && embedded.backgroundStarted && embedded.backgroundTimer === background
+        report["usage_hidden_tag_stops_display_refresh_without_stopping_collector"] = displayTimer != nil && displayTimer?.isValid == false && embedded.visibleLease == nil && embedded.backgroundStarted && embedded.backgroundTimer === background
         var visits: [String] = []
         embedded.onNavigateAccounts = { visits.append("accounts") }; embedded.onNavigatePreferences = { visits.append("preferences") }
         embedded.showAccounts(); embedded.showMoneyPreferences()
         report["usage_navigation_buttons_reuse_main_panel_tags"] = visits == ["accounts", "preferences"] && embedded.accountController == nil && embedded.preferencesController == nil
         embedded.schedule = CueUsageSchedulePreferences(autoSync: false)
         embedded.refreshAfterPreferences()
-        report["usage_saved_settings_do_not_activate_hidden_statistics_tag"] = !embedded.embeddedVisible && embedded.visibleTimer == nil && embedded.queryPending
+        report["usage_saved_settings_do_not_activate_hidden_statistics_tag"] = !embedded.embeddedVisible && embedded.visibleLease == nil && !embedded.queryPending && embedded.snapshotNeedsRefresh
         embedded.backgroundTimer?.invalidate(); embedded.backgroundTimer = nil; embedded.pricingTimer?.invalidate(); embedded.pricingTimer = nil; embedded.backgroundStarted = false
+        let unchanged = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
+        let renders = unchanged.snapshotApplyCount
+        let original = unchanged.snapshot
+        var progress = original; progress["sync"] = ["running": false, "files_scanned": 33, "last_synced_at": Date().timeIntervalSince1970]
+        report["usage_unchanged_snapshot_does_not_rebuild_native_chart_or_table"] = !unchanged.applyQuerySnapshot(original) && unchanged.snapshotApplyCount == renders
+        report["usage_progress_only_change_does_not_rebuild_native_content"] = !unchanged.applyQuerySnapshot(progress) && unchanged.snapshotApplyCount == renders
+        var changed = progress; var summary = changed["summary"] as? [String: Any] ?? [:]
+        summary["requests"] = 123456; changed["summary"] = summary
+        report["usage_real_data_change_still_updates_native_content"] = unchanged.applyQuerySnapshot(changed) && unchanged.snapshotApplyCount == renders + 1
+        unchanged.queryInFlight = false; unchanged.queryPending = false; unchanged.window?.orderOut(nil)
+        unchanged.query()
+        report["usage_hidden_query_marks_dirty_without_starting_worker"] = unchanged.snapshotNeedsRefresh && !unchanged.queryInFlight && !unchanged.queryPending
+        let sameMoney: [String: Any] = ["prefs": ["currency": "CNY"], "fx": ["rate": 7.1, "date": "2026-10-29", "refresh_due": false]]
+        var laterMoney = sameMoney; laterMoney["fx"] = ["rate": 7.1, "date": "2026-10-29", "refresh_due": true, "attempted_at": 1]
+        report["usage_fx_schedule_only_change_does_not_requery_history"] = moneyDisplaySnapshot(sameMoney).isEqual(moneyDisplaySnapshot(laterMoney))
         host.contentView = nil
         return report
     }
@@ -793,8 +814,9 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         // Automatic display refresh during import only needs progress. Keep a
         // deliberate filter/page change responsive via the normal query path.
         if !invalidate && (syncing || backendRunning) { pollSyncStatus(); return }
+        if invalidate { queryID += 1; snapshotNeedsRefresh = true; queryRequiresApply = true }
+        guard dashboardVisible else { snapshotNeedsRefresh = true; return }
         if invalidate {
-            queryID += 1
             // The old numbers describe the previous filter. Do not present
             // them under a new range or a newly selected table's columns.
             rows = []; table.reloadData()
@@ -803,9 +825,15 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             previous.isEnabled = false; next.isEnabled = false
             if !tableOnly { status.stringValue = "正在查询所选范围…"; status.textColor = .secondaryLabelColor }
         }
-        guard !queryInFlight else { queryPending = true; return }
-        queryInFlight = true
-        let identifier = queryID
+        guard !queryInFlight else {
+            // A display tick arriving during an unchanged read is already
+            // covered by that result. Only a real invalidation needs a sequel.
+            if snapshotNeedsRefresh { queryPending = true }
+            return
+        }
+        queryInFlight = true; snapshotNeedsRefresh = false
+        let identifier = queryID, forceApply = queryRequiresApply
+        queryRequiresApply = false
         var arguments = ["query", "--range", selected(range), "--app", selected(app), "--provider", selected(provider), "--model", selected(model), "--source", selected(source), "--status", selected(statusFilter), "--heatmap-weeks", String(heatmapWeeks), "--page", String(page), "--page-size", String(pageSize), "--view", currentView]
         if selected(range) == "custom", let start = selectedStart, let end = selectedEnd { arguments += ["--start-date", start, "--end-date", end] }
         client.run(arguments) { [weak self] result in
@@ -813,7 +841,17 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             self.queryInFlight = false
             if self.queryID == identifier {
                 switch result {
-                case .success(let data): self.queryError = ""; self.apply(data)
+                case .success(let data):
+                    self.queryError = ""
+                    if self.dashboardVisible { self.applyQuerySnapshot(data, force: forceApply) }
+                    else {
+                        // A result may arrive after a tag switch. Keep numeric
+                        // state, but defer native layout until the page is shown.
+                        self.snapshot = data; self.readSync(data)
+                        if self.backgroundStarted { self.configureBackgroundTimer() }
+                        self.readPricingSchedule(data["money"] as? [String: Any] ?? [:])
+                        self.snapshotNeedsRefresh = true; self.queryRequiresApply = true
+                    }
                 case .failure(let error): self.queryError = error.localizedDescription
                 }
                 self.updateStatus()
@@ -822,6 +860,24 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             if self.queryPending { self.queryPending = false; self.query() }
         }
     }
+    /// Progress metadata does not invalidate the expensive native table/chart.
+    @discardableResult private func applyQuerySnapshot(_ data: [String: Any], force: Bool = false) -> Bool {
+        var previous = snapshot, incoming = data
+        previous.removeValue(forKey: "sync"); incoming.removeValue(forKey: "sync")
+        guard force || !NSDictionary(dictionary: previous).isEqual(to: incoming) else {
+            snapshot = data; readSync(data)
+            if backgroundStarted { configureBackgroundTimer() }
+            readPricingSchedule(data["money"] as? [String: Any] ?? [:])
+            updateStatus(); return false
+        }
+        apply(data); return true
+    }
+    private static func moneyDisplaySnapshot(_ data: [String: Any]) -> NSDictionary {
+        let fx = data["fx"] as? [String: Any] ?? [:]
+        var visible: [String: Any] = [:]
+        for key in ["rate", "date", "source", "stale", "error", "mode"] { if let value = fx[key] { visible[key] = value } }
+        return NSDictionary(dictionary: ["prefs": data["prefs"] as? [String: Any] ?? [:], "fx": visible])
+    }
     private func readSync(_ data: [String: Any]) {
         let sync = data["sync"] as? [String: Any] ?? [:]
         syncMetadata = sync; backendRunning = sync["running"] as? Bool ?? false
@@ -829,6 +885,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         warnings = (sync["errors"] as? [String] ?? []) + (sync["warnings"] as? [String] ?? [])
     }
     private func apply(_ data: [String: Any]) {
+        snapshotApplyCount += 1
         snapshot = data; readSync(data)
         if backgroundStarted { configureBackgroundTimer() }
         readPricingSchedule(data["money"] as? [String: Any] ?? [:])
@@ -865,7 +922,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             metrics[5].value.toolTip = (metrics[5].value.toolTip ?? "") + "\n缓存汇率，可能已过期。" + (fx["error"] as? String ?? "")
             if currency != "USD" { metrics[5].detail.stringValue += " · 缓存汇率" }
         }
-        heatmap.days = data["days"] as? [[String: Any]] ?? []
+        let incomingDays = data["days"] as? [[String: Any]] ?? []
+        if !NSArray(array: heatmap.days).isEqual(to: incomingDays) { heatmap.days = incomingDays }
         heatmap.trendGranularity = data["trend_granularity"] as? String ?? "day"
         heatmap.trendPoints = data["trend_points"] as? [[String: Any]]
         heatmap.currency = currency
@@ -878,7 +936,9 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         let counts = data["group_counts"] as? [String: Any] ?? [:]
         for (index, item) in ["logs", "providers", "models", "sources"].enumerated() { tabs.setLabel(["请求日志", "供应商", "模型", "来源"][index] + ((counts[item] as? NSNumber).map { " \(Self.compact($0.doubleValue))" } ?? ""), forSegment: index) }
         tabs.toolTip = ["logs", "providers", "models", "sources"].enumerated().map { index, key in ["请求日志", "供应商", "模型", "来源"][index] + "：" + ((counts[key] as? NSNumber).map { Self.integer($0.doubleValue) } ?? "—") }.joined(separator: "\n")
-        rows = data[currentView] as? [[String: Any]] ?? []
+        let incomingRows = data[currentView] as? [[String: Any]] ?? []
+        let tableChanged = !NSArray(array: rows).isEqual(to: incomingRows)
+        rows = incomingRows
         // Give complete currency strings their measured native column width;
         // horizontal scrolling is preferable to silently clipping an amount.
         if let column = table.tableColumns.first(where: { $0.identifier.rawValue == "cost" }) {
@@ -899,7 +959,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         columnsButton.isEnabled = currentView == "logs"; statusFilter.isEnabled = true
         moreHistory.isEnabled = heatmapWeeks < 530 && heatRange["has_older"] as? Bool != false
         detail.stringValue = rows.isEmpty ? "当前筛选暂无记录。可点“立即同步”，或查看“数据说明”。" : "用量来自本机历史与 CC Switch 数值记录；未记录的字段不推断。"
-        table.reloadData()
+        if tableChanged { table.reloadData() }
         layout()
     }
     private func updateStatus() {
@@ -1018,13 +1078,24 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
                 self.pricingScheduleKnown = true; self.pricingRetryAfter = Date().addingTimeInterval(900)
                 self.pricingNextRefreshAt = self.pricingRetryAfter; self.configurePricingTimer()
             }
-            self.query(); self.usageDidChange?()
+            if case .success(let data) = result {
+                let next = NSDictionary(dictionary: ["pricing": data["pricing"] ?? [], "display": Self.moneyDisplaySnapshot(data)])
+                let changed = self.lastPricingSnapshot?.isEqual(next) != true
+                self.lastPricingSnapshot = next
+                if changed { self.query(invalidate: true); self.usageDidChange?() }
+            }
         }
     }
     private func refreshExchange() {
-        guard !exchangeRefreshing, Date().timeIntervalSince(lastExchangeRefresh) > 900 else { return }
+        guard !stopped, !exchangeRefreshing, Date().timeIntervalSince(lastExchangeRefresh) > 900 else { return }
         exchangeRefreshing = true; lastExchangeRefresh = Date()
-        client.run(["refresh"], module: "vibecue.usage_money") { [weak self] _ in self?.exchangeRefreshing = false; self?.query(); self?.usageDidChange?() }
+        client.run(["refresh"], module: "vibecue.usage_money") { [weak self] result in
+            guard let self, !self.stopped else { return }; self.exchangeRefreshing = false
+            if case .success(let data) = result,
+               !Self.moneyDisplaySnapshot(self.snapshot["money"] as? [String: Any] ?? [:]).isEqual(Self.moneyDisplaySnapshot(data)) {
+                self.query(invalidate: true); self.usageDidChange?()
+            }
+        }
     }
     @objc private func showInfo() {
         let sync = snapshot["sync"] as? [String: Any] ?? [:]
@@ -1175,6 +1246,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         }
         // Preserve an active filter even if the new result has no matching rows.
         if choice != "all", items[choice] == nil { items[choice] = popup.titleOfSelectedItem ?? choice; order.append(choice) }
+        let existing = popup.itemArray.compactMap { $0.representedObject as? String }
+        if existing == order && popup.itemArray.map(\.title) == order.map({ items[$0] ?? $0 }) { return }
         fill(popup, items, order: order, selected: choice)
     }
     private func fill(_ popup: NSPopUpButton, _ items: [String: String], order: [String]? = nil, selected: String) {

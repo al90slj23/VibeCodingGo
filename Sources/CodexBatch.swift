@@ -6,7 +6,7 @@ struct CueBatchTarget {
     let title: String
     init?(threadID: String, title: String, provider: String = "codex") {
         guard provider == "codex", !threadID.isEmpty, threadID.count <= 160,
-              threadID.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0) }) else { return nil }
+              CueIdentifier.isValid(threadID) else { return nil }
         self.threadID = threadID; self.title = String(title.prefix(180))
     }
     static func unique(_ values: [CueBatchTarget]) -> [CueBatchTarget] {

@@ -293,6 +293,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     private var runningTaskSnapshot = Data()
     lazy var recentHistory = CueRecentHistory(home: home)
     var shortcutMenu: NSMenu?
+    private var shortcutMenuDirty = true
+    private let watcherSnapshots = CueJSONSnapshotReader()
+    private let eventInbox = CueEventInboxReader()
+    private let diagnosticQueue = DispatchQueue(label: "local.vibecue.diagnostics", qos: .utility)
+    private var diagnosticWrite: DispatchWorkItem?
+    private var menuRebuilds = 0
+    private var lastStatusItemTitle: NSAttributedString?
+    private var lastStatusItemTooltip = ""
     var statusPopover: NSPopover?
     var statusPopoverController: CueStatusPopoverController?
     var usageDashboard: CueUsageDashboardController?
@@ -311,7 +319,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var codexConnectionSummary = "正在自动连接 Codex…"
     var approvalLauncher: Process?
     var approvalLaunchLog: FileHandle?
-    var readTimer: Timer?
+    var readTimer: CueActivityLease?
+    private var diagnosticsLease: CueActivityLease?
     var pulseTimer: Timer?
     var effectFrameRate = 0.0
     var nextEffectTelemetry = Date.distantPast
@@ -413,8 +422,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         updateWatcherHealth()
         refreshMenu()
         recoverInflight()
-        readTimer = Timer.scheduledTimer(timeInterval: 0.5, target: self, selector: #selector(scanEvents), userInfo: nil, repeats: true)
-        RunLoop.main.add(readTimer!, forMode: .common)
+        readTimer = CueActivityScheduler.shared.observe(key: "application.event-inbox", interval: 0.5, isActive: { [weak self] in self?.shuttingDown == false }) { [weak self] in self?.scanEvents() }
+        diagnosticsLease = CueActivityScheduler.shared.observe(key: "application.diagnostics", interval: 5, isActive: { [weak self] in self?.shuttingDown == false }) { [weak self] in self?.writeStatus() }
         monitorObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, let current = self.current else { return }
             self.makeWindows(for: current)
@@ -463,35 +472,21 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
 
     @objc func scanEvents() {
-        let settingsRequest = home.appendingPathComponent("settings.request")
-        if FileManager.default.fileExists(atPath: settingsRequest.path) {
-            try? FileManager.default.removeItem(at: settingsRequest)
-            openSettings()
-        }
+        guard !shuttingDown else { return }
         if nextHealthCheck <= Date() { updateWatcherHealth() }
         if let until = pausedUntil, until <= Date() { pausedUntil = nil; refreshMenu(); writeStatus() }
-        guard let files = try? FileManager.default.contentsOfDirectory(at: eventsDirectory, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else { return }
-        var batch: [Data] = []
-        for file in files.filter({ $0.pathExtension == "json" }).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).prefix(100) {
-            guard let properties = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
-                  properties.isRegularFile == true, properties.isSymbolicLink != true,
-                  let size = properties.fileSize, size <= 1_048_576 else { continue }
-            let claim = inflightDirectory.appendingPathComponent(UUID().uuidString + ".json")
-            do {
-                try FileManager.default.moveItem(at: file, to: claim)
-                defer { try? FileManager.default.removeItem(at: claim) }
-                batch.append(try Data(contentsOf: claim))
-            } catch { /* Another process may have moved the file. */ }
+        eventInbox.read(home: home, events: eventsDirectory, inflight: inflightDirectory, synchronous: !ownsLock) { [weak self] batch in
+            guard let self, !self.shuttingDown else { return }
+            if batch.settingsRequested { self.openSettings() }
+            // Process resolutions before alerts from the same claimed batch.
+            for (_, data) in batch.rows { if let resolution = CueResolution(data) { self.applyResolution(resolution, resume: false) } }
+            for (_, data) in batch.rows {
+                guard let event = CueEvent(data), abs(event.date.timeIntervalSinceNow) <= 120, !self.resolutions.contains(event.id) else { continue }
+                self.enqueue(event)
+            }
+            self.eventInbox.acknowledge(batch, home: self.home, synchronous: !self.ownsLock)
+            if self.current == nil, self.pausedUntil == nil { self.showNext() }
         }
-        // Resolve controls first: a request approved before this poll must never
-        // briefly play a stale alert simply because its show file sorted first.
-        for data in batch { if let resolution = CueResolution(data) { applyResolution(resolution, resume: false) } }
-        for data in batch {
-            guard let event = CueEvent(data), abs(event.date.timeIntervalSinceNow) <= 120,
-                  !resolutions.contains(event.id) else { continue }
-            enqueue(event)
-        }
-        if current == nil, pausedUntil == nil { showNext() }
     }
 
     func applyResolution(_ resolution: CueResolution, resume: Bool = true) {
@@ -725,7 +720,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     @discardableResult
     func open(event: CueEvent) -> Bool {
         guard event.provider == "codex", !event.threadID.isEmpty,
-              event.threadID.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_" )).contains($0) }) else { return false }
+              CueIdentifier.isValid(event.threadID) else { return false }
         var components = URLComponents()
         components.scheme = "codex"; components.host = "threads"; components.path = "/" + event.threadID
         guard let url = components.url, openConversationURL(url) else { return false }
@@ -929,6 +924,18 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func updateWatcherHealth() {
         nextHealthCheck = Date().addingTimeInterval(2)
+        let path = home.appendingPathComponent("watcher-state.json")
+        if ownsLock {
+            watcherSnapshots.read(path, limit: 2_097_152) { [weak self] state in
+                guard let self, !self.shuttingDown else { return }
+                self.applyWatcherHealth(state)
+            }
+        } else {
+            let data = try? Data(contentsOf: path)
+            applyWatcherHealth(data.flatMap { $0.count <= 2_097_152 ? (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] : nil } ?? [:])
+        }
+    }
+    private func applyWatcherHealth(_ loadedState: [String: Any]) {
         var message = "监控进程未连接"
         let previousManual = manualApprovalConnected
         let previousConnection = codexConnectionState + codexConnectionSummary
@@ -952,9 +959,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             default: break
             }
         }
-        let path = home.appendingPathComponent("watcher-state.json")
-        let savedData = try? Data(contentsOf: path)
-        var state = savedData.flatMap { $0.count <= 2_097_152 ? (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] : nil } ?? [:]
+        var state = loadedState
         var live = false
         if
            state["running"] as? Bool == true,
@@ -1244,6 +1249,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     func refreshMenu() {
         guard statusItem != nil else { return }
         writeModelSettingsTargets()
+        shortcutMenuDirty = true
+        refreshStatusItem()
+        if statusPopover?.isShown == true { updateStatusPopover() }
+        settingsPanel?.updateEmbeddedTasks()
+    }
+    private func rebuildShortcutMenuIfNeeded() {
+        guard shortcutMenuDirty || shortcutMenu == nil else { return }
+        shortcutMenuDirty = false; menuRebuilds += 1
         let menu = NSMenu(), remindersMenu = NSMenu(), codingMenu = NSMenu(), testMenu = NSMenu()
         func command(_ title: String, _ action: Selector, in parent: NSMenu) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -1300,7 +1313,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 item.target = self; item.representedObject = event.id; item.isEnabled = record.canOpen
                 item.toolTip = "\(event.label) · \(event.title)"; codingMenu.addItem(item)
             }
-            let snapshot = CueStatusListSnapshot(records: recentHistory.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: recentHistory.followups.records)
+            let snapshot = CueStatusListSnapshot(records: recentHistory.displayRecords, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: recentHistory.followups.records, recordsAreConversations: true)
             let pinned = snapshot.pinned
             if !pinned.isEmpty { heading("置顶提醒 · \(pinned.count) 条"); pinned.forEach(reminder) }
             let pinnedFollowups = snapshot.pinnedFollowups
@@ -1346,18 +1359,17 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let exit = NSMenuItem(title: "结束 VibeCoding Go", action: #selector(quit), keyEquivalent: "q")
         exit.target = self; menu.addItem(exit)
         shortcutMenu = menu
-        refreshStatusItem()
-        if statusPopover?.isShown == true { updateStatusPopover() }
     }
 
     private func writeModelSettingsTargets() {
         // IDs only. This tells the existing read-only subscription which
         // retained list entries need current settings, including older chats.
-        let requested = runningTasks.map(\.threadID) + recentHistory.records.filter(\.isPinned).map { $0.event.threadID }
+        let conversations = recentHistory.displayRecords
+        let requested = runningTasks.map(\.threadID) + conversations.filter(\.isPinned).map { $0.event.threadID }
             + recentHistory.followups.records.map(\.threadID) + interruptedTasks.map(\.threadID)
-            + recentHistory.records.map { $0.event.threadID }
+            + conversations.map { $0.event.threadID }
         var seen = Set<String>()
-        let ids = Array(requested.filter { CueThreadFollowups.valid($0) && seen.insert($0).inserted }.prefix(256))
+        let ids = Array(requested.filter { seen.insert($0).inserted && CueIdentifier.isValid($0) }.prefix(256))
         guard let data = try? JSONSerialization.data(withJSONObject: ["thread_ids": ids], options: [.sortedKeys]), data != modelSettingsTargets else { return }
         let file = home.appendingPathComponent("model-settings-targets.json")
         do {
@@ -1374,9 +1386,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard let button = statusItem?.button else { return }
         let usage = menuUsage?.snapshot ?? CueMenuBarUsage(), work = menuWork
         button.imagePosition = .imageLeading
-        button.attributedTitle = NSAttributedString(string: usage.title(work: work), attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)])
-        button.toolTip = usage.tooltip(work: work, health: watcherHealthText)
-        button.setAccessibilityLabel("VibeCoding Go" + usage.title(work: work))
+        let title = NSAttributedString(string: usage.title(work: work), attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)])
+        if lastStatusItemTitle != title { button.attributedTitle = title; lastStatusItemTitle = title; button.setAccessibilityLabel("VibeCoding Go" + title.string) }
+        let tooltip = usage.tooltip(work: work, health: watcherHealthText)
+        if tooltip != lastStatusItemTooltip { button.toolTip = tooltip; lastStatusItemTooltip = tooltip }
     }
 
     @objc func openAccountQuota() { openWorkspacePage(.accountQuota) }
@@ -1455,9 +1468,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     @objc func toggleStatusPopover(_ sender: NSButton? = nil) {
         guard let button = sender ?? statusItem.button else { return }
-        if NSApp.currentEvent?.type == .rightMouseUp, let menu = shortcutMenu {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            rebuildShortcutMenuIfNeeded()
             statusPopover?.performClose(nil)
-            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+            shortcutMenu?.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
             return
         }
         if statusPopover?.isShown == true { statusPopover?.performClose(nil); writeStatus(); return }
@@ -1488,6 +1502,15 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
 
     func writeStatus() {
+        guard ownsLock else { writeStatusNow(synchronous: true); return }
+        guard !shuttingDown, diagnosticWrite == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.shuttingDown else { return }
+            self.diagnosticWrite = nil; self.writeStatusNow(synchronous: false)
+        }
+        diagnosticWrite = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+    }
+    private func writeStatusNow(synchronous: Bool) {
         let data: [String: Any] = ["pid": ProcessInfo.processInfo.processIdentifier, "muted": muted,
             "paused_until": pausedUntil?.timeIntervalSince1970 ?? 0,
             "current_id": current?.id ?? "", "current_kind": current?.kind ?? "",
@@ -1524,10 +1547,13 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
             "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
             "codex_connection_state": codexConnectionState, "codex_connection_summary": codexConnectionSummary,
+            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
-        if let json = try? JSONSerialization.data(withJSONObject: data, options: [.sortedKeys]) {
-            try? json.write(to: home.appendingPathComponent("app-status.json"), options: .atomic)
+        let destination = home.appendingPathComponent("app-status.json")
+        let write = {
+            if let json = try? JSONSerialization.data(withJSONObject: data, options: [.sortedKeys]) { try? json.write(to: destination, options: .atomic) }
         }
+        if synchronous { write() } else { diagnosticQueue.async(execute: write) }
     }
 
     func captureBanner(to path: String) {
@@ -1554,7 +1580,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         watcherRestartTimer?.invalidate()
         if let process = watcherProcess, process.isRunning { process.terminate() }
         if historyScopeActive { historyURL?.stopAccessingSecurityScopedResource() }
-        readTimer?.invalidate(); hideWindows()
+        readTimer?.cancel(); diagnosticsLease?.cancel(); diagnosticWrite?.cancel(); diagnosticWrite = nil; diagnosticQueue.sync {}; hideWindows()
         if let monitorObserver { NotificationCenter.default.removeObserver(monitorObserver) }
         try? FileManager.default.removeItem(at: home.appendingPathComponent("app-status.json"))
         if lockFD >= 0 { flock(lockFD, LOCK_UN); Darwin.close(lockFD) }
@@ -1750,7 +1776,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         if !wasVisible { activateCurrentEmbedded() }
     }
     func updateEmbeddedTasks() {
-        guard let taskController else { return }
+        guard page == CueWorkspacePage.codingTasks.rawValue, window?.isVisible == true, !window!.isMiniaturized, let taskController else { return }
         cue.populateTaskController(taskController, maximumHeight: max(430, pageScroll.contentSize.height))
     }
     private func embeddedPage(_ route: CueWorkspacePage) -> NSView? {
@@ -2293,6 +2319,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func updateHealth() {
+        guard window?.isVisible == true, window?.isMiniaturized == false else { return }
         updateEmbeddedTasks()
         codingConnectionLabel?.stringValue = cue.codexConnectionSummary
         codingConnectionLabel?.textColor = cue.codexConnectionState == "connected" ? .secondaryLabelColor : .systemOrange
@@ -2449,6 +2476,19 @@ if let index = CommandLine.arguments.firstIndex(of: "--ccswitch-system-action"),
     exit(0)
 }
 
+if CommandLine.arguments.contains("--ui-performance-measure") {
+    _ = NSApplication.shared
+    var checks = CueActivityScheduler.validationReport()
+    checks.merge(CueWorkPipelineChecks.validationReport()) { _, new in new }
+    let measurement = CueStatusPopoverController.performanceMeasurement()
+    checks["unchanged_list_does_not_rebuild"] = measurement["diff_rebuilds"] as? Int == 0
+    checks["unchanged_list_does_not_rerender_rows"] = measurement["diff_row_refreshes"] as? Int == 0
+    checks["unchanged_list_retains_document"] = measurement["document_retained"] as? Bool == true
+    let result: [String: Any] = ["checks": checks, "measurement": measurement]
+    print(String(data: try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(checks.values.allSatisfy { $0 } ? 0 : 1)
+}
+
 if CommandLine.arguments.contains("--recent-self-test") {
     _ = NSApplication.shared
     let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-recent-integration-" + UUID().uuidString)
@@ -2456,6 +2496,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
     defer { try? FileManager.default.removeItem(at: home) }
     let cue = CueController(); cue.presentsWindows = false; cue.settings.enabled = false
     var results = CueRecentHistory.validationReport()
+    results.merge(CueActivityScheduler.validationReport()) { _, new in new }
     results.merge(CueWorkspacePage.validationReport()) { _, new in new }
     results.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
     results.merge(CueNetworkTestsController.validationReport()) { _, new in new }

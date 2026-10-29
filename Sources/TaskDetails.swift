@@ -438,20 +438,28 @@ final class CueTaskHoverController: NSObject {
     private let text = NSTextView()
     private var showWork: DispatchWorkItem?
     private var hideWork: DispatchWorkItem?
-    private var timer: Timer?
+    private var refreshLease: CueActivityLease?
+    private var scrollLease: CueActivityLease?
+    private let activityKey = "hover:" + UUID().uuidString
+    private var selectionObserver: NSObjectProtocol?
     private var activeThreadID: String?
     private weak var anchor: NSView?
     private var provider: (() -> CueTaskDetail?)?
     private var currentTitle = ""
     private var currentBody = ""
     private var renderedMessages = ""
+    private var hasRenderedMessages = false
+    private var markdownRenderCount = 0
     private var currentDetail = CueTaskDetail(raw: [:])
     private var overRow = false
     private var overPanel = false
     private var previousTick = Date()
-    private var lastRefresh = Date.distantPast
     private var latestMessageRange = NSRange(location: 0, length: 0)
 
+    var performanceSnapshot: [String: Any] {
+        ["visible": isVisible, "markdown_renders": markdownRenderCount,
+         "data_job": refreshLease?.isValid == true, "scroll_job": scrollLease?.isValid == true]
+    }
     var isVisible: Bool { panel?.isVisible == true }
     var isEngaged: Bool { overRow || overPanel || isVisible }
 
@@ -459,10 +467,12 @@ final class CueTaskHoverController: NSObject {
         hideWork?.cancel(); overRow = true
         self.anchor = anchor; self.provider = provider; currentTitle = title
         if activeThreadID == threadID, isVisible {
-            refresh(); if !overPanel { positionPanel() }; return
+            // Pointer reconciliation can call this several times per second.
+            // The shared one-second data job owns refreshes of a stable row.
+            if !overPanel { positionPanel() }; return
         }
         showWork?.cancel(); activeThreadID = threadID
-        if isVisible { panel?.orderOut(nil); timer?.invalidate(); timer = nil }
+        if isVisible { panel?.orderOut(nil); refreshLease?.cancel(); refreshLease = nil; scrollLease?.cancel(); scrollLease = nil }
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.activeThreadID == threadID, self.overRow else { return }
             self.showNow()
@@ -473,10 +483,10 @@ final class CueTaskHoverController: NSObject {
     func leaveRow() { overRow = false; showWork?.cancel(); scheduleHide() }
 
     func hide() {
-        showWork?.cancel(); hideWork?.cancel(); timer?.invalidate(); timer = nil
+        showWork?.cancel(); hideWork?.cancel(); refreshLease?.cancel(); refreshLease = nil; scrollLease?.cancel(); scrollLease = nil
         if let panel { panel.parent?.removeChildWindow(panel); panel.orderOut(nil) }
         provider = nil; anchor = nil; activeThreadID = nil; overRow = false; overPanel = false
-        currentBody = ""; renderedMessages = ""; text.string = ""; currentDetail = CueTaskDetail(raw: [:])
+        currentBody = ""; renderedMessages = ""; hasRenderedMessages = false; text.string = ""; currentDetail = CueTaskDetail(raw: [:])
     }
 
     func refresh() {
@@ -496,6 +506,7 @@ final class CueTaskHoverController: NSObject {
         breakdownField.stringValue = detail.tokenBreakdown
         previewHeading.stringValue = detail.contentTruncated ? "最近对话 · 部分内容" : "最近对话"
         renderMessages(detail.messages)
+        updateScrollActivity()
     }
 
     private func scheduleHide() {
@@ -519,8 +530,8 @@ final class CueTaskHoverController: NSObject {
         surface.material = .popover; surface.blendingMode = .withinWindow; surface.state = .active
         surface.wantsLayer = true; surface.layer?.cornerRadius = 13; surface.layer?.masksToBounds = true
         surface.layer?.borderWidth = 0.7; surface.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.6).cgColor
-        surface.entered = { [weak self] in self?.overPanel = true; self?.hideWork?.cancel() }
-        surface.exited = { [weak self] in self?.overPanel = false; self?.scheduleHide() }
+        surface.entered = { [weak self] in self?.overPanel = true; self?.hideWork?.cancel(); self?.updateScrollActivity() }
+        surface.exited = { [weak self] in self?.overPanel = false; self?.updateScrollActivity(); self?.scheduleHide() }
         window.contentView = surface
         titleField.frame = NSRect(x: 18, y: 14, width: 464, height: 24)
         titleField.font = .systemFont(ofSize: 14, weight: .semibold); titleField.lineBreakMode = .byTruncatingTail
@@ -552,21 +563,23 @@ final class CueTaskHoverController: NSObject {
         footerField.frame = NSRect(x: 18, y: 447, width: 464, height: 17)
         footerField.font = .systemFont(ofSize: 10); footerField.textColor = .tertiaryLabelColor
         for view in [titleField, summaryField, modelField, breakdownField, separator, previewHeading, follow, scroll, footerField] { surface.addSubview(view) }
+        selectionObserver = NotificationCenter.default.addObserver(forName: NSTextView.didChangeSelectionNotification, object: text, queue: .main) { [weak self] _ in self?.updateScrollActivity() }
         panel = window
     }
 
     private func showNow() {
-        makePanel(); currentBody = ""; renderedMessages = ""; refresh(); positionPanel()
+        makePanel(); currentBody = ""; renderedMessages = ""; hasRenderedMessages = false; refresh(); positionPanel()
         guard let panel else { return }
         if let parent = anchor?.window, panel.parent !== parent {
             panel.parent?.removeChildWindow(panel); parent.addChildWindow(panel, ordered: .above)
         }
         // Deliberately no activate/makeKey: showing a tip must not steal typing.
-        panel.orderFrontRegardless(); previousTick = Date(); lastRefresh = Date()
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.tick() }
-        if let timer { RunLoop.main.add(timer, forMode: .common) }
-        scrollToLatestMessage()
+        panel.orderFrontRegardless(); previousTick = Date()
+        refreshLease?.cancel()
+        refreshLease = CueActivityScheduler.shared.observe(key: activityKey + ":data", interval: 1,
+            isActive: { [weak self] in self?.isVisible == true },
+            tick: { [weak self] in self?.refresh() })
+        scrollToLatestMessage(); updateScrollActivity()
     }
 
     private func positionPanel() {
@@ -580,14 +593,19 @@ final class CueTaskHoverController: NSObject {
         x = max(visible.minX + 8, min(x, visible.maxX - size.width - 8))
         let y = max(visible.minY + 8, min(target.maxY - size.height, visible.maxY - size.height - 8))
         panel.level = NSWindow.Level(rawValue: max(NSWindow.Level.popUpMenu.rawValue, window.level.rawValue + 1))
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        let origin = NSPoint(x: x, y: y)
+        if panel.frame.origin != origin { panel.setFrameOrigin(origin) }
     }
 
     private func renderMessages(_ messages: [CueTaskMessage]) {
+        let signature = messages.map { $0.role + "\u{0}" + $0.text + "\u{0}" + ($0.date?.description ?? "") }.joined(separator: "\u{1}")
+        // Compare the bounded source before Markdown parsing or TextKit layout.
+        // The old guard ran after constructing every attributed string.
+        guard !hasRenderedMessages || signature != renderedMessages else { return }
+        hasRenderedMessages = true; markdownRenderCount += 1
         let result = NSMutableAttributedString()
         let date = DateFormatter(); date.locale = Locale(identifier: "zh_CN"); date.dateFormat = "HH:mm:ss"
         let headingStyle = NSMutableParagraphStyle(); headingStyle.paragraphSpacing = 5
-        let signature = messages.map { $0.role + "\u{0}" + $0.text + "\u{0}" + ($0.date?.description ?? "") }.joined(separator: "\u{1}")
         var latest = NSRange(location: 0, length: 0)
         for message in messages {
             latest = NSRange(location: result.length, length: 0)
@@ -600,7 +618,6 @@ final class CueTaskHoverController: NSObject {
         if messages.isEmpty {
             result.append(NSAttributedString(string: "暂未读取到可显示的最近对话。", attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor]))
         }
-        guard signature != renderedMessages || result.string != currentBody else { return }
         let origin = scroll.contentView.bounds.origin
         let wasAtEnd = text.frame.height - scroll.contentView.bounds.maxY < 10
         let selection = text.selectedRange()
@@ -621,11 +638,22 @@ final class CueTaskHoverController: NSObject {
         else { scroll.contentView.scroll(to: scroll.contentView.constrainBoundsRect(NSRect(origin: origin, size: scroll.contentSize)).origin); scroll.reflectScrolledClipView(scroll.contentView) }
     }
 
+    private var canAdvanceScroll: Bool {
+        isVisible && !overPanel && text.selectedRange().length == 0 && scroll.contentView.bounds.origin.y < max(0, text.frame.height - scroll.contentSize.height)
+    }
+    private func updateScrollActivity() {
+        guard canAdvanceScroll else { scrollLease?.cancel(); scrollLease = nil; return }
+        guard scrollLease?.isValid != true else { return }
+        previousTick = Date()
+        scrollLease = CueActivityScheduler.shared.observe(key: activityKey + ":scroll", interval: 0.05,
+            isActive: { [weak self] in self?.canAdvanceScroll == true },
+            tick: { [weak self] in self?.tick() })
+    }
     private func tick() {
-        guard isVisible else { timer?.invalidate(); timer = nil; return }
-        let now = Date(), elapsed = min(0.15, nowInterval(since: previousTick)); previousTick = now
-        if now.timeIntervalSince(lastRefresh) >= 1 { lastRefresh = now; refresh() }
+        guard canAdvanceScroll else { updateScrollActivity(); return }
+        let elapsed = min(0.15, nowInterval(since: previousTick)); previousTick = Date()
         advanceScroll(elapsed: elapsed)
+        if !canAdvanceScroll { updateScrollActivity() }
     }
     private func advanceScroll(elapsed: TimeInterval) {
         guard !overPanel, text.selectedRange().length == 0 else { return }
@@ -650,10 +678,11 @@ final class CueTaskHoverController: NSObject {
         scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, text.frame.height - scroll.contentSize.height)))
         scroll.reflectScrolledClipView(scroll.contentView)
     }
-    @objc private func followLatest() { text.setSelectedRange(NSRange(location: 0, length: 0)); refresh(); scrollToLatestMessage() }
+    @objc private func followLatest() { text.setSelectedRange(NSRange(location: 0, length: 0)); refresh(); scrollToLatestMessage(); updateScrollActivity() }
 
     deinit {
-        showWork?.cancel(); hideWork?.cancel(); timer?.invalidate()
+        showWork?.cancel(); hideWork?.cancel(); refreshLease?.cancel(); scrollLease?.cancel()
+        if let selectionObserver { NotificationCenter.default.removeObserver(selectionObserver) }
         if let panel { panel.parent?.removeChildWindow(panel); panel.orderOut(nil) }
     }
 
@@ -722,6 +751,10 @@ final class CueTaskHoverController: NSObject {
         results.merge(CueTaskUsageSummary.validationReport()) { _, new in new }
         results.merge(CueHoverMarkdown.validationReport()) { _, new in new }
         let hover = CueTaskHoverController(); hover.makePanel(); hover.update(detail: messages, title: "测试标题")
+        let renderedOnce = hover.markdownRenderCount
+        let stableBody = hover.text.textStorage?.copy() as? NSAttributedString
+        for _ in 0..<20 { hover.update(detail: messages, title: "测试标题") }
+        results["task_hover_unchanged_refresh_skips_markdown_and_text_layout"] = hover.markdownRenderCount == renderedOnce && hover.text.textStorage?.isEqual(to: stableBody ?? NSAttributedString()) == true
         results["task_hover_text_is_selectable_and_not_editable"] = hover.text.isSelectable && !hover.text.isEditable
         results["task_hover_initial_update_does_not_make_key"] = hover.panel?.isKeyWindow == false
         results["task_hover_contains_only_visible_conversation"] = hover.currentBody.contains("可见回复") && !hover.currentBody.contains("NOT-VISIBLE")

@@ -1,5 +1,31 @@
 import AppKit
 import Foundation
+import Darwin
+
+/// Titles change much less often than telemetry. Cache the exact same
+/// transliteration result across immutable task snapshots, with a small bound.
+private enum CueTaskTitleKeys {
+    private static let lock = NSLock()
+    private static var values: [String: String] = [:]
+    private static var order: [String] = []
+    private static var hits = 0, misses = 0
+    static func key(_ title: String) -> String {
+        lock.lock()
+        if let value = values[title] { hits += 1; lock.unlock(); return value }
+        lock.unlock()
+        let value = (title.applyingTransform(.toLatin, reverse: false) ?? title)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        lock.lock(); defer { lock.unlock() }
+        if let existing = values[title] { hits += 1; return existing }
+        if order.count >= 512 { values.removeValue(forKey: order.removeFirst()) }
+        values[title] = value; order.append(title); misses += 1
+        return value
+    }
+    static var metrics: [String: Int] {
+        lock.lock(); defer { lock.unlock() }
+        return ["entries": values.count, "capacity": 512, "hits": hits, "misses": misses]
+    }
+}
 
 /// A live navigation target from the watcher, separate from the alert ledger.
 struct CueRunningTask {
@@ -16,14 +42,13 @@ struct CueRunningTask {
 
     init?(raw: [String: Any]) {
         guard let threadID = raw["thread_id"] as? String, !threadID.isEmpty, threadID.count <= 160,
-              threadID.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0) }),
+              CueIdentifier.isValid(threadID),
               (raw["provider"] as? String ?? "codex") == "codex",
               let startDate = Self.date(raw["started_at"]),
               let updatedDate = Self.date(raw["last_activity"]) else { return nil }
         self.threadID = threadID
         self.title = String((raw["title"] as? String ?? "Codex 对话").prefix(180))
-        self.titleSortKey = (self.title.applyingTransform(.toLatin, reverse: false) ?? self.title)
-            .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        self.titleSortKey = CueTaskTitleKeys.key(self.title)
         self.provider = "codex"; self.startDate = startDate; self.updatedDate = updatedDate
         self.turnID = String((raw["turn_id"] as? String ?? "").prefix(160))
         self.recoveryStatus = ["interrupted", "unconfirmed"].contains(raw["status"] as? String ?? "") ? (raw["status"] as? String ?? "") : "running"
@@ -42,6 +67,8 @@ struct CueRunningTask {
     var recoveryLabel: String { recoveryStatus == "interrupted" ? "中断待续" : "运行待确认" }
     var navigationID: String { "\(needsRecovery ? "interrupted" : "running"):\(threadID)" }
     var ephemeralCueEvent: CueEvent { CueEvent(runningThreadID: threadID, title: title, date: startDate) }
+
+    static var titleKeyCacheMetrics: [String: Int] { CueTaskTitleKeys.metrics }
 
     /// Shared by the popover and shortcut menu. Activity updates never move a
     /// row; Chinese titles use pinyin and numeric suffixes follow Finder order.
@@ -66,8 +93,8 @@ struct CueStatusListSnapshot {
     var rowCount: Int { pinned.count + pinnedFollowups.count + running.count + interrupted.count + followups.count + ordinary.count }
     var sectionCount: Int { [!pinned.isEmpty || !pinnedFollowups.isEmpty, !running.isEmpty, !interrupted.isEmpty, !followups.isEmpty, !ordinary.isEmpty].filter { $0 }.count }
 
-    init(records: [CueRecentRecord], runningTasks: [CueRunningTask], interruptedTasks: [CueRunningTask] = [], followups: [CueThreadFollowup] = []) {
-        let records = CueRecentRecord.conversations(records)
+    init(records: [CueRecentRecord], runningTasks: [CueRunningTask], interruptedTasks: [CueRunningTask] = [], followups: [CueThreadFollowup] = [], recordsAreConversations: Bool = false) {
+        let records = recordsAreConversations ? records : CueRecentRecord.conversations(records)
         var latestByThread: [String: CueRunningTask] = [:]
         for task in runningTasks {
             if let previous = latestByThread[task.threadID], previous.updatedDate >= task.updatedDate { continue }
@@ -101,9 +128,14 @@ struct CueRecentRecord {
     var resolved = false
     var manualPinned = false
     var notificationCount = 1
-    var conversationKey: String {
-        let valid = !event.threadID.isEmpty && event.threadID.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0) }
-        return event.provider + ":" + (valid ? "thread:" + event.threadID : "event:" + event.id)
+    let conversationKey: String
+    let canOpen: Bool
+    init(event: CueEvent, openedAt: Date? = nil, resolved: Bool = false, manualPinned: Bool = false, notificationCount: Int = 1) {
+        self.event = event; self.openedAt = openedAt; self.resolved = resolved
+        self.manualPinned = manualPinned; self.notificationCount = notificationCount
+        let valid = CueIdentifier.isValid(event.threadID)
+        conversationKey = event.provider + ":" + (valid ? "thread:" + event.threadID : "event:" + event.id)
+        canOpen = event.provider == "codex" && valid
     }
     /// Keep every real event in the ledger, but render one summary per chat.
     static func conversations(_ records: [Self]) -> [Self] {
@@ -126,10 +158,7 @@ struct CueRecentRecord {
     }
     var isPinned: Bool { manualPinned || !isOpened }
     var isOpened: Bool { openedAt != nil }
-    var canOpen: Bool {
-        event.provider == "codex" && !event.threadID.isEmpty &&
-        event.threadID.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0) }
-    }
+
 }
 
 /// This is an opening ledger, not an assertion that a chat was read or handled.
@@ -139,19 +168,28 @@ final class CueRecentHistory {
     let file: URL
     let followups: CueThreadFollowups
     private var displayCache: [CueRecentRecord]?
+    private var eventGroups: [String: String] = [:]
+    private var displayByGroup: [String: CueRecentRecord] = [:]
+    private var notificationCounts: [String: Int] = [:]
     private(set) var records: [CueRecentRecord] = [] { didSet { displayCache = nil } }
     private(set) var lastError = ""
     var displayRecords: [CueRecentRecord] {
         if let displayCache { return displayCache }
-        let rows = CueRecentRecord.conversations(records); displayCache = rows; return rows
+        let rows = CueRecentRecord.conversations(records)
+        eventGroups = Dictionary(uniqueKeysWithValues: records.map { ($0.event.id, $0.conversationKey) })
+        displayByGroup = Dictionary(uniqueKeysWithValues: rows.map { ($0.conversationKey, $0) })
+        notificationCounts = Dictionary(rows.map { ($0.event.provider + ":" + $0.event.threadID, $0.notificationCount) }, uniquingKeysWith: +)
+        displayCache = rows; return rows
     }
     var events: [CueEvent] { displayRecords.map(\.event) }
     func displayRecord(for id: String) -> CueRecentRecord? {
-        guard let original = records.first(where: { $0.event.id == id }) else { return nil }
-        return displayRecords.first { $0.conversationKey == original.conversationKey }
+        _ = displayRecords
+        guard let key = eventGroups[id] else { return nil }
+        return displayByGroup[key]
     }
     func notificationCount(threadID: String, provider: String = "codex") -> Int {
-        displayRecords.first { $0.event.threadID == threadID && $0.event.provider == provider }?.notificationCount ?? 0
+        guard CueIdentifier.isValid(threadID) else { return 0 }
+        _ = displayRecords; return notificationCounts[provider + ":" + threadID] ?? 0
     }
     var unopenedCount: Int {
         let alerts = displayRecords.filter { !$0.isOpened && $0.canOpen }
@@ -520,6 +558,18 @@ private struct CueTaskRowLayout {
     }
 }
 
+private enum CueListSymbols {
+    private static var images: [String: NSImage] = [:]
+    static func image(_ name: String, size: CGFloat? = nil) -> NSImage? {
+        let key = name + ":" + String(Double(size ?? 0))
+        if let cached = images[key] { return cached }
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        let resolved = size.flatMap { image?.withSymbolConfiguration(.init(pointSize: $0, weight: .regular)) } ?? image
+        if let resolved { images[key] = resolved }
+        return resolved
+    }
+}
+
 private final class CueRecentRowButton: NSButton {
     private(set) var record: CueRecentRecord
     private(set) var isRunning: Bool
@@ -539,7 +589,7 @@ private final class CueRecentRowButton: NSButton {
         let tint: NSColor = record.isOpened ? .secondaryLabelColor : .systemBlue
         let icon = NSImageView(frame: NSRect(x: 11, y: 16, width: 20, height: 20))
         icon.identifier = NSUserInterfaceItemIdentifier("row-icon")
-        icon.image = NSImage(systemSymbolName: record.isOpened ? (record.manualPinned ? "pin.fill" : "arrow.up.forward.app") : "circle.fill", accessibilityDescription: nil)
+        icon.image = CueListSymbols.image(record.isOpened ? (record.manualPinned ? "pin.fill" : "arrow.up.forward.app") : "circle.fill")
         icon.contentTintColor = tint; addSubview(icon)
         let heading = NSTextField(labelWithString: record.event.title)
         heading.identifier = NSUserInterfaceItemIdentifier("row-title")
@@ -574,13 +624,13 @@ private final class CueRecentRowButton: NSButton {
         for view in subviews {
             if let field = view as? NSTextField {
                 switch field.identifier?.rawValue {
-                case "row-title": field.stringValue = record.event.title; field.textColor = record.isOpened ? .secondaryLabelColor : .labelColor
+                case "row-title": field.stringValue = record.event.title; field.textColor = record.isOpened ? .secondaryLabelColor : .labelColor; field.font = .systemFont(ofSize: 13, weight: record.isOpened ? .regular : .semibold)
                 case "row-metadata": field.stringValue = "\(isRunning ? "上次提醒：" : "")\(kind) · \(date.string(from: record.event.date))\(record.isPinned ? " · 置顶" : "")"
                 case "row-state": field.stringValue = recovery?.recoveryLabel ?? (isRunning ? (record.isOpened ? "运行中 · 已打开" : "运行中 · 未读") : pending && record.isOpened ? "待续 · 置顶" : record.isOpened ? (record.manualPinned ? "已打开 · 置顶" : "已打开") : record.canOpen ? "未读 · 置顶" : "不可跳转"); field.textColor = recovery != nil ? .systemOrange : isRunning ? .systemGreen : pending && record.isOpened ? .systemPurple : tint
                 default: break
                 }
             } else if let icon = view as? NSImageView, icon.identifier?.rawValue == "row-icon" {
-                icon.image = NSImage(systemSymbolName: record.isOpened ? (record.manualPinned ? "pin.fill" : "arrow.up.forward.app") : "circle.fill", accessibilityDescription: nil); icon.contentTintColor = tint
+                icon.image = CueListSymbols.image(record.isOpened ? (record.manualPinned ? "pin.fill" : "arrow.up.forward.app") : "circle.fill"); icon.contentTintColor = tint
             }
         }
         let state = pending && record.isOpened && !isRunning ? "待续" : record.isOpened ? "已查看" : "未读"
@@ -794,8 +844,22 @@ final class CueStatusPopoverController: NSViewController {
     private var frozenPinnedTargets: [CueBatchTarget] = []
     private var frozenRunningTargets: [CueBatchTarget] = []
     private var frozenAllTargets: [CueBatchTarget] = []
-    private var pointerTimer: Timer?
-    private var elapsedTimer: Timer?
+    private var pointerLease: CueActivityLease?
+    private var elapsedLease: CueActivityLease?
+    private let activityID = UUID().uuidString
+    private var scrollObserver: NSObjectProtocol?
+    private var presentationManaged = false
+    private var needsRefreshOnShow = false
+    private var pendingStructure = false
+    private var renderedStructure: [String]?
+    private var renderedRowSignatures: [ObjectIdentifier: [String]] = [:]
+    private(set) var rebuildCount = 0
+    private(set) var rowRefreshCount = 0
+    private(set) var clockLabelWrites = 0
+    var performanceSnapshot: [String: Int] { ["rebuilds": rebuildCount, "row_refreshes": rowRefreshCount, "clock_label_writes": clockLabelWrites] }
+    private var workVisible: Bool {
+        isViewLoaded && view.window?.isVisible == true && view.window?.isMiniaturized != true && (!embedded || embeddedActive)
+    }
     private weak var pointerAnchor: NSView?
     // Nil is used only by isolated event-handler fixtures. Production always
     // reads the global pointer, even when another application remains active.
@@ -810,6 +874,11 @@ final class CueStatusPopoverController: NSViewController {
         let root = CueFlippedView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: embedded ? embeddedSize.height : 660))
         if embedded { root.autoresizingMask = [.width, .height] }
         root.backgroundColor = .windowBackgroundColor; view = root
+        scroll.contentView.postsBoundsChangedNotifications = true
+        scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: scroll.contentView, queue: .main) { [weak self] _ in
+            guard let self, !self.rebuilding, self.workVisible else { return }
+            self.refreshInPlace(); self.refreshElapsedLabels(now: Date())
+        }
         rebuild()
     }
     func update(status: String, enabled: Bool, soundEnabled: Bool, paused: Bool, maximumHeight: CGFloat = 900, runningTasks: [CueRunningTask] = [], interruptedTasks: [CueRunningTask] = [], taskDetails: [String: CueTaskDetail] = [:], attentionConnected: Bool = false, connectionSummary: String? = nil, connectionState: String = "legacy", showConnectionAction: Bool? = nil, sideChats: [String: [CueSideChat]] = [:]) {
@@ -821,12 +890,30 @@ final class CueStatusPopoverController: NSViewController {
         self.connectionState = ["legacy", "connected", "reconnecting", "disconnected", "unsupported"].contains(connectionState) ? connectionState : "disconnected"
         self.showConnectionAction = showConnectionAction
         self.sideChats = sideChats
-        sideChatsController.refresh(groups: sideChats)
-        hoverController.refresh()
-        if isViewLoaded {
-            if batchMode || hoverController.isEngaged || sideChatsController.isShown { refreshInPlace() }
-            else { rebuild() }
-        }
+        guard isViewLoaded else { return }
+        if presentationManaged && !workVisible { needsRefreshOnShow = true; return }
+        renderCurrentState()
+    }
+    private func currentSnapshot() -> CueStatusListSnapshot {
+        CueStatusListSnapshot(records: history.displayRecords, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records, recordsAreConversations: true)
+    }
+    private func structure(_ snapshot: CueStatusListSnapshot) -> [String] {
+        var keys: [String] = [String(Double(panelWidth)), String(Double(embeddedSize.height)), String(Double(maximumHeight)), String(batchMode)]
+        keys += ["pinned"]; keys += snapshot.pinned.map(\.conversationKey)
+        keys += ["pinned-followup"]; keys += snapshot.pinnedFollowups.map(\.threadID)
+        keys += ["running"]; keys += snapshot.running.map(\.threadID)
+        keys += ["interrupted"]; keys += snapshot.interrupted.map(\.threadID)
+        keys += ["followup"]; keys += snapshot.followups.map(\.threadID)
+        keys += ["ordinary"]; keys += snapshot.ordinary.map(\.conversationKey)
+        return keys
+    }
+    private func renderCurrentState() {
+        let latest = currentSnapshot()
+        let changed = renderedStructure != structure(latest)
+        let frozen = batchMode || hoverController.isEngaged || sideChatsController.isShown
+        if changed && !frozen { rebuild(); return }
+        pendingStructure = changed
+        refreshInPlace(latest: latest)
     }
     /// A host embeds a distinct controller instance; the shared history store
     /// remains authoritative while selection, scrolling and batch state stay local.
@@ -841,8 +928,8 @@ final class CueStatusPopoverController: NSViewController {
     /// hosting does not always deliver NSViewController appearance callbacks.
     func setEmbeddedVisible(_ visible: Bool) {
         guard embedded else { return }
-        embeddedActive = visible
-        if visible { _ = view; startObservation() }
+        presentationManaged = true; embeddedActive = visible
+        if visible { _ = view; if needsRefreshOnShow { needsRefreshOnShow = false; renderCurrentState() }; startObservation() }
         else { stopObservation() }
     }
     override func viewDidLayout() {
@@ -851,31 +938,27 @@ final class CueStatusPopoverController: NSViewController {
         resizeEmbedded(to: view.bounds.size)
     }
     override func viewDidAppear() {
-        super.viewDidAppear(); if embedded { embeddedActive = true }; startObservation()
+        super.viewDidAppear(); presentationManaged = true; if embedded { embeddedActive = true }; if needsRefreshOnShow { needsRefreshOnShow = false; renderCurrentState() }; startObservation()
     }
     private func startObservation() {
-        pointerTimer?.invalidate(); elapsedTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in self?.reconcilePointerHover() }
-        RunLoop.main.add(timer, forMode: .common); pointerTimer = timer
-        let elapsed = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self, self.isViewLoaded, self.view.window?.isVisible == true else { return }
-            self.refreshElapsedLabels(now: Date())
-        }
-        RunLoop.main.add(elapsed, forMode: .common); elapsedTimer = elapsed
+        pointerLease?.cancel(); elapsedLease?.cancel()
+        pointerLease = CueActivityScheduler.shared.observe(key: "status-list-pointer:" + activityID, interval: 0.12, isActive: { [weak self] in self?.workVisible == true }) { [weak self] in self?.reconcilePointerHover() }
+        elapsedLease = CueActivityScheduler.shared.observe(key: "status-list-clock:" + activityID, interval: 1, isActive: { [weak self] in self?.workVisible == true }) { [weak self] in self?.refreshElapsedLabels(now: Date()) }
         refreshElapsedLabels(now: Date())
         DispatchQueue.main.async { [weak self] in self?.reconcilePointerHover() }
     }
     private func stopObservation() {
-        pointerTimer?.invalidate(); pointerTimer = nil; elapsedTimer?.invalidate(); elapsedTimer = nil
+        pointerLease?.cancel(); pointerLease = nil; elapsedLease?.cancel(); elapsedLease = nil
         pointerAnchor = nil; hoverController.hide(); sideChatsController.close()
     }
-    override func viewDidDisappear() { super.viewDidDisappear(); if embedded { embeddedActive = false }; stopObservation() }
-    deinit { pointerTimer?.invalidate(); elapsedTimer?.invalidate() }
+    override func viewDidDisappear() { super.viewDidDisappear(); presentationManaged = true; if embedded { embeddedActive = false }; stopObservation() }
+    deinit { pointerLease?.cancel(); elapsedLease?.cancel(); if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) } }
 
     /// Status-item popovers can be visible while Codex remains the active app.
     /// Tracking is activeAlways, and this geometry check also handles a pointer
     /// already inside a row when a non-key popover first appears or scrolls.
     private func reconcilePointerHover() {
+        if pendingStructure && !batchMode && !hoverController.isEngaged && !sideChatsController.isShown && workVisible { pendingStructure = false; renderCurrentState() }
         guard (!embedded || embeddedActive), !batchMode, !sideChatsController.isShown, isViewLoaded, let window = view.window, window.isVisible, let document = recentDocument,
               let screenPoint = pointerLocation() else { return }
         let point = window.convertPoint(fromScreen: screenPoint)
@@ -914,10 +997,14 @@ final class CueStatusPopoverController: NSViewController {
     }
     private func rebuild() {
         guard !rebuilding else { return }
-        rebuilding = true; defer { rebuilding = false }
+        if presentationManaged && !workVisible { needsRefreshOnShow = true; return }
+        rebuilding = true; rebuildCount += 1; pendingStructure = false
+        renderedRowSignatures.removeAll(keepingCapacity: true)
+        defer { rebuilding = false }
         sideChatsController.close()
         let origin = scroll.contentView.bounds.origin
-        let snapshot = batchMode ? (frozenBatchSnapshot ?? CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records)) : CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records)
+        let snapshot = batchMode ? (frozenBatchSnapshot ?? CueStatusListSnapshot(records: history.displayRecords, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records, recordsAreConversations: true)) : CueStatusListSnapshot(records: history.displayRecords, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records, recordsAreConversations: true)
+        renderedStructure = structure(snapshot)
         view.subviews.forEach { $0.removeFromSuperview() }
         let compactBatch = embedded && panelWidth < 680
         let batchExtra: CGFloat = compactBatch && batchMode ? 36 : 0
@@ -1081,8 +1168,10 @@ final class CueStatusPopoverController: NSViewController {
 
     /// Preserve controls and row geometry while a person is selecting or reading.
     /// Telemetry is still refreshed; only membership and ordering are deferred.
-    private func refreshInPlace() {
-        let latest = CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records)
+    private func refreshInPlace(latest supplied: CueStatusListSnapshot? = nil) {
+        let latest = supplied ?? currentSnapshot()
+        if sideChatsController.isShown { sideChatsController.refresh(groups: sideChats) }
+        if hoverController.isEngaged { hoverController.refresh() }
         var tasks: [String: CueRunningTask] = [:]
         for task in runningTasks {
             if let previous = tasks[task.threadID], previous.updatedDate >= task.updatedDate { continue }
@@ -1120,6 +1209,13 @@ final class CueStatusPopoverController: NSViewController {
             }
         }
         for child in recentDocument?.subviews ?? [] {
+            if (child is CueRecentRowButton || child is CueRunningRowButton), !rowVisible(child) { continue }
+            if let row = child as? NSButton, row is CueRecentRowButton || row is CueRunningRowButton {
+                let signature = rowSignature(row)
+                let identity = ObjectIdentifier(row)
+                if renderedRowSignatures[identity] == signature { continue }
+                renderedRowSignatures[identity] = signature; rowRefreshCount += 1
+            }
             if let row = child as? CueRecentRowButton {
                 row.refresh(record: records[row.record.conversationKey], isRunning: row.record.event.provider == "codex" && latest.activeThreadIDs.contains(row.record.event.threadID), recovery: latest.recoveryByThread[row.record.event.threadID], pending: history.followups.contains(row.record.event.threadID))
                 refreshDetails(in: row, threadID: row.record.event.threadID, eventDate: row.record.event.date)
@@ -1135,6 +1231,46 @@ final class CueStatusPopoverController: NSViewController {
             }
         }
     }
+    /// Bounded fixture comparison; it never reads the real app home, starts
+    /// polling, discovers Codex, or submits work. Only AppKit view work is timed.
+    static func performanceMeasurement() -> [String: Any] {
+        _ = NSApplication.shared
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("vcgo-list-measure-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let history = CueRecentHistory(home: home)
+        for index in 0..<12 {
+            let event = CueEvent(try! JSONSerialization.data(withJSONObject: ["id": "measure-\(index)", "kind": "complete", "thread_id": "measure-chat-\(index)", "title": "列表测量 \(index)", "created_at": Double(1000 + index)]))!
+            history.append(event)
+        }
+        let actions = CueStatusPopoverActions(openSettings: {}, openUsage: {}, toggleEnabled: {}, toggleSound: {}, pause: {}, demo: {}, quit: {}, openEvent: { _ in })
+        let controller = CueStatusPopoverController(history: history, actions: actions)
+        _ = controller.view
+        func cpu() -> Double {
+            var usage = rusage(); _ = getrusage(0, &usage)
+            return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
+        }
+        let initialBuilds = controller.rebuildCount
+        let beforeCPU = cpu(), beforeWall = ProcessInfo.processInfo.systemUptime
+        var iterations = 0
+        for _ in 0..<30 {
+            controller.rebuild(); iterations += 1
+            if iterations >= 5 && ProcessInfo.processInfo.systemUptime - beforeWall > 0.8 { break }
+        }
+        let rebuildWall = ProcessInfo.processInfo.systemUptime - beforeWall, rebuildCPU = cpu() - beforeCPU
+        let afterBuilds = controller.rebuildCount, refreshes = controller.rowRefreshCount
+        let document = controller.recentDocument
+        let diffCPUStart = cpu(), diffWallStart = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<iterations { controller.update(status: "本机监控中", enabled: true, soundEnabled: true, paused: false) }
+        let diffWall = ProcessInfo.processInfo.systemUptime - diffWallStart, diffCPU = cpu() - diffCPUStart
+        var usage = rusage(); _ = getrusage(0, &usage)
+        return ["fixture_rows": 12, "iterations": iterations, "forced_rebuild_wall_ms": rebuildWall * 1000,
+                "forced_rebuild_cpu_ms": rebuildCPU * 1000, "diff_update_wall_ms": diffWall * 1000, "diff_update_cpu_ms": diffCPU * 1000,
+                "forced_rebuilds": afterBuilds - initialBuilds, "diff_rebuilds": controller.rebuildCount - afterBuilds,
+                "diff_row_refreshes": controller.rowRefreshCount - refreshes, "document_retained": controller.recentDocument === document,
+                "process_peak_rss_mib": Double(usage.ru_maxrss) / 1_048_576,
+                "scope": "isolated 12-row AppKit fixture; process RSS includes fixture and framework initialization"]
+    }
+
     static func validationReport() -> [String: Bool] {
         _ = NSApplication.shared
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-context-" + UUID().uuidString)
@@ -1228,9 +1364,9 @@ final class CueStatusPopoverController: NSViewController {
         embeddedTasks.resizeEmbedded(to: NSSize(width: 610, height: 520))
         results["embedded_batch_resize_preserves_frozen_scope_and_narrow_row_access"] = embeddedTasks.batchMode && embeddedTasks.selectedThreads == selectedEmbedded && !selectedEmbedded.isEmpty && embeddedTasks.scroll.hasHorizontalScroller && embeddedTasks.recentDocument!.frame.width >= 645 && embeddedTasks.scroll.frame.maxY <= 498
         embeddedTasks.setEmbeddedVisible(true)
-        let observing = embeddedTasks.pointerTimer != nil && embeddedTasks.elapsedTimer != nil
+        let observing = embeddedTasks.pointerLease != nil && embeddedTasks.elapsedLease != nil
         embeddedTasks.setEmbeddedVisible(false)
-        results["embedded_hidden_page_stops_timers_and_transient_hover"] = observing && !embeddedTasks.embeddedActive && embeddedTasks.pointerTimer == nil && embeddedTasks.elapsedTimer == nil && embeddedTasks.pointerAnchor == nil
+        results["embedded_hidden_page_stops_timers_and_transient_hover"] = observing && !embeddedTasks.embeddedActive && embeddedTasks.pointerLease == nil && embeddedTasks.elapsedLease == nil && embeddedTasks.pointerAnchor == nil
         var batchCalls: [[CueBatchTarget]] = []
         var batchActions = liveActions; batchActions.batchConfigure = { batchCalls.append($0) }
         let batchController = CueStatusPopoverController(history: liveHistory, actions: batchActions)
@@ -1368,7 +1504,7 @@ final class CueStatusPopoverController: NSViewController {
         results["nonkey_popover_first_pointer_entry_starts_hover_without_click"] = geometryRow != nil && geometry.pointerAnchor === geometryRow && geometry.hoverController.isEngaged && !geometryWindow.isKeyWindow && NSApp.keyWindow === keyBefore && NSApp.isActive == activeBefore
         geometry.pointerLocation = { NSPoint(x: 100000, y: 100000) }; geometry.reconcilePointerHover()
         results["nonkey_pointer_exit_releases_pending_hover"] = geometry.pointerAnchor == nil && !geometry.hoverController.isEngaged
-        geometry.hoverController.hide(); geometryWindow.orderOut(nil); geometry.pointerTimer?.invalidate(); geometry.pointerTimer = nil
+        geometry.hoverController.hide(); geometryWindow.orderOut(nil); geometry.pointerLease?.cancel(); geometry.pointerLease = nil
         let clockHistory = CueRecentHistory(home: home.appendingPathComponent("live-second-clock"))
         let clockNow = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
         for id in ["clock-pin", "clock-done", "clock-wait"] {
@@ -1407,12 +1543,12 @@ final class CueStatusPopoverController: NSViewController {
         results["second_clock_preserves_document_row_identity_selection_and_scroll"] = clock.recentDocument === clockDocument && pinTime === clockField("clock-pin") && runTime === clockField("clock-run") && followTime === clockField("clock-follow") && clock.selectedID == "clock-pin" && clock.scroll.contentView.bounds.origin == originBeforeClock
         let stateFrame = pinTime?.superview?.subviews.first(where: { $0.identifier?.rawValue == "row-state" })?.frame ?? .zero
         results["row_elapsed_stays_under_state_in_left_information_area"] = pinTime?.alignment == .right && pinTime?.frame.maxX == stateFrame.maxX && (pinTime?.frame.minY ?? 0) >= stateFrame.maxY && (pinTime?.frame.minX ?? 0) > 300
-        results["list_clock_uses_common_runloop_timer_only_while_visible"] = clock.elapsedTimer?.isValid == true && clock.elapsedTimer?.timeInterval == 1
+        results["list_clock_uses_common_runloop_timer_only_while_visible"] = clock.elapsedLease?.isValid == true && clock.elapsedLease?.key.hasPrefix("status-list-clock:") == true
         let staleComplete = CueTaskDetail(raw: ["status": "complete", "started_at": clockNow.addingTimeInterval(-1000).timeIntervalSince1970, "finished_at": clockNow.addingTimeInterval(-500).timeIntervalSince1970])
         clock.taskDetails["clock-run"] = staleComplete
         results["new_turn_clock_ignores_previous_turn_completed_details"] = clock.durationLine(threadID: "clock-run", eventDate: nil, now: clockNow) == "本轮 ≥1分5秒"
         clock.viewDidDisappear(); clockWindow.orderOut(nil)
-        results["hidden_list_invalidates_second_clock"] = clock.elapsedTimer == nil
+        results["hidden_list_invalidates_second_clock"] = clock.elapsedLease == nil
         let reconnect = CueStatusPopoverController(history: liveHistory, actions: liveActions)
         reconnect.pointerLocation = { nil }
         reconnect.update(status: "连接状态验收", enabled: true, soundEnabled: true, paused: false, connectionSummary: "Codex 自动重连中…", connectionState: "reconnecting", showConnectionAction: false)
@@ -1570,6 +1706,38 @@ final class CueStatusPopoverController: NSViewController {
         let liveUniqueRow = liveUniquePanel.recentDocument?.subviews.compactMap { $0 as? CueRunningRowButton }.first
         let liveBadge = liveUniqueRow?.subviews.first { $0.identifier?.rawValue == "notification-count:unique-chat" } as? NSTextField
         results["notification_badge_remains_visible_when_chat_moves_to_running"] = liveUniqueRow != nil && liveBadge?.stringValue == "3" && liveBadge?.isHidden == false
+        let cacheTitle = "拼音缓存 \(UUID().uuidString) 12"
+        let cacheRaw: [String: Any] = ["thread_id": "title-cache", "title": cacheTitle, "started_at": 1000.0, "last_activity": 1001.0]
+        let firstCached = CueRunningTask(raw: cacheRaw)!
+        let titleMetrics = CueRunningTask.titleKeyCacheMetrics
+        let secondCached = CueRunningTask(raw: cacheRaw)!
+        results["task_snapshot_reuses_bounded_title_transliteration_cache"] = (CueRunningTask.titleKeyCacheMetrics["hits"] ?? 0) == (titleMetrics["hits"] ?? 0) + 1 && (CueRunningTask.titleKeyCacheMetrics["entries"] ?? 0) <= 512 && !CueRunningTask.titleAscending(firstCached, secondCached) && !CueRunningTask.titleAscending(secondCached, firstCached)
+        let stableHistory = CueRecentHistory(home: home.appendingPathComponent("diff-rendering"))
+        let stableRaw: [String: Any] = ["id": "diff-event", "kind": "complete", "thread_id": "diff-thread", "title": "差异更新", "created_at": 1000.0]
+        stableHistory.append(CueEvent(try! JSONSerialization.data(withJSONObject: stableRaw))!)
+        let diffController = CueStatusPopoverController(history: stableHistory, actions: actions)
+        _ = diffController.view
+        let diffDocument = diffController.recentDocument
+        let diffRow = diffDocument?.subviews.compactMap { $0 as? CueRecentRowButton }.first
+        let diffQuick = diffRow?.subviews.first { $0.identifier?.rawValue == "quick-more" }
+        let buildsBefore = diffController.rebuildCount, refreshesBefore = diffController.rowRefreshCount
+        for _ in 0..<30 { diffController.update(status: "本机监控中", enabled: true, soundEnabled: true, paused: false) }
+        let updatedDiffRow = diffController.recentDocument?.subviews.compactMap { $0 as? CueRecentRowButton }.first
+        let updatedDiffQuick = updatedDiffRow?.subviews.first { $0.identifier?.rawValue == "quick-more" }
+        let sameDiffDocument = diffController.recentDocument === diffDocument
+        let sameDiffRow = updatedDiffRow === diffRow
+        let sameDiffQuick = updatedDiffQuick === diffQuick
+        results["unchanged_list_updates_keep_rows_controls_and_document"] = sameDiffDocument && sameDiffRow && sameDiffQuick
+        results["unchanged_list_updates_do_not_rebuild_or_render_rows"] = diffController.rebuildCount == buildsBefore && diffController.rowRefreshCount == refreshesBefore
+        let metricsChange = CueTaskDetail(raw: ["status": "running", "model": "changed-model", "total_tokens": 1234, "tokens_status": "complete"])
+        diffController.update(status: "本机监控中", enabled: true, soundEnabled: true, paused: false, taskDetails: ["diff-thread": metricsChange])
+        results["changed_row_metrics_update_without_rebuilding_the_list"] = diffController.rebuildCount == buildsBefore && diffController.rowRefreshCount == refreshesBefore + 1 && diffController.recentDocument === diffDocument
+        let embeddedStable = CueStatusPopoverController(history: stableHistory, actions: actions, embedded: true)
+        _ = embeddedStable.view
+        embeddedStable.setEmbeddedVisible(false)
+        let hiddenBuilds = embeddedStable.rebuildCount, hiddenRefreshes = embeddedStable.rowRefreshCount
+        embeddedStable.update(status: "后台状态已变化", enabled: false, soundEnabled: false, paused: false, taskDetails: ["diff-thread": metricsChange])
+        results["hidden_embedded_list_defers_all_rendering_until_presented"] = embeddedStable.needsRefreshOnShow && embeddedStable.rebuildCount == hiddenBuilds && embeddedStable.rowRefreshCount == hiddenRefreshes
         return results
     }
 
@@ -1661,7 +1829,7 @@ final class CueStatusPopoverController: NSViewController {
             batchMode = false; selectedThreads.removeAll(); batchTargets.removeAll()
             frozenBatchSnapshot = nil; frozenPinnedTargets = []; frozenRunningTargets = []; frozenAllTargets = []
         } else {
-            frozenBatchSnapshot = CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records)
+            frozenBatchSnapshot = CueStatusListSnapshot(records: history.displayRecords, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records, recordsAreConversations: true)
             frozenPinnedTargets = pinnedBatchTargets()
             frozenRunningTargets = CueBatchTarget.unique(runningTasks.compactMap { CueBatchTarget(threadID: $0.threadID, title: $0.title) })
             frozenAllTargets = availableBatchTargets()
@@ -1832,6 +2000,56 @@ final class CueStatusPopoverController: NSViewController {
         badge.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.12).cgColor
         row.addSubview(badge)
         refreshDetails(in: row, threadID: threadID, eventDate: eventDate)
+        renderedRowSignatures[ObjectIdentifier(row)] = rowSignature(row)
+    }
+    private func rowVisible(_ row: NSView) -> Bool {
+        // Detached fixtures render synchronously; actual windows update only
+        // the viewport, and scrolling catches newly exposed rows up in place.
+        guard presentationManaged, let document = recentDocument else { return true }
+        return row.frame.intersects(document.visibleRect)
+    }
+    private func rowSignature(_ row: NSButton) -> [String] {
+        let id: String, record: CueRecentRecord?, followup: CueThreadFollowup?, task: CueRunningTask?
+        if let reminder = row as? CueRecentRowButton {
+            id = reminder.record.event.threadID; record = history.displayRecord(for: reminder.record.event.id); followup = history.followups.records.first { $0.threadID == id }
+            task = runningTasks.first { $0.threadID == id } ?? interruptedTasks.first { $0.threadID == id }
+        } else if let running = row as? CueRunningRowButton {
+            id = running.task.threadID; record = history.displayRecords.first { $0.event.threadID == id && $0.event.provider == "codex" }; followup = history.followups.records.first { $0.threadID == id }
+            task = runningTasks.first { $0.threadID == id } ?? interruptedTasks.first { $0.threadID == id }
+        } else { return [] }
+        let detail = taskDetails[id]
+        var base: [String] = [id, String(Double(row.bounds.width)), String(batchMode), String(selectedThreads.contains(id))]
+        base.reserveCapacity(48)
+        if let record {
+            base.append(contentsOf: [record.event.id, record.event.title, record.event.kind])
+            base.append(String(record.openedAt?.timeIntervalSince1970 ?? 0))
+            base.append(contentsOf: [String(record.manualPinned), String(record.resolved), String(record.notificationCount)])
+        } else { base.append(contentsOf: Array(repeating: "", count: 7)) }
+        if let followup {
+            base.append(followup.title)
+            base.append(String(followup.reviewedAt.timeIntervalSince1970))
+            base.append(contentsOf: [String(followup.pinned), String(followup.unread)])
+        } else { base.append(contentsOf: Array(repeating: "", count: 4)) }
+        if let task {
+            base.append(contentsOf: [task.title, task.turnID, task.recoveryStatus, task.recoveryReason])
+            base.append(String(task.updatedDate.timeIntervalSince1970))
+            base.append(String(task.startDate.timeIntervalSince1970))
+        } else { base.append(contentsOf: Array(repeating: "", count: 6)) }
+        if let detail {
+            base.append(contentsOf: [detail.status, detail.turnID])
+            base.append(String(detail.startedAt?.timeIntervalSince1970 ?? 0))
+            base.append(String(detail.finishedAt?.timeIntervalSince1970 ?? 0))
+            base.append(String(detail.lastActivity?.timeIntervalSince1970 ?? 0))
+            base.append(String(detail.elapsedSeconds ?? -1))
+            base.append(detail.elapsedStatus)
+            base.append(contentsOf: [detail.modelSelectionLine, detail.speedSelectionLine, detail.settingsTooltip])
+            base.append(contentsOf: [detail.turnUsage.tokenLine, detail.turnUsage.costLine, detail.turnUsage.tooltip])
+            base.append(contentsOf: [detail.historyUsage.tokenLine, detail.historyUsage.costLine, detail.historyUsage.tooltip])
+        } else { base.append(contentsOf: Array(repeating: "", count: 16)) }
+        for sideChat in sideChats[id] ?? [] {
+            base.append(contentsOf: [sideChat.threadID, sideChat.title, sideChat.statusLabel, String(sideChat.canOpen)])
+        }
+        return base
     }
     private func refreshDetails(in row: NSButton, threadID: String, eventDate: Date?) {
         let layout = CueTaskRowLayout(width: row.bounds.width)
@@ -1939,7 +2157,7 @@ final class CueStatusPopoverController: NSViewController {
             let button = row.subviews.first { $0.identifier?.rawValue == "quick-" + command } as? CueRowQuickButton ?? CueRowQuickButton(command: command)
             if button.superview == nil { row.addSubview(button) }
             button.frame = CueTaskRowLayout(width: row.bounds.width).action(index)
-            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+            button.image = CueListSymbols.image(symbol, size: 12)
             button.contentTintColor = command == "pin" && effectivePin ? .controlAccentColor : command == "unread" && unread ? .systemBlue : .secondaryLabelColor
             button.toolTip = label; button.setAccessibilityElement(true); button.setAccessibilityLabel(label + "：" + event.title)
             button.isEnabled = valid && !(command == "unread" && unread)
@@ -1990,13 +2208,14 @@ final class CueStatusPopoverController: NSViewController {
     /// Update text only: no list rebuild, row reorder, hover or selection changes.
     private func refreshElapsedLabels(now: Date) {
         for child in recentDocument?.subviews ?? [] {
+            guard rowVisible(child) else { continue }
             let threadID: String, eventDate: Date?
             if let row = child as? CueRecentRowButton { threadID = row.record.event.threadID; eventDate = row.record.event.date }
             else if let row = child as? CueRunningRowButton { threadID = row.task.threadID; eventDate = nil }
             else { continue }
             guard let field = child.subviews.first(where: { $0.identifier?.rawValue == "task-elapsed:" + threadID }) as? NSTextField else { continue }
             let value = durationLine(threadID: threadID, eventDate: eventDate, now: now)
-            if field.stringValue != value { field.stringValue = value }
+            if field.stringValue != value { field.stringValue = value; clockLabelWrites += 1 }
         }
     }
     private func hover(_ inside: Bool, threadID: String, title: String, row: NSView) {

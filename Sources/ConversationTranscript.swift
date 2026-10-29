@@ -18,6 +18,10 @@ final class CueConversationTranscriptView: NSView, WKNavigationDelegate {
     private var payload: [String: Any] = ["messages": [], "state": "loading"]
     private(set) var isReady = false
     private(set) var renderError = ""
+    private var payloadRevision = 0, sentRevision = -1, documentGeneration = 0
+    private var sentTheme = ""
+    private var flushScheduled = false, flushInFlight = false
+    private(set) var javascriptFlushCount = 0
     var onAction: ((String, String) -> Void)?
     override var isFlipped: Bool { true }
 
@@ -53,15 +57,37 @@ final class CueConversationTranscriptView: NSView, WKNavigationDelegate {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); flush() }
 
     func update(messages: [[String: Any]], activities: [[String: Any]] = [], state: String = "ready", message: String = "") {
-        payload = ["messages": messages, "activities": activities, "state": state, "message": message]
+        let next: [String: Any] = ["messages": messages, "activities": activities, "state": state, "message": message]
+        guard !NSDictionary(dictionary: payload).isEqual(to: next) else { return }
+        payload = next; payloadRevision += 1
         flush()
     }
+    private var theme: String { effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? "dark" : "light" }
     private func flush() {
-        guard isReady else { return }
-        var values = payload
-        values["theme"] = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? "dark" : "light"
+        guard isReady, !flushScheduled, !flushInFlight,
+              sentRevision != payloadRevision || sentTheme != theme else { return }
+        // ready, didFinish and appearance can arrive in the same main-loop turn.
+        // Coalesce them and never queue concurrent WebKit payload evaluations.
+        flushScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }; self.flushScheduled = false
+            self.performFlush()
+        }
+    }
+    private func performFlush() {
+        guard isReady, !flushInFlight, sentRevision != payloadRevision || sentTheme != theme else { return }
+        var values = payload; let nextTheme = theme
+        values["theme"] = nextTheme
+        let generation = documentGeneration
+        sentRevision = payloadRevision; sentTheme = nextTheme; flushInFlight = true
+        javascriptFlushCount += 1
         webView.callAsyncJavaScript("window.VibeCueTranscript.update(payload)", arguments: ["payload": values], in: nil, in: .page) { [weak self] result in
-            if case .failure = result { self?.renderError = "对话排版暂不可用，请刷新。" }
+            guard let self, generation == self.documentGeneration else { return }
+            self.flushInFlight = false
+            if case .failure = result { self.renderError = "对话排版暂不可用，请刷新。" }
+            // A newer payload may have arrived while WebKit evaluated the old one.
+            // The same failed payload is not retried in a tight loop.
+            self.flush()
         }
     }
     fileprivate func receive(_ raw: Any) {
@@ -89,6 +115,21 @@ final class CueConversationTranscriptView: NSView, WKNavigationDelegate {
         decisionHandler(.cancel)
         if action.navigationType == .linkActivated { onAction?("openLink", url.absoluteString) }
     }
-    func reload() { isReady = false; renderError = ""; if let documentURL { webView.loadFileURL(documentURL, allowingReadAccessTo: documentURL.deletingLastPathComponent()) } }
-    func evaluate(_ script: String, completion: @escaping (Any?, Error?) -> Void) { webView.evaluateJavaScript(script, completionHandler: completion) }
+    func reload() { documentGeneration += 1; isReady = false; renderError = ""; sentRevision = -1; sentTheme = ""; flushInFlight = false; if let documentURL { webView.loadFileURL(documentURL, allowingReadAccessTo: documentURL.deletingLastPathComponent()) } }
+    /// Explicit document reads are ordered after the latest pending payload.
+    /// This keeps capture/selection operations deterministic despite coalescing.
+    func evaluate(_ script: String, completion: @escaping (Any?, Error?) -> Void) {
+        if flushScheduled { flushScheduled = false; performFlush() }
+        webView.evaluateJavaScript(script, completionHandler: completion)
+    }
+    func performanceValidationReport() -> [String: Bool] {
+        let beforeRevision = payloadRevision, beforeFlushes = javascriptFlushCount
+        let rows = payload["messages"] as? [[String: Any]] ?? []
+        let activities = payload["activities"] as? [[String: Any]] ?? []
+        for _ in 0..<20 { update(messages: rows, activities: activities, state: payload["state"] as? String ?? "ready", message: payload["message"] as? String ?? "") }
+        let same = beforeRevision == payloadRevision
+        for _ in 0..<20 { flush() }
+        return ["conversation_identical_payloads_do_not_serialize_or_send_again": same && javascriptFlushCount == beforeFlushes,
+                "conversation_webkit_has_only_one_pending_payload_flush": flushInFlight || flushScheduled || sentRevision == payloadRevision]
+    }
 }

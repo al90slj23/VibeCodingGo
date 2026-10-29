@@ -19,4 +19,5 @@ fi
 mkdir -p "$APP_DIR/Contents/Resources/CCSwitchIntegration"
 cp "$PROJECT_ROOT/integrations/ccswitch/vibecue_quota.rs" "$APP_DIR/Contents/Resources/CCSwitchIntegration/vibecue_quota.rs"
 /usr/bin/codesign --force --sign - "$APP_DIR"
+/usr/bin/python3 "$PROJECT_ROOT/scripts/check-ui-performance.py"
 printf '%s\n' "$APP_DIR"

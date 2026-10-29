@@ -306,7 +306,7 @@ final class CueStyledBannerView: NSView {
 
     private var canOpenConversation: Bool {
         controller != nil && event.provider == "codex" && !event.isPreview && !event.threadID.isEmpty &&
-        event.threadID.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0) }
+        CueIdentifier.isValid(event.threadID)
     }
 
     // Route passive content to the card, while preserving present and future

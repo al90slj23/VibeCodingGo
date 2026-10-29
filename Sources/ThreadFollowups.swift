@@ -20,11 +20,7 @@ final class CueThreadFollowups {
     private(set) var lastError = ""
     init(home: URL) { file = home.appendingPathComponent("thread-followups.json"); load() }
 
-    static func valid(_ id: String) -> Bool {
-        !id.isEmpty && id.count <= 160 && id.unicodeScalars.allSatisfy {
-            CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0)
-        }
-    }
+    static func valid(_ id: String) -> Bool { CueIdentifier.isValid(id) }
     func contains(_ id: String) -> Bool { records.contains { $0.threadID == id } }
     @discardableResult func retain(threadID: String, title: String, provider: String = "codex", now: Date = Date()) -> Bool {
         guard provider == "codex", Self.valid(threadID) else { return false }

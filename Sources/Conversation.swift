@@ -83,6 +83,11 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         guard !embedded || embeddedVisible, let host = presentationWindow else { return false }
         return host.isVisible && !host.isMiniaturized
     }
+    private var isPollingVisible: Bool {
+        guard isPresentationVisible, let host = presentationWindow else { return false }
+        return host.occlusionState.contains(.visible)
+    }
+    private let observationKey = "conversation:" + UUID().uuidString
     private let client: CueUsageClient
     private let drafts: CueConversationDrafts
     private let windowGeometry: CueConversationWindowState
@@ -122,7 +127,22 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     private let pathButton = NSButton(title: "访达打开", target: nil, action: nil)
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private let unlockButton = NSButton(title: "已核对，解锁发送", target: nil, action: nil)
-    private var timer: Timer?
+    private var activityLease: CueActivityLease?
+    private var lastLayoutSignature: String?
+    private var layoutWorkCount = 0
+    private var controlsSignature: String?
+    private var unchangedReads = 0
+    private var readRequestCount = 0, statusRequestCount = 0
+    // A read already in flight may finish after the window becomes occluded.
+    // Keep only its latest bounded response until presentation resumes.
+    private var deferredTranscriptResult: Result<[String: Any], Error>?
+    private var transcriptApplicationCount = 0
+    var performanceSnapshot: [String: Any] {
+        ["visible": isPollingVisible, "observation_job": activityLease?.isValid == true,
+         "excerpt_requests": readRequestCount, "status_requests": statusRequestCount,
+         "layout_passes": layoutWorkCount, "webkit_flushes": transcript.javascriptFlushCount,
+         "deferred_transcript": deferredTranscriptResult != nil, "transcript_applications": transcriptApplicationCount]
+    }
     private var reading = false, checking = false, sending = false, loading = false
     var hasInFlightOperation: Bool { sending || loading }
     private var canSend = false, canLoad = false, messageLimit = 8192
@@ -204,7 +224,12 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         // The native editor stays above its background, while all prompt text
         // remains outside the WebView and its scripting environment.
         root.addSubview(composerSurface, positioned: .below, relativeTo: nil)
-        root.onAppearance = { [weak self] in self?.composerSurface.needsDisplay = true; self?.sendButton.needsDisplay = true; self?.window?.backgroundColor = CueConversationColors.background }
+        root.onAppearance = { [weak self] in
+            guard let self else { return }
+            self.composerSurface.needsDisplay = true; self.sendButton.needsDisplay = true
+            self.window?.backgroundColor = CueConversationColors.background
+            self.lastLayoutSignature = nil; self.layout()
+        }
         transcript.onAction = { [weak self] action, value in self?.handleTranscriptAction(action, value: value) }
         [pathButton, refreshButton].forEach { $0.isHidden = true }
         let saved = drafts.values(event.threadID); composer.string = saved["draft"] ?? ""; note.string = saved["note"] ?? ""; pendingRequestID = saved["pending_request_id"] ?? ""
@@ -212,14 +237,14 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         refreshMetrics(); layout(); updateControls()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    deinit { timer?.invalidate(); saveWork?.cancel(); stopLifecycleObservers() }
+    deinit { activityLease?.cancel(); saveWork?.cancel(); stopLifecycleObservers() }
 
     /// Retained for old embedded callers and migration fixtures. Normal task
     /// navigation always presents this controller's independent chat window.
     func embeddedContentView() -> NSView {
         if !embedded {
             embedded = true; remembersWindowGeometry = false
-            timer?.invalidate(); timer = nil; stopLifecycleObservers()
+            activityLease?.cancel(); activityLease = nil; stopLifecycleObservers()
             window?.orderOut(nil)
             if window?.contentView === root { window?.contentView = NSView(frame: .zero) }
             root.autoresizingMask = [.width, .height]
@@ -243,7 +268,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
             updateControls(); beginVisibleWork()
         } else {
             saveWork?.cancel(); saveWork = nil
-            timer?.invalidate(); timer = nil; stopLifecycleObservers()
+            activityLease?.cancel(); activityLease = nil; stopLifecycleObservers()
             // Status/read callbacks from this presentation cannot re-enable old
             // state. A send/load callback still commits its original receipt.
             connectionGeneration += 1; loadGeneration += 1
@@ -281,18 +306,40 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     private func beginVisibleWork() {
         guard !fixtureMode else { return }
         startLifecycleObservers()
+        applyDeferredTranscriptIfVisible(isPollingVisible)
         connectionGeneration += 1
         if checking { connectionRefreshQueued = true }
-        readConversation(); checkConnection(force: true)
-        timer?.invalidate(); timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            guard let self, self.isPresentationVisible else { return }
-            self.refreshMetrics(); self.readConversation(); self.checkConnection()
+        if activityLease?.isValid != true {
+            activityLease = CueActivityScheduler.shared.observe(key: observationKey, interval: 2,
+                isActive: { [weak self] in self?.isPollingVisible == true },
+                tick: { [weak self] in self?.pollVisibleWork() })
         }
-        if let timer { RunLoop.main.add(timer, forMode: .common) }
+        CueActivityScheduler.shared.poke(key: observationKey)
+    }
+    private func pollVisibleWork() {
+        guard !fixtureMode, isPollingVisible else { return }
+        applyDeferredTranscriptIfVisible(true)
+        refreshMetrics()
+        // Observational requests are serialized per window. A status read and
+        // excerpt read no longer launch two Python workers in the same tick.
+        guard !reading, !checking, !sending, !loading else { return }
+        if Date() >= nextStatusCheck { checkConnection(); return }
+        readConversation()
+    }
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard !fixtureMode, isPresentationVisible else { return }
+        applyDeferredTranscriptIfVisible(isPollingVisible)
+        lastRead = .distantPast; nextStatusCheck = .distantPast
+        CueActivityScheduler.shared.poke(key: observationKey)
+    }
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard !fixtureMode, isPollingVisible else { return }
+        applyDeferredTranscriptIfVisible(true)
+        CueActivityScheduler.shared.poke(key: observationKey)
     }
     func windowWillClose(_ notification: Notification) {
         if embedded { _ = setEmbeddedVisible(false); return }
-        remembersWindowGeometry = false; windowGeometry.flush(); timer?.invalidate(); timer = nil
+        remembersWindowGeometry = false; windowGeometry.flush(); activityLease?.cancel(); activityLease = nil
         stopLifecycleObservers(); saveDraft(); if !hasInFlightOperation { onClosed?() }
         // Closing never handles a task.
     }
@@ -301,7 +348,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     /// an in-flight send/load can finish and retain its crash-safe receipt.
     func stop() {
         if !embedded { windowGeometry.flush() }
-        timer?.invalidate(); timer = nil; stopLifecycleObservers(); saveDraft(); client.stop()
+        activityLease?.cancel(); activityLease = nil; stopLifecycleObservers(); saveDraft(); client.stop()
     }
     private func startLifecycleObservers() {
         guard applicationObservers.isEmpty, workspaceObservers.isEmpty else { return }
@@ -335,7 +382,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
             updateControls()
             if checking { connectionRefreshQueued = true }
         }
-        if !checking { checkConnection(force: true) }
+        CueActivityScheduler.shared.poke(key: observationKey)
     }
     func windowDidMove(_ notification: Notification) { rememberWindowGeometry() }
     func windowDidResize(_ notification: Notification) { rememberWindowGeometry() }
@@ -362,6 +409,11 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
 
     private func layout() {
         let w = root.bounds.width, h = root.bounds.height
+        // Connection polls usually change no geometry. Avoid synchronous TextKit
+        // ensureLayout and resetting every child frame for the same input.
+        let signature = "\(w)|\(h)|\(embedded)|\(notesVisible)|\(feedback.stringValue.isEmpty)|\(loadButton.isHidden)|\(connectButton.isHidden)|\(unlockButton.isHidden)|" + composer.string
+        guard signature != lastLayoutSignature else { return }
+        lastLayoutSignature = signature; layoutWorkCount += 1
         let sidebar: CGFloat = notesVisible ? min(248, max(210, w * 0.28)) : 0
         let mainWidth = w - sidebar
         let column = min(768, mainWidth - 40), left = (mainWidth - column) / 2
@@ -394,7 +446,6 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         count.isHidden = composer.string.utf8.count < 1024
         let actionWidth: CGFloat = (!loadButton.isHidden ? 90 : 0) + (!connectButton.isHidden ? 112 : 0) + (!unlockButton.isHidden ? 165 : 0)
         connection.frame = NSRect(x: left + 2, y: composeY - 25, width: max(140, column - actionWidth - 12), height: 18)
-        connection.toolTip = connectionDiagnostic.isEmpty ? connection.stringValue : connectionDiagnostic
         var actionX = left + column
         for (button, width) in [(unlockButton, CGFloat(160)), (connectButton, 107), (loadButton, 85)] where !button.isHidden {
             actionX -= width; button.frame = NSRect(x: actionX, y: composeY - 31, width: width - 4, height: 26)
@@ -418,26 +469,59 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     private func refreshMetrics() {
         if let detail = detailProvider() {
             let state = ["running": "运行中", "waiting": "等待你处理", "complete": "本轮已结束", "aborted": "已中断", "interrupted": "已中断"][detail.status] ?? "待续"
-            summary.stringValue = state + " · " + detail.summaryLine() + " · " + detail.secondaryLine
-            summary.toolTip = summary.stringValue + "\n" + detail.settingsTooltip
-        } else { summary.stringValue = "待续 · 关闭后继续保留" }
+            let next = state + " · " + detail.summaryLine() + " · " + detail.secondaryLine
+            if summary.stringValue != next { summary.stringValue = next }
+            let tooltip = next + "\n" + detail.settingsTooltip
+            if summary.toolTip != tooltip { summary.toolTip = tooltip }
+        } else if summary.stringValue != "待续 · 关闭后继续保留" { summary.stringValue = "待续 · 关闭后继续保留" }
     }
     private func payload(_ values: [String: Any]) -> Data? { try? JSONSerialization.data(withJSONObject: values) }
     private func readConversation() {
-        guard !fixtureMode, isPresentationVisible, !reading, Date().timeIntervalSince(lastRead) > readDelay else { return }
+        let foreground = presentationWindow?.isKeyWindow == true
+        let budgetDelay = foreground ? readDelay : max(12, readDelay)
+        let recentWork = detailProvider()?.lastActivity.map { $0 > lastRead } ?? false
+        guard !fixtureMode, isPollingVisible, !reading, !checking, !sending, !loading,
+              Date().timeIntervalSince(lastRead) > (recentWork ? (foreground ? 1.5 : 8) : budgetDelay) else { return }
+        readRequestCount += 1
         reading = true; lastRead = Date(); loadGeneration += 1; let generation = loadGeneration
         var request: [String: Any] = ["thread_id": event.threadID]
         if !fingerprint.isEmpty { request["if_fingerprint"] = fingerprint }
         client.run(["read"], module: "vibecue.thread_info", input: payload(request)) { [weak self] result in
             guard let self else { return }; self.reading = false
             guard generation == self.loadGeneration else { return }
-            switch result {
-            case .success(let data): self.applyTranscript(data)
-            case .failure(let error):
-                self.fingerprint = ""; self.readDelay = 30; self.lastRead = Date()
-                self.source.stringValue = "最近对话 · 暂不可读"; self.source.toolTip = error.localizedDescription
-                if self.bodySignature.isEmpty { self.transcript.update(messages: [], state: "empty", message: "当前记录暂时无法读取，可在 Codex 中打开或稍后刷新。") }
-            }
+            defer { CueActivityScheduler.shared.poke(key: self.observationKey) }
+            self.receiveTranscriptResult(result, visible: self.isPollingVisible)
+        }
+    }
+    private func receiveTranscriptResult(_ result: Result<[String: Any], Error>, visible: Bool) {
+        if case .success(let data) = result, data["thread_id"] as? String != event.threadID { return }
+        guard visible else {
+            // An unchanged acknowledgement must not discard an unpresented full
+            // snapshot with that same fingerprint while the window is hidden.
+            if case .success(let next) = result, next["unchanged"] as? Bool == true,
+               case .success(let previous)? = deferredTranscriptResult,
+               previous["unchanged"] as? Bool != true,
+               let fingerprint = next["fingerprint"] as? String, !fingerprint.isEmpty,
+               previous["fingerprint"] as? String == fingerprint { return }
+            deferredTranscriptResult = result
+            return
+        }
+        deferredTranscriptResult = nil
+        applyTranscriptResult(result)
+    }
+    private func applyDeferredTranscriptIfVisible(_ visible: Bool) {
+        guard visible, let result = deferredTranscriptResult else { return }
+        deferredTranscriptResult = nil
+        applyTranscriptResult(result)
+    }
+    private func applyTranscriptResult(_ result: Result<[String: Any], Error>) {
+        transcriptApplicationCount += 1
+        switch result {
+        case .success(let data): applyTranscript(data)
+        case .failure(let error):
+            fingerprint = ""; readDelay = 30; lastRead = Date()
+            source.stringValue = "最近对话 · 暂不可读"; source.toolTip = error.localizedDescription
+            if bodySignature.isEmpty { transcript.update(messages: [], state: "empty", message: "当前记录暂时无法读取，可在 Codex 中打开或稍后刷新。") }
         }
     }
     private func applyTranscript(_ data: [String: Any]) {
@@ -452,7 +536,12 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         let coverage = data["coverage"] as? [String: Any] ?? [:]
         source.stringValue = readable ? (coverage["partial"] as? Bool == true ? "最近对话 · 部分记录" : "最近对话") : "最近对话 · 暂不可读"
         source.toolTip = data["message"] as? String
-        if data["unchanged"] as? Bool == true { return }
+        if data["unchanged"] as? Bool == true {
+            unchangedReads = min(unchangedReads + 1, 3)
+            readDelay = min(12, 1.5 * pow(2, Double(unchangedReads)))
+            return
+        }
+        unchangedReads = 0
         guard readable else { if bodySignature.isEmpty { transcript.update(messages: [], state: "empty", message: data["message"] as? String ?? "当前对话记录暂不可用。") }; return }
         if let title = data["title"] as? String, !title.isEmpty { titleField.stringValue = title; titleField.toolTip = title; window?.title = "VibeCoding Go · " + title }
         let messages = data["messages"] as? [[String: Any]] ?? []
@@ -475,8 +564,9 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         guard let date else { return "" }; let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm"; return formatter.string(from: date)
     }
     private func checkConnection(force: Bool = false) {
-        guard !fixtureMode, !checking, isPresentationVisible,
+        guard !fixtureMode, !checking, !reading, !sending, !loading, isPollingVisible,
               force || Date() >= nextStatusCheck else { return }
+        statusRequestCount += 1
         checking = true; nextStatusCheck = Date().addingTimeInterval(8)
         let generation = connectionGeneration
         client.run(["status"], module: "vibecue.codex_chat", input: payload(["thread_id": event.threadID])) { [weak self] result in
@@ -485,6 +575,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     }
     private func finishConnectionCheck(_ result: Result<[String: Any], Error>, generation: Int) {
         checking = false
+        defer { CueActivityScheduler.shared.poke(key: observationKey) }
         guard generation == connectionGeneration else {
             // A reply issued before a wake/restart cannot make the old owner
             // look ready again. Only a new discovery may restore sending.
@@ -527,6 +618,11 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         return min(15, initial * pow(2, Double(min(4, max(0, failures - 1)))))
     }
     private func updateControls() {
+        let signature = "\(canSend)|\(canLoad)|\(messageLimit)|\(sending)|\(loading)|\(pendingRequestID)|\(handled)|\(chatState)|\(chatTransport)|\(automaticReconnect)|\(connectionSupported)|\(needsLegacyConnectionSetup)|\(feedback.stringValue.isEmpty)|" + connection.stringValue + "\u{0}" + connectionDiagnostic + "\u{0}" + composer.string
+        guard signature != controlsSignature else { return }
+        controlsSignature = signature
+        let nextTooltip = connectionDiagnostic.isEmpty ? connection.stringValue : connectionDiagnostic
+        if connection.toolTip != nextTooltip { connection.toolTip = nextTooltip }
         let length = composer.string.utf8.count, hasText = !composer.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         count.stringValue = "\(length) / \(messageLimit) 字节"; count.textColor = length > messageLimit ? .systemRed : .secondaryLabelColor
         count.toolTip = "输入长度按 UTF-8 计算。中文通常占 3 字节；超限不会截断或发送。"
@@ -622,7 +718,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     @objc private func connectCodex() { if needsLegacyConnectionSetup { onConnect() } else { retryConnection() } }
     @objc private func retryConnection() { nextStatusCheck = .distantPast; if checking { connectionRefreshQueued = true } else { checkConnection(force: true) } }
     @objc private func revealProject() { onPathAction("reveal_project") }
-    @objc private func refresh() { fingerprint = ""; readDelay = 1.5; lastRead = .distantPast; if !transcript.renderError.isEmpty { transcript.reload() }; readConversation(); checkConnection(force: true) }
+    @objc private func refresh() { fingerprint = ""; unchangedReads = 0; readDelay = 1.5; lastRead = .distantPast; nextStatusCheck = .distantPast; if !transcript.renderError.isEmpty { transcript.reload() }; readConversation(); checkConnection(force: true) }
     private func handleTranscriptAction(_ action: String, value: String) {
         if action == "openAttachment" {
             let url = URL(fileURLWithPath: value).standardizedFileURL
@@ -676,6 +772,31 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         controller.applyTranscript(["thread_id": event.threadID, "source_readable": false, "fingerprint": "failed-source"])
         results["unreadable_source_never_poisoned_retry_fingerprint"] = controller.fingerprint.isEmpty
         results["failed_source_read_backs_off_without_losing_body"] = controller.readDelay == 30
+        let unchangedPayload: [String: Any] = ["thread_id": event.threadID, "source_readable": true, "unchanged": true, "fingerprint": "stable"]
+        for _ in 0..<8 { controller.applyTranscript(unchangedPayload) }
+        results["conversation_unchanged_excerpts_back_off_without_clearing_fingerprint"] = controller.unchangedReads == 3 && controller.readDelay == 12 && controller.fingerprint == "stable"
+        controller.fixtureMode = false
+        let hiddenReads = controller.readRequestCount, hiddenStatuses = controller.statusRequestCount
+        for _ in 0..<20 { controller.pollVisibleWork(); controller.readConversation(); controller.checkConnection(force: true) }
+        results["conversation_hidden_window_never_launches_observation_workers"] = controller.readRequestCount == hiddenReads && controller.statusRequestCount == hiddenStatuses
+        controller.fixtureMode = true
+        let late = CueConversationController(home: home.appendingPathComponent("late-results"), event: event, detailProvider: { nil }, onHandled: {}, onCodex: {}, onConnect: {}, onPathAction: { _ in })
+        late.fixtureMode = true
+        let lateBody = late.bodySignature, lateLayouts = late.layoutWorkCount
+        let oldLate: [String: Any] = ["thread_id": event.threadID, "source_readable": true, "fingerprint": "old-cached", "messages": [["role": "assistant", "text": "old-cached"]]]
+        let newLate: [String: Any] = ["thread_id": event.threadID, "source_readable": true, "fingerprint": "newest-cached", "messages": [["role": "assistant", "text": "newest-cached"]]]
+        late.receiveTranscriptResult(.success(oldLate), visible: false)
+        late.receiveTranscriptResult(.success(newLate), visible: false)
+        late.applyDeferredTranscriptIfVisible(false)
+        results["conversation_hidden_late_excerpt_only_caches_without_presentation_work"] = late.transcriptApplicationCount == 0 && late.layoutWorkCount == lateLayouts && late.bodySignature == lateBody && late.deferredTranscriptResult != nil
+        late.receiveTranscriptResult(.success(["thread_id": event.threadID, "source_readable": true, "unchanged": true, "fingerprint": "newest-cached"]), visible: false)
+        late.applyDeferredTranscriptIfVisible(true)
+        late.applyDeferredTranscriptIfVisible(true)
+        results["conversation_resuming_applies_only_latest_cached_excerpt_once"] = late.transcriptApplicationCount == 1 && late.deferredTranscriptResult == nil && late.fingerprint == "newest-cached" && late.bodySignature.contains("newest-cached") && !late.bodySignature.contains("old-cached")
+        controller.updateControls()
+        let layoutBefore = controller.layoutWorkCount
+        for _ in 0..<20 { controller.updateControls() }
+        results["conversation_unchanged_controls_skip_textkit_and_child_layout"] = controller.layoutWorkCount == layoutBefore
         controller.pendingRequestID = "send-one"; controller.composer.string = "实际发送的内容"
         controller.applySendResult(["status": "unverified", "thread_id": event.threadID, "request_id": "send-one"], sentText: "实际发送的内容", requestID: "send-one")
         results["unconfirmed_send_keeps_draft_and_blocks_duplicate_retry"] = controller.pendingRequestID == "send-one" && controller.composer.string == "实际发送的内容"
@@ -783,7 +904,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         let hiddenDuringSend = embeddedViewer.setEmbeddedVisible(false)
         embeddedViewer.releaseClosedWindowIfIdle()
         let embeddedSaved = CueConversationDrafts(home: geometryHome).values(embeddedEvent.threadID)
-        results["embedded_switch_keeps_inflight_send_and_pending_receipt"] = hiddenDuringSend && !embeddedViewer.isEmbeddedActive && embeddedViewer.hasInFlightOperation && embeddedViewer.pendingRequestID == "embedded-send-one" && embeddedSaved["pending_request_id"] == "embedded-send-one" && embeddedSaved["draft"] == "发送中的草稿" && embeddedClosed == 0 && embeddedViewer.timer == nil && embeddedViewer.applicationObservers.isEmpty && embeddedViewer.workspaceObservers.isEmpty
+        results["embedded_switch_keeps_inflight_send_and_pending_receipt"] = hiddenDuringSend && !embeddedViewer.isEmbeddedActive && embeddedViewer.hasInFlightOperation && embeddedViewer.pendingRequestID == "embedded-send-one" && embeddedSaved["pending_request_id"] == "embedded-send-one" && embeddedSaved["draft"] == "发送中的草稿" && embeddedClosed == 0 && embeddedViewer.activityLease == nil && embeddedViewer.applicationObservers.isEmpty && embeddedViewer.workspaceObservers.isEmpty
         embeddedViewer.sending = false
         embeddedViewer.applySendResult(["status": "accepted", "thread_id": embeddedEvent.threadID, "request_id": "embedded-send-one"], sentText: "发送中的草稿", requestID: "embedded-send-one")
         embeddedViewer.releaseClosedWindowIfIdle()
@@ -852,6 +973,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
                        "conversation_composer_and_body_share_reading_axis": controller.composerSurface.frame.width == 768 && controller.transcript.frame.width == controller.root.bounds.width,
                        "conversation_input_is_native_editable_and_plain_text": controller.composer.isEditable && !controller.composer.isRichText]
         guard ready else { return results }
+        results.merge(controller.transcript.performanceValidationReport()) { _, new in new }
         var response: [String: Any]?
         controller.transcript.evaluate("({headings:document.querySelectorAll('.message-body h2').length, tables:document.querySelectorAll('.message-body table').length, code:document.querySelectorAll('.code-block').length, copies:document.querySelectorAll('[data-action=copy-code]').length, roles:document.querySelectorAll('.message-user').length, activities:document.querySelectorAll('details').length, invalidNavigation:document.querySelectorAll('a[href],iframe,img').length, theme:document.documentElement.dataset.theme})") { value, _ in response = value as? [String: Any] }
         let deadline = Date().addingTimeInterval(5)
