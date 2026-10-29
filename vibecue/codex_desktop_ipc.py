@@ -42,6 +42,10 @@ class DesktopConnectionInterrupted(ControlError):
     """A read-only operation may retry using a fresh desktop/client identity."""
 
 
+class DesktopProtocolUnsupported(ControlError):
+    """The verified desktop peer uses a build whose protocol is unreviewed."""
+
+
 def _private_socket(path):
     uid = os.getuid()
     parent, target = path.parent.lstat(), path.lstat()
@@ -84,7 +88,7 @@ def _peer_bundle(sock):
         if info.get('CFBundleIdentifier') != 'com.openai.codex':
             raise ValueError()
         if (str(info.get('CFBundleShortVersionString')), str(info.get('CFBundleVersion'))) not in DESKTOP_BUILDS:
-            raise ControlError('当前 Codex 版本的窗口回复协议尚未核对，请更新 VibeCue')
+            raise DesktopProtocolUnsupported('当前 Codex 版本的窗口回复协议尚未核对，请更新 VibeCue')
         return bundle
     except ControlError:
         raise

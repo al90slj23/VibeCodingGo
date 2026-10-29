@@ -5,7 +5,7 @@ import stat
 import struct
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 from vibecue import codex_desktop_ipc as ipc
 from vibecue.codex_control import ControlError, UnconfirmedUpdate
@@ -178,6 +178,24 @@ class DesktopIPCTests(unittest.TestCase):
                     pass
         self.assertEqual(fake.sent, [])
         self.assertTrue(fake.closed)
+
+    def test_only_verified_codex_peer_build_mismatch_has_unsupported_type(self):
+        def proc_pidpath(pid, buffer, size):
+            buffer.value = b'/Applications/Codex.app/Contents/MacOS/Codex'
+            return len(buffer.value)
+        peer = SimpleNamespace(getsockopt=lambda *args: struct.pack('i', 42))
+        libproc = SimpleNamespace(proc_pidpath=proc_pidpath)
+        info = {'CFBundleIdentifier': 'com.openai.codex',
+                'CFBundleShortVersionString': '99.0.0', 'CFBundleVersion': '99999'}
+        with patch.object(ipc.sys, 'platform', 'darwin'), patch.object(ipc.ctypes, 'CDLL', return_value=libproc), \
+                patch.object(Path, 'resolve', return_value=Path('/Applications/Codex.app')), \
+                patch.object(Path, 'open', mock_open(read_data=b'plist')), patch.object(ipc.plistlib, 'load', return_value=info):
+            with self.assertRaises(ipc.DesktopProtocolUnsupported):
+                ipc._peer_bundle(peer)
+            info['CFBundleIdentifier'] = 'com.example.other'
+            with self.assertRaises(ControlError) as caught:
+                ipc._peer_bundle(peer)
+            self.assertNotIsInstance(caught.exception, ipc.DesktopProtocolUnsupported)
 
     def test_private_socket_rejects_symlink_and_broad_permissions(self):
         folder = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=os.getuid())

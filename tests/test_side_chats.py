@@ -123,6 +123,23 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(self.projection.snapshot()['parent_thread_id'], PARENT)
         self.assertFalse(self.projection.snapshot()['can_interact'])
 
+    def test_cached_relation_requires_a_new_snapshot_and_cannot_be_reparented(self):
+        self.projection.apply(change(titled_state('Own question')))
+        restored = SideChatProjection(CHILD, OWNER, clock=lambda: self.now,
+                                      previous=self.projection.snapshot())
+        restored.mark_live()
+        self.assertEqual(restored.snapshot()['status'], 'disconnected')
+        self.assertFalse(restored.snapshot()['can_open'])
+        changed = state()
+        changed['forkedFromId'] = OTHER
+        changed['sideConversationParentNavigationPath'] = '/local/' + OTHER
+        with self.assertRaises(NotSideChat):
+            restored.apply(change(changed))
+        self.assertEqual(restored.snapshot()['parent_thread_id'], PARENT)
+        restored.apply(change())
+        self.assertEqual(restored.snapshot()['title'], 'Own question')
+        self.assertTrue(restored.snapshot()['can_open'])
+
 
 class ScannerTests(unittest.TestCase):
     def setUp(self):
@@ -183,6 +200,8 @@ class FakeChannel:
     socket = None
     unavailable = False
     def __init__(self): self.sent = []; self.calls = []
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
     def _send(self, value): self.sent.append(value)
     def discover(self):
         self.calls.append(self.thread_id)
@@ -196,10 +215,10 @@ class ServiceTests(unittest.TestCase):
         self.service = SideChatService('/fixture', home='/fixture', channel_factory=None, scanner=scanner, clock=lambda: self.now)
         self.service.channel = FakeChannel(); self.service.connected = True
 
-    def message(self, value=None, **replace):
+    def message(self, value=None, revision=1, **replace):
         result = {'type': 'broadcast', 'method': 'thread-stream-state-changed', 'version': 11,
                   'sourceClientId': OWNER, 'targetClientIds': [CLIENT],
-                  'params': {'hostId': 'local', 'conversationId': CHILD, 'change': change(value)}}
+                  'params': {'hostId': 'local', 'conversationId': CHILD, 'change': change(value, revision)}}
         result.update(replace)
         return result
 
@@ -225,6 +244,110 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(row['can_open'])
         self.assertNotIn(CHILD, self.service.projections)
         self.assertEqual(len(self.service.known), 1)
+
+    def test_lower_revision_requires_fresh_follow_then_recovers_without_candidate_cooldown(self):
+        self.service._discover()
+        self.service._on_message(self.message(titled_state('Verified own title'), revision=90))
+        original = self.service.projections[CHILD]
+        self.service._on_message(self.message(state('completed', 'idle'), revision=1))
+        self.service._on_message(self.message(state('completed', 'idle'), revision=91))  # Queued old stream.
+        self.assertEqual(original.revision, 90)
+        row = self.service.snapshot()['by_parent'][PARENT][0]
+        self.assertEqual(row['status'], 'disconnected')
+        self.assertFalse(row['can_open'])
+        self.assertEqual(row['title'], 'Verified own title')
+        self.service._discover()
+        self.assertNotIn(CHILD, self.service.projections)
+        self.assertFalse(self.service.channel.sent[-1]['params']['following'])
+        self.now += 2
+        self.service._discover()
+        self.assertIsNot(self.service.projections[CHILD], original)
+        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_interact'])
+        self.service._on_message(self.message(revision=1))
+        row = self.service.snapshot()['by_parent'][PARENT][0]
+        self.assertEqual(row['status'], 'running')
+        self.assertEqual(row['title'], 'Verified own title')
+        self.assertTrue(row['can_interact'])
+        self.assertEqual(len(self.service.channel.calls), 2)
+
+    def test_patch_gap_loses_permissions_and_known_owner_replacement_revalidates(self):
+        self.service._discover(); self.service._on_message(self.message(revision=90))
+        message = self.message()
+        message['params']['change'] = {'type': 'patches', 'baseRevision': 89, 'revision': 91, 'patches': []}
+        self.service._on_message(message)
+        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_open'])
+        self.service._discover()
+        self.now += 2
+        new_owner = '33333333-3333-4333-8333-333333333333'
+        self.service.channel.owner = new_owner
+        self.service._discover()
+        for malformed in (None, [], 'invalid'):
+            self.service._on_message(malformed)
+        self.service._on_message(self.message(state('completed', 'idle')))
+        self.service._on_message(self.message(sourceClientId=new_owner, targetClientIds=['old-client']))
+        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_open'])
+        self.service._on_message(self.message(sourceClientId=new_owner))
+        self.assertEqual(self.service.snapshot()['by_parent'][PARENT][0]['status'], 'running')
+
+    def test_missing_owner_retries_known_relation_soon_and_never_reuses_terminal_status(self):
+        self.service._discover(); self.service._on_message(self.message(state('completed', 'idle')))
+        self.now += 16
+        self.service.channel.unavailable = True
+        self.service._discover()
+        self.assertEqual(self.service.snapshot()['by_parent'][PARENT][0]['status'], 'disconnected')
+        self.now += 2
+        self.service._discover()
+        self.assertEqual(len(self.service.channel.calls), 3)
+        self.service.channel.unavailable = False
+        self.now += 2
+        self.service._discover()
+        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_open'])
+        self.service._on_message(self.message())
+        self.assertEqual(self.service.snapshot()['by_parent'][PARENT][0]['status'], 'running')
+
+    def test_two_missing_known_owners_cannot_starve_older_known_or_new_candidates(self):
+        class DiscoveryChannel(FakeChannel):
+            def discover(channel):
+                channel.calls.append(channel.thread_id)
+                if channel.thread_id != PARENT:
+                    raise DesktopOwnerUnavailable('fixture owner unavailable')
+
+        for reachable_is_known in (True, False):
+            with self.subTest(reachable_is_known=reachable_is_known):
+                self.now = 1000.0
+                service = SideChatService('/fixture', home='/fixture', channel_factory=None,
+                                          scanner=self.service.scanner, clock=lambda: self.now)
+                service.channel = DiscoveryChannel(); service.connected = True
+                threads = (PARENT, CHILD, OTHER) if reachable_is_known else (CHILD, OTHER)
+                for thread in threads:
+                    projection = SideChatProjection(CHILD, OWNER, clock=lambda: self.now)
+                    projection.apply(change())
+                    service.known[thread] = dict(projection.snapshot(False), thread_id=thread,
+                                                 parent_thread_id='44444444-4444-4444-8444-444444444444')
+                service.candidates[PARENT] = self.now
+                for tick in range(3):
+                    self.now = 1000.0 + tick
+                    service._discover()
+                # Known chats win the initial priority, then both unavailable
+                # owners yield to the next chat instead of alternating forever.
+                self.assertEqual(service.channel.calls, [OTHER, CHILD, PARENT])
+                self.assertIn(PARENT, service.projections)
+
+    def test_connection_restart_clears_old_subscription_cooldown_and_rechecks_relation(self):
+        self.service._discover(); self.service._on_message(self.message(revision=90))
+        self.service.next_attempt[CHILD] = self.now + 180
+        self.service.channel_factory = lambda *args, **kwargs: FakeChannel()
+        with patch('vibecue.side_chats.select.select', side_effect=ControlError('fixture restart')), \
+                patch.object(self.service.stop_event, 'wait', return_value=True):
+            self.service._run()
+        self.assertNotIn(CHILD, self.service.next_attempt)
+        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_open'])
+        self.service.channel = FakeChannel(); self.service.connected = True
+        self.service._discover()
+        self.assertIn(CHILD, self.service.projections)
+        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_open'])
+        self.service._on_message(self.message(revision=1))
+        self.assertTrue(self.service.snapshot()['by_parent'][PARENT][0]['can_open'])
 
     def test_non_side_chat_is_unfollowed_and_never_exported(self):
         self.service._discover()

@@ -15,7 +15,8 @@ import threading
 import time
 
 from .codex_control import ControlError, THREAD_ID
-from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable
+from .codex_desktop_ipc import (DesktopChannel, DesktopConnectionInterrupted,
+                                DesktopOwnerUnavailable, DesktopProtocolUnsupported)
 from .codex_runtime import RuntimeProjection
 from .current_model_settings import ModelSettingsProjection, unavailable_settings
 from .model_presentation import ModelPresentation
@@ -27,6 +28,10 @@ SOURCE = 'codex client approval stream'
 MAX_THREADS = 64
 MAX_REQUESTS = 512
 REQUEST_METHODS = APPROVAL_METHODS | INPUT_METHODS | {'item/plan/requestImplementation'}
+
+
+class AttentionRevisionGap(ControlError):
+    """This chat needs a fresh snapshot, without changing desktop compatibility."""
 
 
 def request_metadata(value):
@@ -73,14 +78,14 @@ class AttentionProjection:
             raise ControlError('对话订阅版本无效')
         if change.get('type') == 'snapshot':
             if self.revision is not None and revision < self.revision:
-                raise ControlError('对话订阅快照早于已观察版本')
+                raise AttentionRevisionGap('对话订阅快照早于已观察版本')
             state = change.get('conversationState')
             if not isinstance(state, dict) or state.get('id') not in (None, self.thread):
                 raise ControlError('对话快照与所选对话不一致')
             self.requests = request_list(state.get('requests'))
         elif change.get('type') == 'patches':
             if self.revision is None or change.get('baseRevision') != self.revision or revision <= self.revision:
-                raise ControlError('对话订阅出现版本缺口，正在重新连接')
+                raise AttentionRevisionGap('对话订阅出现版本缺口，正在重新连接')
             patches = change.get('patches')
             if not isinstance(patches, list) or len(patches) > 10000:
                 raise ControlError('对话订阅增量无效')
@@ -301,7 +306,7 @@ class DesktopAttentionService:
         self._thread = None
         self._threads = []
         self._stdio = False
-        self._health = {'connected': False, 'status': 'reconnecting', 'message': '正在自动连接 Codex', 'last_seen': 0,
+        self._health = {'connected': False, 'status': 'reconnecting', 'reason_code': 'recovering', 'message': '正在自动连接 Codex', 'last_seen': 0,
                         'capabilities': {'reply': False, 'control': False, 'attention': False}}
         self.monitor = DesktopAttentionMonitor(home)
         self.model_presentation = ModelPresentation(codex_home)
@@ -312,6 +317,7 @@ class DesktopAttentionService:
         self.subscribed_at = {}
         self.quarantine_until = {}
         self.unavailable_reasons = {}
+        self.resync_attempts = {}
         self._reconnect_stamp = None
         self._reconnect_seen = False
 
@@ -415,11 +421,18 @@ class DesktopAttentionService:
         if message.get('type') != 'broadcast':
             return
         if message.get('method') == 'ipc-connection-reset':
-            raise ControlError('Codex 连接已重建，正在自动重连')
+            with self._lock:
+                self.quarantine_until.clear()
+                self.unavailable_reasons.clear()
+            raise DesktopConnectionInterrupted('Codex 连接已重建，正在自动重连')
         if message.get('method') == 'client-status-changed':
             params = message.get('params')
-            if isinstance(params, dict) and params.get('status') == 'disconnected' and any(projection.owner == params.get('clientId') for projection in self.projections.values()):
-                raise ControlError('对话窗口连接已变化，正在自动恢复')
+            if isinstance(params, dict) and params.get('status') == 'disconnected':
+                with self._lock:
+                    threads = [thread for thread, projection in self.projections.items() if projection.owner == params.get('clientId')]
+                for thread in threads:
+                    self._invalidate_thread(thread, '对话窗口连接已变化，正在自动恢复')
+            return
         if message.get('method') != 'thread-stream-state-changed' or message.get('version') != 11:
             return
         params = message.get('params')
@@ -433,14 +446,42 @@ class DesktopAttentionService:
             try:
                 projection.apply(params.get('change'))
             except ControlError:
-                # One drifted thread must not repeatedly disconnect healthy
-                # chats immediately after each global reconnect.
-                self.quarantine_until[projection.thread] = time.monotonic() + 30
-                raise
+                # Revisions belong to the owner's in-memory conversation cache.
+                # Logout/reload can restart that cache at zero on the same
+                # socket and owner ID. Discard every derived field and request
+                # before obtaining a new full snapshot for only this chat.
+                self._invalidate_thread(projection.thread, '正在重新读取此对话的 Codex 当前状态')
+                return
             self.monitor.update(projection)
             self.unavailable_reasons.pop(projection.thread, None)
+            self.resync_attempts.pop(projection.thread, None)
             self._health['last_seen'] = time.time()
             self._health['capabilities']['attention'] = True
+            if not self.resync_attempts:
+                self._health.update(reason_code='connected', message='已自动复用当前 Codex 连接')
+
+    def _invalidate_thread(self, thread, reason, *, retry=True):
+        """Retire one subscription epoch; settled alerts cannot survive its gap."""
+        with self._lock:
+            projection = self.projections.pop(thread, None)
+            self.subscribed_at.pop(thread, None)
+            self.monitor.gap(thread)
+            if retry:
+                attempts = min(6, self.resync_attempts.get(thread, 0) + 1)
+                self.resync_attempts[thread] = attempts
+                self.next_discovery[thread] = time.monotonic() + min(30, 2 ** (attempts - 1))
+                self.unavailable_reasons[thread] = reason
+                self._health.update(reason_code='stream_resync', message='正在自动重新同步 Codex 对话')
+            else:
+                self.next_discovery.pop(thread, None)
+                self.resync_attempts.pop(thread, None)
+                self.unavailable_reasons.pop(thread, None)
+                self.quarantine_until.pop(thread, None)
+                if not self.resync_attempts and self._health['connected']:
+                    self._health.update(reason_code='connected', message='已自动复用当前 Codex 连接')
+            self._health['capabilities']['attention'] = any(row.revision is not None for row in self.projections.values())
+        if projection is not None:
+            self._follow(thread, projection.owner, False)
 
     def _follow(self, thread, owner, value):
         self.channel._send({'type': 'broadcast', 'sourceClientId': self.channel.client_id,
@@ -450,20 +491,16 @@ class DesktopAttentionService:
     def _discover(self, desired):
         with self._lock:
             existing = list(self.projections)
+            retired = (set(self.next_discovery) | set(self.resync_attempts) | set(self.unavailable_reasons) | set(self.quarantine_until)) - set(desired) - set(existing)
+        for thread in retired:
+            self._invalidate_thread(thread, '', retry=False)
         for thread in existing:
             projection = self.projections[thread]
             missing_snapshot = projection.revision is None and time.monotonic() - self.subscribed_at.get(thread, 0) > 5
             invalidated = projection.settings.invalidated or projection.runtime.invalidated
             if thread not in desired or missing_snapshot or invalidated:
-                with self._lock:
-                    projection = self.projections.pop(thread)
-                    if missing_snapshot:
-                        self.unavailable_reasons[thread] = 'Codex 未返回此对话的当前状态快照'
-                self._follow(thread, projection.owner, False)
-                with self._lock:
-                    self.monitor.gap(thread)
-                    if invalidated:
-                        self.next_discovery.pop(thread, None)
+                reason = 'Codex 未返回此对话的当前状态快照' if missing_snapshot else '正在重新读取此对话的 Codex 当前状态'
+                self._invalidate_thread(thread, reason, retry=thread in desired)
         # Do not send another discovery while a full initial snapshot is in
         # flight: this keeps size/gap attribution local to one candidate.
         if any(projection.revision is None for projection in self.projections.values()):
@@ -487,6 +524,10 @@ class DesktopAttentionService:
                 with self._lock:
                     self.unavailable_reasons[thread] = '此对话未在 Codex 加载，打开后自动读取当前设置'
                 # Not open: do not load or claim it just to obtain state.
+            except (DesktopConnectionInterrupted, DesktopProtocolUnsupported):
+                # Transport loss and verified peer incompatibility are global,
+                # not evidence that this candidate needs a long quarantine.
+                raise
             except ControlError as error:
                 if '不支持安全的外部消息输入' not in str(error):
                     # A read deadline may expire while the router is proving
@@ -510,7 +551,7 @@ class DesktopAttentionService:
                     self.channel = channel
                 with channel:
                     with self._lock:
-                        self._health.update(connected=True, status='connected', message='已自动复用当前 Codex 连接', last_seen=time.time(),
+                        self._health.update(connected=True, status='connected', reason_code='connected', message='已自动复用当前 Codex 连接', last_seen=time.time(),
                                             capabilities={'reply': True, 'control': True, 'attention': False})
                     while not self._stop.is_set():
                         if time.monotonic() - opened_at >= 10:
@@ -545,9 +586,10 @@ class DesktopAttentionService:
                             self._health['last_seen'] = time.time()
             except (ControlError, OSError, ValueError, TypeError, RecursionError, OverflowError) as error:
                 message = str(error) if isinstance(error, ControlError) else 'Codex 连接暂不可用，正在自动重试'
-                unsupported = '版本' in message or '协议' in message
+                unsupported = isinstance(error, DesktopProtocolUnsupported)
                 with self._lock:
-                    self._health.update(connected=False, status='unsupported' if unsupported else 'reconnecting', message=message,
+                    self._health.update(connected=False, status='unsupported' if unsupported else 'reconnecting',
+                                        reason_code='protocol_unsupported' if unsupported else 'recovering', message=message,
                                         last_seen=time.time(),
                                         capabilities={'reply': False, 'control': False, 'attention': False})
             finally:
@@ -561,12 +603,12 @@ class DesktopAttentionService:
                     channel.close()
                 with self._lock:
                     self.monitor.gap()
-                    self.projections.clear(); self.next_discovery.clear(); self.subscribed_at.clear(); self.channel = None
+                    self.projections.clear(); self.next_discovery.clear(); self.subscribed_at.clear(); self.resync_attempts.clear(); self.channel = None
             if self._wait_retry(delay):
                 break
             delay = min(30, delay * 2)
         with self._lock:
-            self._health.update(connected=False, status='disconnected', message='本机监控已停止',
+            self._health.update(connected=False, status='disconnected', reason_code='stopped', message='本机监控已停止',
                                 capabilities={'reply': False, 'control': False, 'attention': False})
 
     def _retry_stamp(self):

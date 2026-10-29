@@ -32,6 +32,7 @@ MAX_LOG_TAIL = 4 * 1024 * 1024
 MAX_LOG_LINE = 8192
 SCAN_SECONDS = 30
 RETRY_SECONDS = 180
+RECONNECT_SECONDS = 2
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 LOG_ID = re.compile(rb'\bconversationId=(' + UUID_PATTERN.encode() + rb')(?=\s|$)')
 OWNER_ROLE = re.compile(rb'\brole=owner(?=\s|$)')
@@ -186,13 +187,16 @@ class NotSideChat(ControlError):
 
 
 class SideChatProjection:
-    def __init__(self, thread, owner, *, clock=time.time):
+    def __init__(self, thread, owner, *, clock=time.time, previous=None):
         from .desktop_attention import AttentionProjection
         self.thread, self.owner, self.clock = thread, owner, clock
         self.attention = AttentionProjection(thread, owner)
         self.attention.runtime.clock = clock
-        self.relation = None
-        self.observed_at = self.verified_at = None
+        # A cached relationship is an identity constraint, never a live lease.
+        self.relation = ({key: previous[key] for key in ('thread_id', 'parent_thread_id', 'ephemeral', 'title', 'source')}
+                         if previous else None)
+        self.observed_at = previous.get('observed_at') if previous else None
+        self.verified_at = previous.get('verified_at') if previous else None
         self.invalidated = False
 
     @property
@@ -202,6 +206,7 @@ class SideChatProjection:
     def apply(self, change):
         if not isinstance(change, dict):
             raise ControlError('侧聊订阅更新无效')
+        relation = None
         if change.get('type') == 'snapshot':
             state = change.get('conversationState')
             relation = relationship_metadata(state, self.thread)
@@ -212,9 +217,6 @@ class SideChatProjection:
                 relation['title'] = title
             elif self.relation:
                 relation['title'] = self.relation['title']
-            self.relation = relation
-            if self.observed_at is None:
-                self.observed_at = self.clock()
         elif change.get('type') == 'patches':
             for patch in change.get('patches', []) if isinstance(change.get('patches'), list) else []:
                 path = patch.get('path') if isinstance(patch, dict) else None
@@ -223,6 +225,10 @@ class SideChatProjection:
                     self.invalidated = True
                     raise ControlError('侧聊身份已变化，需要重新核对')
         self.attention.apply(change)
+        if relation is not None:
+            self.relation = relation
+            if self.observed_at is None:
+                self.observed_at = self.clock()
         self.verified_at = self.clock()
 
     def mark_live(self):
@@ -235,7 +241,7 @@ class SideChatProjection:
         if self.relation is None:
             return None
         runtime = self.attention.runtime.snapshot()
-        fresh = (connected and not self.invalidated and self.verified_at is not None
+        fresh = (connected and self.revision is not None and not self.invalidated and self.verified_at is not None
                  and self.verified_at - 5 <= self.clock() <= self.verified_at + 30)
         raw = runtime.get('state') if fresh else None
         status = {'running': 'running', 'waiting': 'waiting', 'complete': 'completed', 'aborted': 'interrupted'}.get(raw)
@@ -370,6 +376,8 @@ class SideChatService:
                             'params': {'conversationId': thread, 'hostId': 'local', 'following': value}})
 
     def _on_message(self, message):
+        if not isinstance(message, dict):
+            return
         if message.get('type') == 'vibecue-observation-gap':
             raise ControlError('侧聊快照过大，暂时无法读取')
         if message.get('type') != 'broadcast':
@@ -384,7 +392,9 @@ class SideChatService:
             return
         projection = self.projections.get(params.get('conversationId'))
         targets = message.get('targetClientIds')
-        if projection is None or projection.thread in self.rejected or message.get('sourceClientId') != projection.owner or not isinstance(targets, list) or self.channel.client_id not in targets:
+        if (projection is None or projection.invalidated or projection.thread in self.rejected
+                or message.get('sourceClientId') != projection.owner or not isinstance(targets, list)
+                or self.channel.client_id not in targets):
             return
         with self.lock:
             try:
@@ -393,9 +403,16 @@ class SideChatService:
                 projection.invalidated = True
                 self.rejected.add(projection.thread)
                 return
+            except ControlError:
+                # Revisions belong to this owner subscription. A restarted
+                # stream may begin lower, but must first be followed afresh.
+                projection.invalidated = True
+                self.next_attempt[projection.thread] = self.clock() + RECONNECT_SECONDS
+                return
             value = projection.snapshot()
             if value:
                 self.known[projection.thread] = value
+                self.next_attempt.pop(projection.thread, None)
                 self.cache_dirty = True
                 while len(self.known) > MAX_CANDIDATES:
                     self.known.popitem(last=False)
@@ -415,13 +432,22 @@ class SideChatService:
             expired = projection.revision is None and now - self.subscribed_at.get(thread, now) > 5
             invalid = projection.invalidated or projection.attention.runtime.invalidated or projection.attention.settings.invalidated
             if thread in self.rejected or expired or invalid:
-                self._follow(thread, projection.owner, False)
                 with self.lock:
+                    projection.invalidated = True
+                    value = projection.snapshot(False)
+                    if value:
+                        self.known[thread] = value
+                        self.cache_dirty = True
                     self.projections.pop(thread, None)
                 if thread in self.rejected:
                     self.candidates.pop(thread, None)
                     self.next_attempt[thread] = now + RETRY_SECONDS
+                else:
+                    self.next_attempt[thread] = now + (RECONNECT_SECONDS if thread in self.known else RETRY_SECONDS)
                 self.rejected.discard(thread)
+                self.subscribed_at.pop(thread, None)
+                self.next_owner_check.pop(thread, None)
+                self._follow(thread, projection.owner, False)
         if now < self.next_probe or any(p.revision is None for p in self.projections.values()):
             return
         # A live socket alone does not prove an ephemeral tab still exists.
@@ -437,25 +463,33 @@ class SideChatService:
                 if self.channel.owner != projection.owner:
                     raise DesktopOwnerUnavailable('侧聊 owner 已变化')
             except DesktopOwnerUnavailable:
-                self._follow(thread, projection.owner, False)
                 with self.lock:
+                    projection.invalidated = True
                     self.known[thread] = projection.snapshot(False)
                     self.projections.pop(thread, None)
-                self.next_attempt[thread] = now + 15
+                    self.cache_dirty = True
+                self.subscribed_at.pop(thread, None)
+                self.next_owner_check.pop(thread, None)
+                self.next_attempt[thread] = now + RECONNECT_SECONDS
+                self._follow(thread, projection.owner, False)
             return
         if sum(p.relation is not None for p in self.projections.values()) >= MAX_SIDE_CHATS:
             return
-        # Reconnect known relationships first; newest log candidates follow.
+        # Start with known relationships and newest log candidates, but serve
+        # never/least-recently attempted chats before retrying missing owners.
+        # Otherwise two closed known tabs can consume every 2-second retry.
         candidates = list(reversed(self.known)) + list(reversed(self.candidates))
-        for thread in dict.fromkeys(candidates):
+        candidates = sorted(dict.fromkeys(candidates), key=lambda thread: self.next_attempt.get(thread, 0))
+        for thread in candidates:
             if thread in self.projections or now < self.next_attempt.get(thread, 0):
                 continue
             self.next_probe = now + 1
-            self.next_attempt[thread] = now + RETRY_SECONDS
+            self.next_attempt[thread] = now + (RECONNECT_SECONDS if thread in self.known else RETRY_SECONDS)
             self.channel.thread_id = thread
             try:
                 self.channel.discover()
-                projection = SideChatProjection(thread, self.channel.owner, clock=self.clock)
+                projection = SideChatProjection(thread, self.channel.owner, clock=self.clock,
+                                                previous=self.known.get(thread))
                 with self.lock:
                     self.projections[thread] = projection
                 self.subscribed_at[thread] = now
@@ -508,6 +542,14 @@ class SideChatService:
                             self.cache_dirty = True
                     self.connected = False
                     self.projections.clear()
+                    self.subscribed_at.clear()
+                    self.next_owner_check.clear()
+                    # A new socket has new owner discovery and subscriptions;
+                    # an old candidate cooldown must not delay known chats.
+                    for thread in self.known:
+                        if thread not in self.rejected:
+                            self.next_attempt.pop(thread, None)
+                    self.next_probe = 0
                     self.channel = None
                 self._save_cache(force=True)
             if self.stop_event.wait(delay):

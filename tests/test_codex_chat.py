@@ -196,6 +196,46 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(result['retry_after_seconds'], 2)
 
 
+class DesktopReadonlyRecoveryTests(unittest.TestCase):
+    def desktop(self, operation, failures):
+        from vibecue.codex_chat import desktop_run
+        with patch('vibecue.codex_chat.time.sleep'), \
+             patch('vibecue.codex_desktop_ipc.DesktopChannel') as channel, \
+             patch('vibecue.codex_chat.DesktopChatController') as controller, \
+             patch('vibecue.events.codex_directory') as directory:
+            directory.return_value.__truediv__.return_value.exists.return_value = True
+            getattr(controller.return_value, operation).side_effect = failures
+            result = desktop_run(operation, {'thread_id':'thread-one'})
+            return result, channel.call_count, getattr(controller.return_value, operation).call_count
+
+    def test_revision_reset_read_retries_and_can_recover_without_user_input(self):
+        recovered = {'thread_id':'thread-one','connected':True,'can_send':True,'state':'idle'}
+        result, channels, calls = self.desktop('status', [ControlError('对话订阅快照早于已观察版本'), recovered])
+        self.assertTrue(result['can_send'])
+        self.assertEqual((channels,calls),(2,2))
+
+    def test_persistent_transient_read_error_remains_automatically_retryable(self):
+        result, channels, calls = self.desktop('status', ControlError('对话状态快照无效'))
+        self.assertTrue(result['auto_reconnect'])
+        self.assertEqual(result['state'],'reconnecting')
+        self.assertEqual(result['reason_code'],'recovering')
+        self.assertFalse(result['can_send'])
+        self.assertEqual((channels,calls),(2,2))
+
+    def test_verified_protocol_incompatibility_is_never_relabelled_as_connected(self):
+        from vibecue.codex_desktop_ipc import DesktopProtocolUnsupported
+        result, channels, calls = self.desktop('status', DesktopProtocolUnsupported('当前协议需要适配'))
+        self.assertFalse(result['auto_reconnect'])
+        self.assertEqual(result['reason_code'],'protocol_unsupported')
+        self.assertEqual((channels,calls),(1,1))
+
+    def test_mutation_is_never_replayed_after_transient_error(self):
+        result, channels, calls = self.desktop('send', ControlError('连接已变化'))
+        self.assertFalse(result['auto_reconnect'])
+        self.assertFalse(result['can_send'])
+        self.assertEqual((channels,calls),(1,1))
+
+
 class ChatRelayTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)

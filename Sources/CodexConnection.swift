@@ -33,8 +33,10 @@ struct CueCodexConnection {
         } else if attentionConnected {
             state = "connected"; summary = "Codex 批准监听已连接 · 桌面连接自动恢复中"
         } else {
-            state = fresh && desktop["status"] as? String == "unsupported" ? "unsupported" : "reconnecting"
-            summary = state == "unsupported" ? String((desktop["message"] as? String ?? "当前 Codex 版本需要适配，请更新 VibeCue。").prefix(180)) : "Codex 自动重连中 · 打开 Codex 后会自动恢复。"
+            // A stream revision reset is normal after owner/cache replacement.
+            // Only the transport's explicit incompatibility code needs setup.
+            state = fresh && desktop["status"] as? String == "unsupported" && desktop["reason_code"] as? String == "protocol_unsupported" ? "unsupported" : "reconnecting"
+            summary = state == "unsupported" ? String((desktop["message"] as? String ?? "当前 Codex 版本需要适配，请更新 VibeCue。").prefix(180)) : "Codex 自动重连中，正在重新发现当前连接。"
         }
     }
     static func validationReport() -> [String: Bool] {
@@ -46,11 +48,15 @@ struct CueCodexConnection {
         var stale = watcher; stale["heartbeat"] = stamp - 25
         var staleDesktop = watcher; var old = desktop; old["last_seen"] = stamp - 40; staleDesktop["desktop_connection"] = old
         var missing = watcher; var noCapabilities = desktop; noCapabilities["capabilities"] = [:]; missing["desktop_connection"] = noCapabilities
+        var revisionReset = watcher; revisionReset["desktop_connection"] = ["connected":false, "status":"unsupported", "last_seen":stamp, "message":"对话订阅快照早于已观察版本"]
+        var incompatibility = watcher; incompatibility["desktop_connection"] = ["connected":false, "status":"unsupported", "reason_code":"protocol_unsupported", "last_seen":stamp, "message":"当前 Codex 协议需要适配"]
         let partialState = Self(watcher: partial, now: now)
         return ["desktop_connection_health_enables_only_confirmed_live_capabilities": connected.state == "connected" && connected.attentionConnected && connected.summary.contains("回复、批准提醒、批量设置"),
                 "stale_watcher_cannot_claim_connected": Self(watcher: stale, now: now).state == "reconnecting",
                 "stale_desktop_cannot_claim_connected": Self(watcher: staleDesktop, now: now).state == "reconnecting",
                 "socket_without_capabilities_cannot_claim_connected": Self(watcher: missing, now: now).state == "reconnecting",
-                "reply_connection_never_impersonates_approval_listener": partialState.state == "connected" && !partialState.attentionConnected && partialState.summary.contains("批准监听恢复中")]
+                "reply_connection_never_impersonates_approval_listener": partialState.state == "connected" && !partialState.attentionConnected && partialState.summary.contains("批准监听恢复中"),
+                "revision_reset_never_asks_user_to_repair_a_protocol": Self(watcher: revisionReset, now: now).state == "reconnecting" && Self(watcher: revisionReset, now: now).summary.contains("自动重连") && !Self(watcher: revisionReset, now: now).summary.contains("早于"),
+                "only_explicit_protocol_incompatibility_exposes_diagnostics": Self(watcher: incompatibility, now: now).state == "unsupported"]
     }
 }

@@ -10,8 +10,10 @@ from unittest.mock import patch
 
 from vibecue.codex_control import ControlError
 from vibecue.desktop_attention import (AttentionProjection, DesktopAttentionMonitor,
-                                       DesktopAttentionService, _AttentionChannel, request_metadata)
-from vibecue.codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable
+                                       DesktopAttentionService, AttentionRevisionGap,
+                                       _AttentionChannel, request_metadata)
+from vibecue.codex_desktop_ipc import (DesktopChannel, DesktopOwnerUnavailable,
+                                      DesktopConnectionInterrupted, DesktopProtocolUnsupported)
 
 THREAD = 'thread-one'
 OWNER = '22222222-2222-4222-8222-222222222222'
@@ -84,6 +86,18 @@ class ProjectionTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             self.projection.apply({'type': 'patches', 'baseRevision': 1, 'revision': 2,
                                    'patches': [{'op': 'remove', 'path': ['requests', 7]}]})
+
+    def test_revision_gap_and_rollback_are_typed_as_transient_projection_loss(self):
+        self.projection.apply(change(100))
+        for update in [change(0), {'type': 'patches', 'baseRevision': 0, 'revision': 1, 'patches': []}]:
+            with self.assertRaises(AttentionRevisionGap):
+                self.projection.apply(update)
+
+    def test_repeated_initial_snapshot_does_not_create_a_revision_gap(self):
+        self.projection.apply(change(0, [request()]))
+        self.projection.apply(change(0, [request()]))
+        self.assertEqual(self.projection.revision, 0)
+        self.assertEqual(len(self.projection.requests), 1)
 
 
 class MonitorTests(unittest.TestCase):
@@ -174,6 +188,31 @@ class ServiceTests(unittest.TestCase):
         def _receive(self, deadline):
             if not self.socket.recv(1): raise ConnectionError()
             message = self.messages.pop(0); self.on_message(message); return message
+        def queue(self, message):
+            self.messages.append(message)
+            self.server.send(b'x')
+
+    class EpochChannel(Channel):
+        def __init__(self, on_message, server_list):
+            super().__init__(on_message, server_list)
+            self.owners = {THREAD: OWNER, 'healthy-thread': '33333333-3333-4333-8333-333333333333'}
+            self.revisions = {THREAD: 100, 'healthy-thread': 8}
+        def discover(self):
+            self.owner = self.owners[self.thread_id]
+            return {'owner_client_id': self.owner}
+        def snapshot(self, thread, *, requests=None):
+            update = change(self.revisions[thread], requests)
+            update['conversationState'].update(id=thread,
+                latestThreadSettings={'model': 'model-' + str(self.revisions[thread]), 'effort': 'high'},
+                threadRuntimeStatus={'type': 'active', 'activeFlags': []},
+                turns=[{'turnId': 'turn-one' if self.revisions[thread] else 'new-epoch', 'status': 'inProgress'}])
+            return {'type': 'broadcast', 'method': 'thread-stream-state-changed', 'version': 11,
+                    'sourceClientId': self.owners[thread], 'targetClientIds': [CLIENT],
+                    'params': {'hostId': 'local', 'conversationId': thread, 'change': update}}
+        def _send(self, value):
+            self.sent.append(value)
+            if value.get('params', {}).get('following') is True:
+                self.queue(self.snapshot(value['params']['conversationId']))
 
     def wait_until(self, condition, timeout=3):
         deadline = time.monotonic() + timeout
@@ -206,6 +245,130 @@ class ServiceTests(unittest.TestCase):
             self.wait_until(lambda: service._reconnect_seen)
             (home / 'desktop-reconnect.request').write_text('retry')
             self.wait_until(lambda: len(channels) >= 2 and service.snapshot()['capabilities']['attention'])
+
+    def create_epochs(self, home):
+        channels = []
+        def factory(*args, on_message, **kwargs): return self.EpochChannel(on_message, channels)
+        service = DesktopAttentionService(home, channel_factory=factory)
+        events, resolutions = [], []
+        service.monitor.emit = lambda **value: events.append(value)
+        service.monitor.resolve = lambda *args, **kwargs: resolutions.append((args, kwargs))
+        service.set_threads([THREAD, 'healthy-thread']); service.start(); self.addCleanup(service.stop)
+        self.wait_until(lambda: service.snapshot()['subscribed_threads'] == 2)
+        return service, channels, events, resolutions
+
+    def test_same_owner_epoch_rollback_resubscribes_only_drifted_chat_and_settles_alert(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, channels, events, resolutions = self.create_epochs(Path(directory))
+            channel = channels[0]
+            healthy = service.projections['healthy-thread']
+            channel.revisions[THREAD] = 101
+            channel.queue(channel.snapshot(THREAD, requests=[request()]))
+            self.wait_until(lambda: len(events) == 1)
+            channel.revisions[THREAD] = 0
+            channel.queue(channel.snapshot(THREAD))
+            self.wait_until(lambda: THREAD not in service.projections)
+            self.assertEqual(service.snapshot()['status'], 'connected')
+            self.assertEqual(service.snapshot()['reason_code'], 'stream_resync')
+            self.assertEqual(service.current_settings()[THREAD]['status'], 'unavailable')
+            self.assertNotIn(THREAD, service.current_runtime())
+            self.assertEqual(service.monitor.pending, {})
+            self.assertEqual(len(resolutions), 1)
+            self.assertIs(service.projections['healthy-thread'], healthy)
+            self.assertEqual(service.current_settings()['healthy-thread']['model'], 'model-8')
+            self.wait_until(lambda: THREAD in service.projections and service.projections[THREAD].revision == 0)
+            self.assertEqual(len(channels), 1)
+            self.assertEqual(service.current_settings()[THREAD]['model'], 'model-0')
+            self.assertEqual(service.current_runtime()[THREAD]['turn_id'], 'new-epoch')
+            self.assertEqual(len(events), 1)
+            self.assertEqual(service.snapshot()['reason_code'], 'connected')
+            self.assertNotIn(THREAD, service.quarantine_until)
+            follows = [(row['params']['conversationId'], row['params']['following']) for row in channel.sent]
+            self.assertEqual(follows.count((THREAD, False)), 1)
+            self.assertEqual(follows.count((THREAD, True)), 2)
+            self.assertEqual(follows.count(('healthy-thread', True)), 1)
+            self.assertTrue(all(row['method'] == 'thread-stream-following-changed' for row in channel.sent))
+
+    def test_patch_gap_discards_unsettled_pending_and_restarts_full_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, channels, events, _ = self.create_epochs(Path(directory))
+            channel = channels[0]
+            service.monitor.clock = lambda: 0
+            channel.queue(channel.snapshot(THREAD, requests=[request()]))
+            self.wait_until(lambda: bool(service.monitor.pending))
+            packet = channel.snapshot(THREAD)
+            packet['params']['change'] = {'type': 'patches', 'baseRevision': 2, 'revision': 3, 'patches': []}
+            channel.revisions[THREAD] = 0
+            channel.queue(packet)
+            self.wait_until(lambda: THREAD not in service.projections)
+            service.monitor.clock = lambda: 100
+            service.monitor.flush()
+            self.assertEqual(events, [])
+            self.assertEqual(service.monitor.pending, {})
+            self.wait_until(lambda: THREAD in service.projections and service.projections[THREAD].revision == 0)
+            self.assertEqual(service.snapshot()['subscribed_threads'], 2)
+            self.assertEqual(len(channels), 1)
+
+    def test_owner_replacement_rediscovers_only_its_chats_and_ignores_old_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, channels, _, _ = self.create_epochs(Path(directory))
+            channel = channels[0]
+            healthy = service.projections['healthy-thread']
+            replacement = '44444444-4444-4444-8444-444444444444'
+            channel.owners[THREAD] = replacement
+            channel.revisions[THREAD] = 0
+            channel.queue({'type': 'broadcast', 'method': 'client-status-changed',
+                           'params': {'clientId': OWNER, 'status': 'disconnected'}})
+            self.wait_until(lambda: THREAD not in service.projections)
+            self.wait_until(lambda: THREAD in service.projections and service.projections[THREAD].revision == 0)
+            wrong = channel.snapshot(THREAD)
+            wrong['sourceClientId'] = OWNER
+            wrong['params']['change']['revision'] = 999
+            channel.queue(wrong)
+            time.sleep(.15)
+            self.assertEqual(service.projections[THREAD].revision, 0)
+            self.assertEqual(service.projections[THREAD].owner, replacement)
+            self.assertIs(service.projections['healthy-thread'], healthy)
+            self.assertEqual(len(channels), 1)
+
+    def test_duplicate_initial_snapshot_then_ordered_delta_keeps_subscription_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, channels, events, _ = self.create_epochs(Path(directory))
+            channel = channels[0]
+            original = service.projections[THREAD]
+            channel.queue(channel.snapshot(THREAD))
+            patch_message = channel.snapshot(THREAD)
+            patch_message['params']['change'] = {'type': 'patches', 'baseRevision': 100, 'revision': 101,
+                'patches': [{'op': 'replace', 'path': ['latestThreadSettings', 'model'], 'value': 'ordered-model'}]}
+            channel.queue(patch_message)
+            self.wait_until(lambda: service.projections[THREAD].revision == 101)
+            self.assertIs(service.projections[THREAD], original)
+            self.assertEqual(service.current_settings()[THREAD]['model'], 'ordered-model')
+            self.assertEqual(service.resync_attempts, {})
+            self.assertEqual(events, [])
+            self.assertEqual(len(channels), 1)
+
+    def test_only_typed_verified_protocol_mismatch_requires_connection_diagnostics(self):
+        for error, status, reason in [(ControlError('订阅版本或协议正在重新同步'), 'reconnecting', 'recovering'),
+                                      (DesktopProtocolUnsupported('verified unsupported build'), 'unsupported', 'protocol_unsupported')]:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                channels = []
+                calls = []
+                def factory(*args, on_message, **kwargs):
+                    calls.append(None)
+                    if len(calls) == 1:
+                        raise error
+                    return self.Channel(on_message, channels)
+                service = DesktopAttentionService(Path(directory), channel_factory=factory)
+                service.set_threads([THREAD]); service.start()
+                try:
+                    self.wait_until(lambda: service.snapshot()['message'] == str(error))
+                    self.assertEqual(service.snapshot()['status'], status)
+                    self.assertEqual(service.snapshot()['reason_code'], reason)
+                    self.wait_until(lambda: service.snapshot()['capabilities']['attention'])
+                    self.assertEqual(service.snapshot()['reason_code'], 'connected')
+                finally:
+                    service.stop()
 
     def test_wrong_owner_or_target_snapshot_is_ignored(self):
         service = DesktopAttentionService('/fixture')
@@ -295,6 +458,26 @@ class ServiceTests(unittest.TestCase):
         self.assertGreater(service.quarantine_until[THREAD], time.monotonic() + 290)
         # A new connection skips that candidate rather than repeating the loop.
         service._discover([THREAD])
+
+    def test_transport_loss_during_discovery_does_not_quarantine_a_healthy_candidate(self):
+        service = DesktopAttentionService('/fixture')
+        class Channel:
+            def discover(self): raise DesktopConnectionInterrupted('router restarted')
+        service.channel = Channel()
+        with self.assertRaises(DesktopConnectionInterrupted): service._discover([THREAD])
+        self.assertNotIn(THREAD, service.quarantine_until)
+
+    def test_repeated_chat_projection_failures_back_off_with_a_finite_cap(self):
+        service = DesktopAttentionService('/fixture')
+        class Channel:
+            client_id = CLIENT
+            def _send(self, value): pass
+        service.channel = Channel()
+        with patch('vibecue.desktop_attention.time.monotonic', return_value=100):
+            for expected in (1, 2, 4, 8, 16, 30, 30):
+                service.projections[THREAD] = AttentionProjection(THREAD, OWNER)
+                service._invalidate_thread(THREAD, 'resync')
+                self.assertEqual(service.next_discovery[THREAD], 100 + expected)
 
     def test_discovery_router_deadline_has_slack_and_router_timeout_is_local(self):
         sent = []

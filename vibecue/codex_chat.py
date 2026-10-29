@@ -290,7 +290,8 @@ class DesktopChatController(ChatController):
 
 
 def desktop_run(operation, params, home=None):
-    from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable, DesktopConnectionInterrupted
+    from .codex_desktop_ipc import (DesktopChannel, DesktopOwnerUnavailable, DesktopConnectionInterrupted,
+                                    DesktopProtocolUnsupported)
     from .events import codex_directory
     if not (codex_directory() / 'ipc/ipc.sock').exists():
         return None
@@ -301,8 +302,10 @@ def desktop_run(operation, params, home=None):
     # only a status read, on an entirely fresh channel with new discovery; never
     # repeat a load, submitted message, approval or other mutation.
     for attempt in range(2 if readonly else 1):
+        verified_channel = False
         try:
             with DesktopChannel(identifier, deadline=deadline) as channel:
+                verified_channel = True
                 controller = DesktopChatController(channel, home=home)
                 result = getattr(controller, operation)(params)
                 if readonly:
@@ -331,14 +334,21 @@ def desktop_run(operation, params, home=None):
                     'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,
                     'message': '正在自动重新连接 Codex，恢复后即可发送。' if readonly else str(error)}
         except ControlError as error:
+            # Retry stale conversation reads only after peer/handshake checks.
+            # An unverified socket or permission rejection cannot be reused.
+            recoverable = readonly and verified_channel and not isinstance(error, DesktopProtocolUnsupported)
+            if recoverable and attempt == 0 and time.monotonic() + .15 < deadline:
+                time.sleep(.15)
+                continue
             return {'schema_version': 1, 'thread_id': identifier, 'connected': False,
                 'supported': False, 'can_send': False, 'needs_load': False,
-                'auto_reconnect': False, 'retry_after_seconds': None,
+                'auto_reconnect': recoverable, 'retry_after_seconds': 2 if recoverable else None,
                 **prompt_suggestion_metadata(connected=False),
-                'state': 'unavailable', 'transport': 'desktop_ipc',
+                'state': 'reconnecting' if recoverable else 'unavailable', 'transport': 'desktop_ipc',
                 'status': 'unavailable' if operation == 'status' else 'failed',
                 'request_id': params.get('request_id'), 'max_text_bytes': MAX_TEXT_BYTES,
-                'message': str(error)}
+                'reason_code': 'recovering' if recoverable else 'protocol_unsupported' if isinstance(error, DesktopProtocolUnsupported) else 'unavailable',
+                'message': '正在自动恢复 Codex 对话连接，可继续编辑草稿。' if recoverable else str(error)}
 
 
 def socket_call(connection, operation, params):
