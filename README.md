@@ -32,6 +32,8 @@
 
 0.29.0 增加事务版本化的精确聚合复用、后台 watcher 投影及共享采集准入；价格、汇率、到期状态与更正／删除保持精确失效。测量和证据边界见[精确性能优化](docs/performance-exact-2026-10-30.md)。
 
+0.29.1 将日志翻页改为精确版本校验后的局部响应，概览失效时自动完整重查；复用 watcher 明细的精确编码，并消除任务列表的重复刷新。[本轮性能报告](docs/performance-paging-2026-10-30.md)记录测量与边界；[Web Coding 新板块调研](docs/web-coding-modules-2026-10-30.md)整理环境、接口、日志、质量与交付工具的开源参考，候选功能尚未实现。
+
 ## 项目名称与兼容升级
 
 0.26.0 起，项目由 VibeCue 更名为 **VibeCoding Go**，简称 **VCGo**；源码与仓库名称为 `VibeCodingGo`。应用为 `/Applications/VibeCoding Go.app`，可执行程序为 `VCGo`，常用命令入口为 `./scripts/vcgo`。

@@ -25,7 +25,7 @@ import time
 import uuid
 
 from .events import vibecue_directory, codex_directory
-from . import usage_opencode, usage_ccswitch, usage_query_cache
+from . import usage_opencode, usage_ccswitch, usage_query_cache, usage_overview
 
 SCHEMA_VERSION = 1
 CODEX_IMPORT_VERSION = 4
@@ -1024,9 +1024,37 @@ def _archived_groups(conn, app, model, source, provider, status, now, cache=None
     return rows
 
 
+def _query_logs(conn, where, params, page, page_size):
+    logs = [dict(row) for row in conn.execute(
+        'SELECT r.* FROM usage_requests r' + where + ' ORDER BY r.timestamp DESC,r.id LIMIT ? OFFSET ?',
+        params + [page_size, (page - 1) * page_size])]
+    usage_ccswitch.decorate_logs(conn, logs)
+    for row in logs:
+        real = row.get('provider_id') and not row['provider_id'].startswith('_')
+        row['provider_key'] = row['app'] + '|' + (row['provider_id'] if real else 'source:' + row['source'])
+        row['provider_name'] = (row.get('provider_name') or row['provider_id']) if real else ('会话日志' if row['source'].endswith('_session') else '未记录')
+    return logs
+
+
+def _query_sync_metadata(conn, home):
+    metadata = get_meta(conn, 'sync', {'running': False, 'last_synced_at': None, 'errors': [], 'warnings': [], 'coverage': []})
+    if metadata.get('running'):
+        try:
+            with (home / 'usage-sync.lock').open('a') as check:
+                try:
+                    fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    metadata['running'] = False
+                    metadata['warnings'] = list(metadata.get('warnings', [])) + ['上次同步被中断；点击同步可从已提交进度继续']
+                except BlockingIOError:
+                    pass
+        except OSError:
+            pass
+    return metadata
+
+
 def query(home=None, period='all', app='all', model='all', source='all', page=1, page_size=50,
           view='logs', now=None, heatmap_weeks=53, start_date=None, end_date=None,
-          provider='all', status='all'):
+          provider='all', status='all', overview_protocol=False, overview_revision=None):
     home = vibecue_directory(home)
     now = time.time() if now is None else float(now)
     if not math.isfinite(now):
@@ -1058,6 +1086,25 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
         price_groups = cache.rows(
             'SELECT r.app,r.source,r.model,COUNT(*) AS requests,' + sums +
             ' FROM ' + table + where + ' GROUP BY r.app,r.source,r.model', params, upper_bounds=(-1,))
+        from . import usage_money
+        money_snapshot = usage_money.settings(home, now=now)
+        metadata = _query_sync_metadata(conn, home)
+        revision = usage_overview.revision(
+            cache, selection=(period, app, model, source, provider, status, view,
+                              heatmap_weeks, today.isoformat()),
+            money=money_snapshot, metadata=metadata, now=now, period=period,
+            start=start, exclusive=exclusive) if overview_protocol else None
+        if overview_protocol and view == 'logs' and usage_overview.matches(overview_revision, revision):
+            total = sum(row['requests'] for row in price_groups)
+            pages = max(1, (total + page_size - 1) // page_size)
+            page = min(page, pages)
+            result = {'schema_version': SCHEMA_VERSION, 'overview_protocol': usage_overview.PROTOCOL,
+                      'overview_revision': revision, 'overview_unchanged': True, 'view': view,
+                      'logs': _query_logs(conn, where, params, page, page_size),
+                      'pagination': {'total': total, 'page': page, 'page_size': page_size, 'pages': pages},
+                      'sync': metadata, 'money': {key: value for key, value in money_snapshot.items() if key != 'pricing'}}
+            usage_money.decorate_logs(result, money_snapshot)
+            return result
         provider_groups = _provider_groups(conn, price_groups, clauses, params, sums, cache)
         log_count = sum(row['requests'] for row in price_groups)
         archived = _archived_groups(conn, app, model, source, provider, status, now, cache)
@@ -1081,14 +1128,7 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
         group_counts = dict(logs=log_count, **{key: len(rows) for key, rows in groups.items()})
         total = group_counts[view]
         pages = max(1, (total + page_size - 1) // page_size); page = min(page, pages)
-        logs = [dict(row) for row in conn.execute(
-            'SELECT r.* FROM usage_requests r' + where + ' ORDER BY r.timestamp DESC,r.id LIMIT ? OFFSET ?',
-            params + [page_size, (page - 1) * page_size])] if view == 'logs' else []
-        usage_ccswitch.decorate_logs(conn, logs)
-        for row in logs:
-            real = row.get('provider_id') and not row['provider_id'].startswith('_')
-            row['provider_key'] = row['app'] + '|' + (row['provider_id'] if real else 'source:' + row['source'])
-            row['provider_name'] = (row.get('provider_name') or row['provider_id']) if real else ('会话日志' if row['source'].endswith('_session') else '未记录')
+        logs = _query_logs(conn, where, params, page, page_size) if view == 'logs' else []
         full_daily = start is None or datetime.fromtimestamp(start).date() < heat_start
         heat_clauses = base_clauses + ([] if full_daily else ['r.date>=?']) + ['r.timestamp<=?']
         heat_params = base_params + ([] if full_daily else [heat_start.isoformat()]) + [now]
@@ -1169,18 +1209,6 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
                    'models': [{'id': r['model'], 'name': r['model']} for r in cache.rows('SELECT model FROM usage_requests UNION SELECT model FROM usage_archived_daily ORDER BY model')],
                    'sources': [{'id': key, 'name': value} for key, value in sources.items()],
                    'providers': sorted(fallback_providers.values(), key=lambda row: (row['name'], row['id']))}
-        metadata = get_meta(conn, 'sync', {'running': False, 'last_synced_at': None, 'errors': [], 'warnings': [], 'coverage': []})
-        if metadata.get('running'):
-            try:
-                with (home / 'usage-sync.lock').open('a') as check:
-                    try:
-                        fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        metadata['running'] = False
-                        metadata['warnings'] = list(metadata.get('warnings', [])) + ['上次同步被中断；点击同步可从已提交进度继续']
-                    except BlockingIOError:
-                        pass
-            except OSError:
-                pass
         result = {'schema_version': SCHEMA_VERSION, 'summary': summary, 'days': days, 'logs': logs,
                   **{key: rows[(page - 1) * page_size:page * page_size] if view == key else [] for key, rows in groups.items()},
                   'heatmap_summary': dict(_usage_totals(heat_groups), archived_requests=sum(row['requests'] for row in heat_archived)),
@@ -1194,10 +1222,12 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
                   'filters': filters, 'pagination': {'total': total, 'page': page, 'page_size': page_size, 'pages': pages},
                   'sync': metadata, 'supported_apps': list(APPS), 'view': view, 'range': period,
                   'coverage_note': '读取仍保留的本机会话 usage；费用为 API 单价参考估算，不是订阅账单。'}
-        from . import usage_money
         usage_money.decorate(home, result, price_groups, now=now, provider_groups=provider_groups,
                              series_groups=day_price_groups + trend_price_groups,
-                             heatmap_groups=heat_groups)
+                             heatmap_groups=heat_groups, snapshot=money_snapshot)
+        if overview_protocol:
+            result.update(overview_protocol=usage_overview.PROTOCOL, overview_revision=revision,
+                          overview_unchanged=False)
         return result
 
 
@@ -1352,6 +1382,8 @@ def main(argv=None):
     parser.add_argument('--end-date')
     parser.add_argument('--page',type=int,default=1)
     parser.add_argument('--page-size',type=int,default=50)
+    parser.add_argument('--overview-protocol',action='store_true')
+    parser.add_argument('--overview-revision')
     parser.add_argument('--view',choices=('logs','models','providers','sources'),default='logs')
     args=parser.parse_args(argv)
     os.umask(0o077)
@@ -1365,7 +1397,8 @@ def main(argv=None):
         else:
             result=query(period=args.period,app=args.app,model=args.model,source=args.source,
                          page=args.page,page_size=args.page_size,view=args.view,provider=args.provider,status=args.status,
-                         heatmap_weeks=args.heatmap_weeks,start_date=args.start_date,end_date=args.end_date)
+                         heatmap_weeks=args.heatmap_weeks,start_date=args.start_date,end_date=args.end_date,
+                         overview_protocol=args.overview_protocol, overview_revision=args.overview_revision)
         print(json.dumps(result,ensure_ascii=False,separators=(',',':')))
     except (OSError,sqlite3.Error,ValueError) as error:
         print(json.dumps({'error':'本机用量缓存不可用（'+type(error).__name__+'）'},ensure_ascii=False))

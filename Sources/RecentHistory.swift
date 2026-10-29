@@ -889,7 +889,8 @@ final class CueStatusPopoverController: NSViewController {
     private(set) var rebuildCount = 0
     private(set) var rowRefreshCount = 0
     private(set) var clockLabelWrites = 0
-    var performanceSnapshot: [String: Int] { ["rebuilds": rebuildCount, "row_refreshes": rowRefreshCount, "clock_label_writes": clockLabelWrites] }
+    private(set) var updateRequestCount = 0
+    var performanceSnapshot: [String: Int] { ["updates_received": updateRequestCount, "rebuilds": rebuildCount, "row_refreshes": rowRefreshCount, "clock_label_writes": clockLabelWrites] }
     private var workVisible: Bool {
         isViewLoaded && view.window?.isVisible == true && view.window?.isMiniaturized != true && (!embedded || embeddedActive)
     }
@@ -915,6 +916,7 @@ final class CueStatusPopoverController: NSViewController {
         rebuild()
     }
     func update(status: String, enabled: Bool, soundEnabled: Bool, paused: Bool, maximumHeight: CGFloat = 900, runningTasks: [CueRunningTask] = [], interruptedTasks: [CueRunningTask] = [], taskDetails: [String: CueTaskDetail] = [:], attentionConnected: Bool = false, connectionSummary: String? = nil, connectionState: String = "legacy", showConnectionAction: Bool? = nil, sideChats: [String: [CueSideChat]] = [:]) {
+        updateRequestCount += 1
         self.status = status; self.enabled = enabled; self.soundEnabled = soundEnabled
         self.paused = paused; self.maximumHeight = maximumHeight; self.runningTasks = runningTasks; self.taskDetails = taskDetails
         self.interruptedTasks = interruptedTasks

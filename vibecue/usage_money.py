@@ -390,22 +390,20 @@ def _folded_cost(rows, prices, rate, row_cost):
                 'price_sources': sorted(price_sources)}
 
 
-def decorate(home, result, aggregate_groups, cc_path=None, now=None, *, provider_groups=(),
-             series_groups=(), heatmap_groups=None):
-    """Decorate a filtered usage query; never performs network I/O.
+def decorate_logs(result, snapshot, *, prices=None, rate=None, row_cost=None):
+    """Price the visible page from the same settings snapshot as its revision.
 
-    aggregate_groups: full filtered GROUP BY app,source,model, with requests and
-    SUM of the four disjoint token columns. Visible tabs may contain only a page.
-    Unknown models remain nullable, even when every known price is zero.
+    No price, rate, source, request count or rounding rule is cached here. The
+    full dashboard and conditional page use this exact same Decimal path.
     """
-    snapshot = settings(home, cc_path, now)
-    prices = {row['model']: row for row in snapshot.pop('pricing')}
-    rate = snapshot['fx']['rate']
-    row_cost = _DecimalPriceMemo(prices)
+    if prices is None:
+        prices = {row['model']: row for row in snapshot['pricing']}
+    if rate is None:
+        rate = snapshot['fx']['rate']
+    if row_cost is None:
+        row_cost = _DecimalPriceMemo(prices)
     def fold(rows):
         return _folded_cost(rows, prices, rate, row_cost)
-    result['money'] = snapshot
-    result['summary'].update(fold(aggregate_groups))
     for row in result.get('logs', []):
         row.update(fold([dict(row, requests=1)]))
         selected = prices.get(row.get('model'))
@@ -417,6 +415,25 @@ def decorate(home, result, aggregate_groups, cc_path=None, now=None, *, provider
                 usd = Decimal(0) if amount == 0 else (Decimal(amount) * Decimal(str(unit)) / Decimal(1_000_000) if unit is not None else None)
                 row[component + '_cost_usd'] = float(usd) if usd is not None else None
                 row[component + '_cost_cny'] = float(usd * Decimal(str(rate))) if usd is not None and rate is not None else (0.0 if usd == 0 else None)
+
+
+def decorate(home, result, aggregate_groups, cc_path=None, now=None, *, provider_groups=(),
+             series_groups=(), heatmap_groups=None, snapshot=None):
+    """Decorate a filtered usage query; never performs network I/O.
+
+    aggregate_groups: full filtered GROUP BY app,source,model, with requests and
+    SUM of the four disjoint token columns. Visible tabs may contain only a page.
+    Unknown models remain nullable, even when every known price is zero.
+    """
+    snapshot = dict(settings(home, cc_path, now) if snapshot is None else snapshot)
+    prices = {row['model']: row for row in snapshot.pop('pricing')}
+    rate = snapshot['fx']['rate']
+    row_cost = _DecimalPriceMemo(prices)
+    def fold(rows):
+        return _folded_cost(rows, prices, rate, row_cost)
+    result['money'] = snapshot
+    result['summary'].update(fold(aggregate_groups))
+    decorate_logs(result, snapshot, prices=prices, rate=rate, row_cost=row_cost)
     for row in result.get('models', []):
         groups = [group for group in aggregate_groups if group.get('model') == row.get('model')]
         row.update(fold(groups))

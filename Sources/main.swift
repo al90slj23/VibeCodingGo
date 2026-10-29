@@ -776,7 +776,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         refreshConversationHistory()
     }
     private func refreshConversationHistory() {
-        recent = recentHistory.events; refreshMenu(); settingsPanel?.updateHealth(); writeStatus()
+        recent = recentHistory.events; refreshMenu(); settingsPanel?.updateHealth(updateTasks: false); writeStatus()
     }
     private func dismissInterrupted(_ task: CueRunningTask) {
         guard let interrupted = task.interruptedAt else { return }
@@ -908,7 +908,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         pausedUntil = pausedUntil == nil ? Date().addingTimeInterval(1800) : nil
         audioPlayer?.stop()
         pending.removeAll(); hideWindows(); current = nil
-        refreshMenu(); settingsPanel?.updateHealth(); writeStatus()
+        refreshMenu(); settingsPanel?.updateHealth(updateTasks: false); writeStatus()
     }
     @objc func demo(_ sender: NSMenuItem) {
         let kind = sender.representedObject as? String ?? "complete"
@@ -984,12 +984,15 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let runningChanged = runningTaskSnapshot != prepared.signature
         runningTasks = prepared.running; interruptedTasks = prepared.interrupted
         taskDetails = prepared.details; sideChats = prepared.sideChats; runningTaskSnapshot = prepared.signature
-        if watcherHealthText != message || runningChanged || previousConnection != codexConnectionState + codexConnectionSummary {
+        let refreshTaskLists = watcherHealthText != message || runningChanged || previousConnection != codexConnectionState + codexConnectionSummary
+        if refreshTaskLists {
             watcherHealthText = message
             if statusItem != nil { refreshMenu() }
         }
         if previousManual != manualApprovalConnected || previousConnection != codexConnectionState + codexConnectionSummary { settingsPanel?.rebuild(); batchController?.refreshConnection() }
-        settingsPanel?.updateHealth()
+        // refreshMenu already updates both task surfaces. Health labels must
+        // not run the same list projection again for this watcher snapshot.
+        settingsPanel?.updateHealth(updateTasks: !refreshTaskLists || statusItem == nil)
     }
 
     func startWatcher() {
@@ -1405,7 +1408,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             historyChanged: { [weak self] in
                 guard let self else { return }
                 self.recent = self.recentHistory.events
-                self.refreshMenu(); self.settingsPanel?.updateHealth(); self.writeStatus()
+                self.refreshMenu(); self.settingsPanel?.updateHealth(updateTasks: false); self.writeStatus()
             },
             batchConfigure: { [weak self] targets in
                 guard let self else { return }
@@ -1468,7 +1471,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
         let height = min(1100, (screen?.visibleFrame.height ?? 900) - 52)
         if let controller = statusPopoverController { populateTaskController(controller, maximumHeight: height) }
-        settingsPanel?.updateEmbeddedTasks()
+        // The workbench owns its own task surface; opening this popover must
+        // not traverse the workbench's visible rows a second time.
         if let controller = statusPopoverController, controller.isViewLoaded { statusPopover?.contentSize = controller.preferredContentSize }
     }
 
@@ -2289,13 +2293,16 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         _ = button("用量与额度", in: details, frame: NSRect(x: 269, y: 81, width: 238, height: 31), action: #selector(goUsage))
     }
 
-    func updateHealth() {
+    func updateHealth(updateTasks: Bool = true) {
         guard window?.isVisible == true, window?.isMiniaturized == false else { return }
-        updateEmbeddedTasks()
+        if updateTasks { updateEmbeddedTasks() }
         codingConnectionLabel?.stringValue = cue.codexConnectionSummary
         codingConnectionLabel?.textColor = cue.codexConnectionState == "connected" ? .secondaryLabelColor : .systemOrange
-        let work = CueMenuBarWork(records: cue.recentHistory.records, running: cue.runningTasks, interrupted: cue.interruptedTasks, followups: cue.recentHistory.followups.records)
-        codingCountsLabel?.stringValue = "\(work.running) 个运行中 · \(work.pending) 个待处理 · \(work.interrupted) 个中断待续"
+        if let counts = codingCountsLabel {
+            let work = CueMenuBarWork(records: cue.recentHistory.records, running: cue.runningTasks, interrupted: cue.interruptedTasks, followups: cue.recentHistory.followups.records)
+            let value = "\(work.running) 个运行中 · \(work.pending) 个待处理 · \(work.interrupted) 个中断待续"
+            if counts.stringValue != value { counts.stringValue = value }
+        }
         healthLabel?.stringValue = cue.watcherHealthText
         healthLabel?.textColor = cue.watcherHealthText.hasPrefix("本机监控中") ? NSColor(srgbRed: 0.5, green: 0.94, blue: 0.76, alpha: 1) : .systemOrange
         let pause = cue.pausedUntil == nil ? (cue.settings.enabled ? "提醒已启用" : "提醒已关闭") : "提醒已暂停"

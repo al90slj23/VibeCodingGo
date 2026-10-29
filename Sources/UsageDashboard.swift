@@ -269,6 +269,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var snapshotNeedsRefresh = true
     private var queryRequiresApply = false
     private var snapshotApplyCount = 0
+    private var pageOnlyApplyCount = 0
+    private var overviewRecoveryAttempts = 0
     private var lastPricingSnapshot: NSDictionary?
     private var syncing = false
     private var backendRunning = false
@@ -654,6 +656,28 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         let sameMoney: [String: Any] = ["prefs": ["currency": "CNY"], "fx": ["rate": 7.1, "date": "2026-10-29", "refresh_due": false]]
         var laterMoney = sameMoney; laterMoney["fx"] = ["rate": 7.1, "date": "2026-10-29", "refresh_due": true, "attempted_at": 1]
         report["usage_fx_schedule_only_change_does_not_requery_history"] = moneyDisplaySnapshot(sameMoney).isEqual(moneyDisplaySnapshot(laterMoney))
+        let conditional = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
+        let revision = String(repeating: "a", count: 64)
+        conditional.snapshot["overview_protocol"] = 1; conditional.snapshot["overview_revision"] = revision; conditional.snapshot["overview_unchanged"] = false
+        conditional.snapshot["view"] = "logs"; conditional.snapshot["filters"] = [String: Any](); conditional.snapshot["heatmap_range"] = [String: Any](); conditional.snapshot["trend_points"] = [[String: Any]]()
+        let fullBase = conditional.snapshot, fullRenders = conditional.snapshotApplyCount
+        let dayBase = conditional.heatmap.days, metricBase = conditional.metrics.map { $0.value.stringValue }
+        let delta: [String: Any] = ["overview_protocol": 1, "overview_unchanged": true, "overview_revision": revision,
+                                   "view": "logs", "logs": [], "pagination": ["page": 2, "pages": 3, "total": 120], "sync": ["running": false], "money": conditional.snapshot["money"] as? [String: Any] ?? [:]]
+        report["usage_conditional_page_merges_exact_overview_without_chart_render"] = conditional.applyQuerySnapshot(delta, force: true) && conditional.page == 2 && conditional.pageOnlyApplyCount == 1 && conditional.snapshotApplyCount == fullRenders && NSArray(array: dayBase).isEqual(to: conditional.heatmap.days) && metricBase == conditional.metrics.map { $0.value.stringValue } && NSDictionary(dictionary: fullBase["summary"] as? [String: Any] ?? [:]).isEqual(to: conditional.snapshot["summary"] as? [String: Any] ?? [:])
+        conditional.acceptHiddenQuerySnapshot(delta)
+        report["usage_conditional_page_hidden_response_retains_full_base"] = conditional.snapshot["days"] != nil && conditional.snapshot["money"] != nil && conditional.snapshotNeedsRefresh
+        var mismatch = delta; mismatch["overview_revision"] = String(repeating: "b", count: 64)
+        report["usage_conditional_page_mismatch_requests_full_repair"] = !conditional.applyQuerySnapshot(mismatch) && conditional.snapshot["overview_revision"] == nil && conditional.queryPending
+        conditional.queryPending = false; _ = conditional.applyQuerySnapshot(mismatch)
+        report["usage_conditional_page_repair_loop_is_bounded"] = !conditional.queryPending && !conditional.queryError.isEmpty
+        report["usage_conditional_page_without_full_base_cannot_apply"] = Self.mergedPage(delta, base: ["view": "logs", "overview_revision": revision]) == nil
+        var unknownProtocol = delta; unknownProtocol["overview_protocol"] = 2
+        report["usage_conditional_page_unknown_protocol_requires_full_repair"] = Self.mergedPage(unknownProtocol, base: fullBase) == nil
+        var unknownBase = fullBase; unknownBase["overview_protocol"] = 2
+        report["usage_conditional_page_unknown_base_protocol_cannot_reuse"] = Self.mergedPage(delta, base: unknownBase) == nil
+        var incompletePage = delta; incompletePage.removeValue(forKey: "money")
+        report["usage_conditional_page_without_current_money_is_rejected"] = Self.mergedPage(incompletePage, base: fullBase) == nil
         host.contentView = nil
         return report
     }
@@ -840,8 +864,11 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         queryInFlight = true; snapshotNeedsRefresh = false
         let identifier = queryID, forceApply = queryRequiresApply
         queryRequiresApply = false
-        var arguments = ["query", "--range", selected(range), "--app", selected(app), "--provider", selected(provider), "--model", selected(model), "--source", selected(source), "--status", selected(statusFilter), "--heatmap-weeks", String(heatmapWeeks), "--page", String(page), "--page-size", String(pageSize), "--view", currentView]
+        var arguments = ["query", "--overview-protocol", "--range", selected(range), "--app", selected(app), "--provider", selected(provider), "--model", selected(model), "--source", selected(source), "--status", selected(statusFilter), "--heatmap-weeks", String(heatmapWeeks), "--page", String(page), "--page-size", String(pageSize), "--view", currentView]
         if selected(range) == "custom", let start = selectedStart, let end = selectedEnd { arguments += ["--start-date", start, "--end-date", end] }
+        // A filter change cleared overview labels; a hidden full response has
+        // not been painted yet. Both require a full apply before page reuse.
+        if currentView == "logs", (!forceApply || tableOnly), snapshot["overview_protocol"] as? Int == 1, let revision = snapshot["overview_revision"] as? String { arguments += ["--overview-revision", revision] }
         client.run(arguments) { [weak self] result in
             guard let self else { return }
             self.queryInFlight = false
@@ -853,10 +880,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
                     else {
                         // A result may arrive after a tag switch. Keep numeric
                         // state, but defer native layout until the page is shown.
-                        self.snapshot = data; self.readSync(data)
-                        if self.backgroundStarted { self.configureBackgroundTimer() }
-                        self.readPricingSchedule(data["money"] as? [String: Any] ?? [:])
-                        self.snapshotNeedsRefresh = true; self.queryRequiresApply = true
+                        self.acceptHiddenQuerySnapshot(data)
                     }
                 case .failure(let error): self.queryError = error.localizedDescription
                 }
@@ -866,8 +890,57 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             if self.queryPending { self.queryPending = false; self.query() }
         }
     }
+    /// A partial page may reuse only this controller's exact full overview.
+    /// A missing/mismatched base drops its token and requests one full repair;
+    /// malformed repeated partial responses cannot start an unbounded loop.
+    private static func mergedPage(_ data: [String: Any], base: [String: Any]) -> [String: Any]? {
+        guard data["overview_protocol"] as? Int == 1, base["overview_protocol"] as? Int == 1,
+              base["overview_unchanged"] as? Bool == false, data["overview_unchanged"] as? Bool == true,
+              data["view"] as? String == "logs", base["view"] as? String == "logs",
+              let revision = data["overview_revision"] as? String, revision.utf8.count == 64,
+              revision.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              revision == base["overview_revision"] as? String,
+              data["logs"] is [[String: Any]], data["pagination"] is [String: Any], data["money"] is [String: Any],
+              base["summary"] is [String: Any], base["days"] is [[String: Any]],
+              base["filters"] is [String: Any], base["money"] is [String: Any],
+              base["heatmap_range"] is [String: Any], base["heatmap_summary"] is [String: Any],
+              base["group_counts"] is [String: Any], base["trend_points"] is [[String: Any]] else { return nil }
+        var merged = base
+        for key in ["logs", "pagination", "sync", "money"] { merged[key] = data[key] }
+        merged["overview_unchanged"] = false
+        return merged
+    }
+    private func repairOverview() {
+        snapshot.removeValue(forKey: "overview_revision")
+        snapshotNeedsRefresh = true
+        if overviewRecoveryAttempts == 0 {
+            overviewRecoveryAttempts = 1; queryPending = true
+        } else {
+            queryError = "统计分页快照已变化，稍后会自动重新读取。"
+        }
+    }
+    private func acceptHiddenQuerySnapshot(_ data: [String: Any]) {
+        if data["overview_unchanged"] as? Bool == true {
+            guard let merged = Self.mergedPage(data, base: snapshot) else { repairOverview(); return }
+            snapshot = merged
+        } else { snapshot = data; overviewRecoveryAttempts = 0 }
+        readSync(snapshot)
+        if backgroundStarted { configureBackgroundTimer() }
+        readPricingSchedule(snapshot["money"] as? [String: Any] ?? [:])
+        snapshotNeedsRefresh = true; queryRequiresApply = true
+    }
     /// Progress metadata does not invalidate the expensive native table/chart.
     @discardableResult private func applyQuerySnapshot(_ data: [String: Any], force: Bool = false) -> Bool {
+        if data["overview_unchanged"] as? Bool == true {
+            guard currentView == "logs", let merged = Self.mergedPage(data, base: snapshot) else { repairOverview(); return false }
+            snapshot = merged; readSync(merged); overviewRecoveryAttempts = 0
+            if backgroundStarted { configureBackgroundTimer() }
+            readPricingSchedule(merged["money"] as? [String: Any] ?? [:])
+            let prefs = (merged["money"] as? [String: Any])?["prefs"] as? [String: Any] ?? [:]
+            applyListSnapshot(merged, currency: prefs["currency"] as? String ?? "CNY")
+            pageOnlyApplyCount += 1; updateStatus(); return true
+        }
+        overviewRecoveryAttempts = 0
         var previous = snapshot, incoming = data
         previous.removeValue(forKey: "sync"); incoming.removeValue(forKey: "sync")
         guard force || !NSDictionary(dictionary: previous).isEqual(to: incoming) else {
@@ -942,6 +1015,11 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         let counts = data["group_counts"] as? [String: Any] ?? [:]
         for (index, item) in ["logs", "providers", "models", "sources"].enumerated() { tabs.setLabel(["请求日志", "供应商", "模型", "来源"][index] + ((counts[item] as? NSNumber).map { " \(Self.compact($0.doubleValue))" } ?? ""), forSegment: index) }
         tabs.toolTip = ["logs", "providers", "models", "sources"].enumerated().map { index, key in ["请求日志", "供应商", "模型", "来源"][index] + "：" + ((counts[key] as? NSNumber).map { Self.integer($0.doubleValue) } ?? "—") }.joined(separator: "\n")
+        moreHistory.isEnabled = heatmapWeeks < 530 && heatRange["has_older"] as? Bool != false
+        applyListSnapshot(data, currency: currency)
+        layout()
+    }
+    private func applyListSnapshot(_ data: [String: Any], currency: String) {
         let incomingRows = data[currentView] as? [[String: Any]] ?? []
         let tableChanged = !NSArray(array: rows).isEqual(to: incomingRows)
         rows = incomingRows
@@ -963,10 +1041,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         previous.isEnabled = page > 1; next.isEnabled = page < pages
         detailsButton.isEnabled = rows.indices.contains(table.selectedRow)
         columnsButton.isEnabled = currentView == "logs"; statusFilter.isEnabled = true
-        moreHistory.isEnabled = heatmapWeeks < 530 && heatRange["has_older"] as? Bool != false
         detail.stringValue = rows.isEmpty ? "当前筛选暂无记录。可点“立即同步”，或查看“数据说明”。" : "用量来自本机历史与 CC Switch 数值记录；未记录的字段不推断。"
         if tableChanged { table.reloadData() }
-        layout()
     }
     private func updateStatus() {
         let busy = syncing || backendRunning

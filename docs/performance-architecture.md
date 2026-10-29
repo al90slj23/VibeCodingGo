@@ -39,3 +39,17 @@ The usage ledger remains the source of truth. Disposable numeric SQL projections
 Only the timestamp upper bound may reuse a data-safe watermark from both request and archived records. Rolling lower bounds remain literal. Calendar range, prices, exchange rates, freshness flags and visible request pages still use current inputs. Task cost memoization retains original Decimal arithmetic and group order; it caches the pure numeric fold, not a current/partial/stale judgement. Cache size and parse work are bounded.
 
 Do not add an age-only cache for authoritative totals or settings. A future module must identify its truth epoch, input scope, exact invalidation events and time boundaries, and compare new/corrected/deleted data against the uncached reference. A fast stale result is not an accepted optimization.
+
+## Conditional overview transport (0.29.1)
+
+The statistics collector offers opt-in `--overview-protocol` and `--overview-revision`. Default CLI callers retain the complete response. A revision is derived from the same WAL snapshot as the visible log page: ledger identity/generation, trigger eligibility, file identity, current data-safe upper watermark, filters, exact rolling lower bound, local calendar/timezone, hourly chart boundary, pricing/FX source contents and sync metadata. Only an exact match may omit charts, summaries and filter catalogs. A due-only pricing scheduler deadline is normalized to an already-due state; each response still carries the current unmodified money/scheduling metadata.
+
+The native controller must hold that exact complete overview before merging a page response. It updates list/pager only on a proven match. Missing, malformed or mismatched bases trigger one full repair; repeated malformed responses stop the repair loop. A revision does not promise future freshness: writes after the read snapshot are seen by the next query. Rolling ranges deliberately refresh the overview when their exact lower bound moves. Deep arbitrary log pages retain the original OFFSET behavior; this change does not claim to remove that separate scaling cost.
+
+Do not replace the SHA-256 revision with a TTL or accept a revision sent by an unrelated window without its complete base. New protocol fields are opt-in; unknown or absent proof falls back to a complete query.
+
+## Task surfaces and future feature modules
+
+`refreshMenu` owns one update of the visible menu list and one of the workbench list. A health-label refresh after it must pass `updateTasks: false`; opening the menu alone must not refresh the workbench. `updates_received` complements the row-write counters so duplicate no-op traversals are observable. Rebuilding a workspace page remains a separate lifecycle operation, particularly on a connection transition.
+
+A new module uses the existing work scheduler and bounded collector admission, and declares input identity, engine version, resource class, timeout, output limit and cancellation. Browser/container/full-repository jobs require an isolated finite resource lane and must not occupy message/status capacity. No module gets a background timer merely because its tab exists. Retain a bounded raw report outside the UI, index its summary and render only the current page. The matching report/version and actual input changes define invalidation, not arbitrary cache age. Candidate modules and integration choices are documented in [Web Coding module research](web-coding-modules-2026-10-30.md).
