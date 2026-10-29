@@ -31,6 +31,7 @@ from .task_details import TaskDetails, bounded_details, bound_status_previews
 from .task_recovery import TaskRecovery, codex_process_snapshot
 from ..desktop_attention import DesktopAttentionService
 from ..current_model_settings import unavailable_settings
+from ..task_usage import TaskUsageCache
 
 MAX_READ = 1_048_576
 MAX_RECORD = 2_097_152
@@ -367,7 +368,7 @@ class Interpreter:
                           elapsed_seconds=max(0, now - self.activity_started_at),
                           tokens_status='unknown', total_tokens=None, request_count=None,
                           input_tokens=None, output_tokens=None, cache_read_tokens=None,
-                          cache_creation_tokens=None)
+                          cache_creation_tokens=None, usage_by_model=[])
         if detail and self.runtime_state and self.runtime_state['state'] in ('complete', 'aborted'):
             detail.update(status=self.runtime_state['state'], finished_at=self.activity_terminal_at,
                           elapsed_seconds=max(0, self.activity_terminal_at - (detail.get('started_at') or self.activity_terminal_at)))
@@ -529,6 +530,7 @@ class Watcher:
         self.last_status = 0.0
         self.recovery = TaskRecovery(self.vibecue_home, self.started_at)
         self.desktop = DesktopAttentionService(self.vibecue_home, self.codex_home)
+        self.task_usage = TaskUsageCache(self.vibecue_home)
 
     def metadata(self):
         for db in state_databases(self.codex_home):
@@ -739,6 +741,17 @@ class Watcher:
             if detail:
                 detail.update(status=row['status'], finished_at=row['finished_at'],
                               elapsed_seconds=row.get('elapsed_seconds', 0))
+        # The retained list can contain chats outside the active transcript
+        # window. Give their existing numeric ledger a target without claiming
+        # to know their latest turn or loading conversation bodies.
+        for tid, settings in current_settings.items():
+            if tid not in details_by_id:
+                detail_rows.append({'thread_id': tid, 'title': '', 'provider': 'codex',
+                                    'status': 'unknown', 'last_activity': 0,
+                                    'current_settings': settings, 'messages': [],
+                                    'last_message': '', 'content_available': False,
+                                    'content_truncated': False})
+        detail_rows = self.task_usage.decorate(detail_rows, now=now)
         state = {
             'pid': os.getpid(), 'heartbeat': now, 'running': self.running,
             'started_at': self.started_at, 'watched_threads': len(self.watched),

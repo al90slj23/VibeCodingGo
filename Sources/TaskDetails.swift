@@ -8,6 +8,135 @@ struct CueTaskMessage {
     let date: Date?
 }
 
+/// A backend-provided usage scope. Current settings never participate in pricing.
+struct CueTaskUsageSummary {
+    let totalTokens: Int64?
+    let inputTokens: Int64?
+    let outputTokens: Int64?
+    let cacheReadTokens: Int64?
+    let cacheCreationTokens: Int64?
+    let requestCount: Int64?
+    let tokensStatus: String
+    let costStatus: String
+    let currency: String
+    let provenance: String
+    let updatedAt: Date?
+    let stale: Bool
+    private let money: [String: Any]
+    private let pricedRequests: Int64?
+    private let unpricedRequests: Int64?
+    private let priceSources: [String]
+    private let pricingStale: Bool
+    private let fx: [String: Any]
+    private let message: String
+    private let legacy: Bool
+    private let history: Bool
+
+    init(raw: [String: Any], history: Bool = false, legacy: Bool = false) {
+        totalTokens = CueTaskDetail.integer(raw["total_tokens"])
+        inputTokens = CueTaskDetail.integer(raw["input_tokens"])
+        outputTokens = CueTaskDetail.integer(raw["output_tokens"])
+        cacheReadTokens = CueTaskDetail.integer(raw["cache_read_tokens"])
+        cacheCreationTokens = CueTaskDetail.integer(raw["cache_creation_tokens"])
+        requestCount = CueTaskDetail.integer(raw["request_count"])
+        let declaredTokens = CueTaskDetail.label(raw["tokens_status"], limit: 40)
+        tokensStatus = totalTokens == nil || declaredTokens == "unknown" ? "unknown" : (["complete", "partial"].contains(declaredTokens) ? declaredTokens : "partial")
+        var amounts: [String: Any] = [:]
+        for key in ["cost_usd", "cost_cny"] {
+            if let value = raw[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite, value.doubleValue >= 0 { amounts[key] = value }
+        }
+        money = amounts
+        let declaredCost = CueTaskDetail.label(raw["cost_status"], limit: 40)
+        costStatus = ["unknown", "unpriced"].contains(declaredCost) ? declaredCost : (amounts.isEmpty ? "unknown" : (declaredCost == "complete" ? "complete" : "partial"))
+        let declaredCurrency = CueTaskDetail.label(raw["currency"], limit: 10)
+        currency = ["USD", "CNY", "both"].contains(declaredCurrency) ? declaredCurrency : "CNY"
+        provenance = CueTaskDetail.label(raw["provenance"], limit: 80)
+        updatedAt = CueTaskDetail.date(raw["updated_at"])
+        stale = raw["stale"] as? Bool == true
+        pricedRequests = CueTaskDetail.integer(raw["priced_requests"])
+        unpricedRequests = CueTaskDetail.integer(raw["unpriced_requests"])
+        priceSources = (raw["price_sources"] as? [String] ?? []).prefix(12).map { CueTaskDetail.label($0, limit: 100) }.filter { !$0.isEmpty }
+        pricingStale = raw["pricing_stale"] as? Bool == true
+        fx = raw["fx"] as? [String: Any] ?? [:]
+        message = CueTaskDetail.label(raw["message"], limit: 360)
+        self.legacy = legacy
+        self.history = history
+    }
+
+    var tokenLine: String {
+        guard let total = totalTokens, tokensStatus != "unknown" else { return "— Tokens" }
+        return (tokensStatus == "partial" ? "≥" : "") + CueTaskDetail.compact(total) + " Tokens"
+    }
+
+    /// All money remains in full base units. A star denotes a known subtotal.
+    var costLine: String {
+        if costStatus == "unpriced" { return "未定价" }
+        guard costStatus != "unknown", !money.isEmpty else { return "—" }
+        let formatted = CueUsageMoney.display(money, currency: currency)
+        let amount = formatted.replacingOccurrences(of: " / ", with: "\n") + (formatted.contains("$") ? " USD" : "")
+        return amount + (costStatus == "partial" && !["未定价", "汇率未获取"].contains(formatted) ? " *" : "")
+    }
+
+    var tooltip: String {
+        func exact(_ value: Int64?) -> String { value.map(CueTaskDetail.exact) ?? "—" }
+        var lines = [history ? "历史累计 · 已同步账本" : "本轮用量",
+                     "总 Tokens：" + (tokensStatus == "unknown" ? "—（尚未取得）" : (tokensStatus == "partial" ? "≥" : "") + exact(totalTokens)),
+                     "新增输入 \(exact(inputTokens)) · 输出 \(exact(outputTokens))",
+                     "缓存读取 \(exact(cacheReadTokens)) · 缓存写入 \(exact(cacheCreationTokens))"]
+        if let count = requestCount { lines.append("请求记录：" + CueTaskDetail.exact(count)) }
+        if costStatus == "unknown" { lines.append("API 参考费用：—（尚未取得）") }
+        else if costStatus == "unpriced" { lines.append("API 参考费用：未定价") }
+        else { lines.append("API 参考费用：" + CueUsageMoney.display(money, currency: "both")) }
+        if tokensStatus == "partial" { lines.append("Tokens 为已确认部分，累计值可能继续增加。") }
+        if costStatus == "partial" { lines.append("* 费用仅为已定价小计，仍有未计入或未定价用量。") }
+        if let priced = pricedRequests, let unpriced = unpricedRequests {
+            lines.append("已定价 / 未定价记录：\(CueTaskDetail.exact(priced)) / \(CueTaskDetail.exact(unpriced))")
+        }
+        if history { lines.append("仅含已成功同步到账本的对话记录；未同步的实时增量尚未计入。") }
+        if let updated = updatedAt {
+            let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            lines.append((history ? "最近账本同步：" : "最近用量记录：") + formatter.string(from: updated))
+        } else if history { lines.append("最近账本同步：尚未取得") }
+        if stale { lines.append("当前为缓存快照，可能尚未反映最新用量。") }
+        if !money.isEmpty || costStatus == "unpriced" {
+            lines.append("按记录中的模型及当前生效 API 单价估算，非订阅实际扣费。")
+        }
+        if !priceSources.isEmpty { lines.append("价格来源：" + priceSources.joined(separator: "、")) }
+        if pricingStale { lines.append("价格来源为缓存，可能已过期。") }
+        if let rate = fx["rate"] as? NSNumber, CFGetTypeID(rate) != CFBooleanGetTypeID(), rate.doubleValue.isFinite, rate.doubleValue > 0 {
+            lines.append("1 USD = \(rate.stringValue) CNY · " + CueTaskDetail.label(fx["source"], limit: 100) + " " + CueTaskDetail.label(fx["date"], limit: 30))
+            if fx["stale"] as? Bool == true { lines.append("换算汇率为缓存，可能已过期。") }
+        } else if money["cost_usd"] != nil, money["cost_cny"] == nil, currency != "USD" { lines.append("人民币换算汇率尚未取得。") }
+        if legacy { lines.append("旧版状态仅提供轮次 Tokens；本轮费用与历史累计尚未取得。") }
+        if !message.isEmpty { lines.append(message) }
+        return lines.joined(separator: "\n")
+    }
+
+    static func validationReport() -> [String: Bool] {
+        let unknown = CueTaskUsageSummary(raw: [:])
+        let zero = CueTaskUsageSummary(raw: ["total_tokens": 0, "tokens_status": "complete", "cost_usd": 0, "cost_cny": 0, "cost_status": "complete", "currency": "CNY"])
+        let partial = CueTaskUsageSummary(raw: ["total_tokens": 12345, "tokens_status": "partial", "cost_usd": 0.003, "cost_status": "partial", "currency": "USD", "priced_requests": 1, "unpriced_requests": 2])
+        let both = CueTaskUsageSummary(raw: ["cost_usd": 12345.67, "cost_cny": 1234567.89, "cost_status": "complete", "currency": "both"])
+        let invalid = CueTaskUsageSummary(raw: ["total_tokens": true, "input_tokens": -1, "output_tokens": 0.5, "cost_usd": Double.nan, "cost_cny": -1, "cost_status": "complete"])
+        let unpriced = CueTaskUsageSummary(raw: ["total_tokens": 50, "tokens_status": "complete", "cost_status": "unpriced"])
+        let noFX = CueTaskUsageSummary(raw: ["cost_usd": 1, "cost_status": "complete", "currency": "CNY"])
+        let history = CueTaskUsageSummary(raw: ["total_tokens": 2000000, "tokens_status": "partial", "updated_at": 1793170000, "stale": true], history: true)
+        let legacy = CueTaskDetail(raw: ["total_tokens": 500, "tokens_status": "complete"])
+        let explicitUnknown = CueTaskDetail(raw: ["total_tokens": 500, "tokens_status": "complete", "turn_usage": ["tokens_status": "unknown"]])
+        let recorded = CueTaskDetail(raw: ["total_tokens": 500, "current_settings": ["status": "current", "source": "codex_desktop", "model": "new-model"], "turn_usage": ["total_tokens": 700, "tokens_status": "complete", "cost_usd": 1, "cost_status": "complete", "currency": "USD"], "history_usage": ["total_tokens": 900, "tokens_status": "complete", "cost_usd": 2, "cost_status": "complete", "currency": "USD"]])
+        return ["task_usage_unknown_is_distinct_from_zero": unknown.tokenLine == "— Tokens" && unknown.costLine == "—" && zero.tokenLine == "0 Tokens" && zero.costLine == "0.0000 ¥",
+                "task_usage_partial_exposes_lower_bound_and_priced_subtotal": partial.tokenLine == "≥12.3K Tokens" && partial.costLine == "$0.0030 USD *" && partial.tooltip.contains("已定价小计") && partial.tooltip.contains("1 / 2"),
+                "task_usage_both_currencies_keep_full_base_unit_amounts": both.costLine == "1,234,567.89 ¥\n$12,345.67 USD" && !both.costLine.contains("M") && !both.costLine.contains("K"),
+                "task_usage_invalid_numbers_remain_unknown": invalid.totalTokens == nil && invalid.inputTokens == nil && invalid.outputTokens == nil && invalid.costLine == "—",
+                "task_usage_unpriced_is_distinct_from_unknown": unpriced.tokenLine == "50 Tokens" && unpriced.costLine == "未定价" && unknown.costLine != unpriced.costLine,
+                "task_usage_missing_fx_is_explicit": noFX.costLine == "汇率未获取" && noFX.tooltip.contains("汇率尚未取得"),
+                "task_usage_history_explains_sync_time_and_live_increment": history.tokenLine == "≥2.0M Tokens" && history.tooltip.contains("最近账本同步：") && history.tooltip.contains("未同步的实时增量") && history.tooltip.contains("缓存快照"),
+                "task_usage_legacy_flat_fields_fallback_to_turn_only": legacy.turnUsage.tokenLine == "500 Tokens" && legacy.turnUsage.costLine == "—" && legacy.historyUsage.tokenLine == "— Tokens" && legacy.turnUsage.tooltip.contains("旧版状态"),
+                "task_usage_explicit_unknown_never_reuses_legacy_total": explicitUnknown.turnUsage.tokenLine == "— Tokens",
+                "task_usage_nested_scopes_remain_separate_from_settings": recorded.turnUsage.tokenLine == "700 Tokens" && recorded.historyUsage.tokenLine == "900 Tokens" && recorded.turnUsage.costLine == "$1.00 USD" && recorded.historyUsage.costLine == "$2.00 USD"]
+    }
+}
+
 /// Bounded, in-memory telemetry. Missing fields remain unknown, never zero.
 struct CueTaskDetail {
     let status: String
@@ -40,6 +169,8 @@ struct CueTaskDetail {
     let cacheReadTokens: Int64?
     let cacheCreationTokens: Int64?
     let tokensStatus: String
+    let turnUsage: CueTaskUsageSummary
+    let historyUsage: CueTaskUsageSummary
     let messages: [CueTaskMessage]
     let lastMessage: String
     let lastMessageAt: Date?
@@ -76,6 +207,9 @@ struct CueTaskDetail {
         cacheCreationTokens = Self.integer(raw["cache_creation_tokens"])
         let declared = Self.label(raw["tokens_status"], limit: 40)
         tokensStatus = totalTokens == nil ? "unknown" : ["complete", "partial"].contains(declared) ? declared : "partial"
+        let legacyUsage = raw.filter { ["total_tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "tokens_status", "request_count"].contains($0.key) }
+        turnUsage = CueTaskUsageSummary(raw: raw["turn_usage"] as? [String: Any] ?? (raw["turn_usage"] == nil ? legacyUsage : [:]), legacy: raw["turn_usage"] == nil)
+        historyUsage = CueTaskUsageSummary(raw: raw["history_usage"] as? [String: Any] ?? [:], history: true)
         lastMessage = Self.text(raw["last_message"], limit: 12_000)
         lastMessageAt = Self.date(raw["last_message_at"])
         lastRole = Self.label(raw["last_role"], limit: 30)
@@ -123,6 +257,7 @@ struct CueTaskDetail {
         if let eventDate { return startedAt.map { eventDate < $0.addingTimeInterval(-1) } ?? true ? "最新轮" : "本轮" }
         return isActive ? "本轮" : "最新轮"
     }
+    func turnUsageLabel(eventDate: Date? = nil) -> String { scope(eventDate: eventDate) }
     func durationLine(now: Date = Date(), eventDate: Date? = nil, running: Bool? = nil, stoppedAt: Date? = nil) -> String {
         let duration = elapsed(now: now, running: running, stoppedAt: stoppedAt).map { (elapsedStatus == "partial" ? "≥" : "") + Self.duration($0) } ?? "耗时待确认"
         return "\(scope(eventDate: eventDate)) \(duration)"
@@ -213,7 +348,7 @@ struct CueTaskDetail {
         formatter.maximumFractionDigits = 0
         return formatter.string(from: NSNumber(value: value)) ?? String(value)
     }
-    private static func compact(_ value: Int64) -> String {
+    fileprivate static func compact(_ value: Int64) -> String {
         for (suffix, scale) in [("B", 1_000_000_000.0), ("M", 1_000_000.0), ("K", 1_000.0)] {
             if Double(value) >= scale { return String(format: "%.1f%@", Double(value) / scale, suffix) }
         }
@@ -230,17 +365,17 @@ struct CueTaskDetail {
         let result = value.doubleValue
         return result.isFinite && result >= 0 && result <= 9_000_000_000_000_000 ? result : nil
     }
-    private static func integer(_ raw: Any?) -> Int64? {
+    fileprivate static func integer(_ raw: Any?) -> Int64? {
         guard let value = number(raw), value.rounded(.towardZero) == value else { return nil }
         return Int64(value)
     }
-    private static func date(_ raw: Any?) -> Date? {
+    fileprivate static func date(_ raw: Any?) -> Date? {
         if let value = number(raw), value > 0 && value < 253_402_300_799 { return Date(timeIntervalSince1970: value) }
         guard let value = raw as? String else { return nil }
         let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
     }
-    private static func label(_ raw: Any?, limit: Int, fallback: String = "") -> String {
+    fileprivate static func label(_ raw: Any?, limit: Int, fallback: String = "") -> String {
         guard let value = raw as? String else { return fallback }
         return String(value.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").prefix(limit))
     }
@@ -558,6 +693,7 @@ final class CueTaskHoverController: NSObject {
                        "task_detail_only_user_and_assistant_are_previewed": messages.messages.map(\.role) == ["user", "assistant"],
                        "task_detail_preview_text_stays_bounded": long.messages.count <= 8 && long.messages.reduce(0) { $0 + $1.text.count } <= 12000 && long.contentTruncated]
         _ = NSApplication.shared
+        results.merge(CueTaskUsageSummary.validationReport()) { _, new in new }
         results.merge(CueHoverMarkdown.validationReport()) { _, new in new }
         let hover = CueTaskHoverController(); hover.makePanel(); hover.update(detail: messages, title: "测试标题")
         results["task_hover_text_is_selectable_and_not_editable"] = hover.text.isSelectable && !hover.text.isEditable

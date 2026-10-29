@@ -399,6 +399,27 @@ private final class CueRowQuickButton: NSButton {
     @objc private func trigger() { invoke?() }
 }
 
+/// Shared geometry keeps navigation, accounting and live state separate.
+/// The rightmost controls form a compact 2 × 2 cluster.
+private struct CueTaskRowLayout {
+    static let height: CGFloat = 78
+    static let pitch: CGFloat = 80
+    let width: CGFloat
+    var columnWidth: CGFloat { min(130, max(100, (width - 330) / 3)) }
+    var actionsX: CGFloat { width - 62 }
+    var historyX: CGFloat { actionsX - 16 - columnWidth }
+    var turnX: CGFloat { historyX - 16 - columnWidth }
+    var leftMaxX: CGFloat { turnX - 16 }
+    var state: NSRect { NSRect(x: leftMaxX - 130, y: 7, width: 130, height: 18) }
+    var elapsed: NSRect { NSRect(x: state.minX, y: 29, width: state.width, height: 15) }
+    var heading: NSRect { NSRect(x: 42, y: 6, width: max(100, state.minX - 54), height: 21) }
+    var metadata: NSRect { NSRect(x: 42, y: 28, width: heading.width, height: 15) }
+    var model: NSRect { NSRect(x: 42, y: 52, width: max(100, leftMaxX - 42), height: 16) }
+    func action(_ index: Int) -> NSRect {
+        NSRect(x: actionsX + CGFloat(index % 2) * 28, y: 12 + CGFloat(index / 2) * 29, width: 25, height: 25)
+    }
+}
+
 private final class CueRecentRowButton: NSButton {
     private(set) var record: CueRecentRecord
     private(set) var isRunning: Bool
@@ -412,7 +433,7 @@ private final class CueRecentRowButton: NSButton {
     private var tracking: NSTrackingArea?
     init(record: CueRecentRecord, width: CGFloat, isRunning: Bool = false) {
         self.record = record; self.isRunning = isRunning
-        super.init(frame: NSRect(x: 8, y: 0, width: width - 16, height: 70))
+        super.init(frame: NSRect(x: 8, y: 0, width: width - 16, height: CueTaskRowLayout.height))
         title = ""; isBordered = false; setButtonType(.momentaryPushIn); focusRingType = .exterior
         isEnabled = true
         let tint: NSColor = record.isOpened ? .secondaryLabelColor : .systemBlue
@@ -526,7 +547,7 @@ private final class CueRunningRowButton: NSButton {
     private var tracking: NSTrackingArea?
     init(task: CueRunningTask, width: CGFloat) {
         self.task = task
-        super.init(frame: NSRect(x: 8, y: 0, width: width - 16, height: 70))
+        super.init(frame: NSRect(x: 8, y: 0, width: width - 16, height: CueTaskRowLayout.height))
         title = ""; isBordered = false; setButtonType(.momentaryPushIn); focusRingType = .exterior
         let icon = NSImageView(frame: NSRect(x: 11, y: 16, width: 20, height: 20))
         icon.identifier = NSUserInterfaceItemIdentifier("row-icon")
@@ -648,7 +669,7 @@ final class CueStatusPopoverController: NSViewController {
     private var enabled = true, soundEnabled = true, paused = false
     private var status = "本机监控中"
     private var maximumHeight: CGFloat = 900
-    private let panelWidth: CGFloat = 720
+    private let panelWidth: CGFloat = min(960, max(680, (NSScreen.main?.visibleFrame.width ?? 1000) - 40))
     private var recentDocument: CueFlippedView?
     private var selectedID: String?
     private var runningTasks: [CueRunningTask] = []
@@ -758,18 +779,18 @@ final class CueStatusPopoverController: NSViewController {
         view.subviews.forEach { $0.removeFromSuperview() }
         let fixedHeight: CGFloat = batchMode ? 255 : 219
         let maxHeight = max(390, min(1100, maximumHeight))
-        let capacity = max(3, min(12, Int((maxHeight - fixedHeight) / 72)))
-        let contentHeight = CGFloat(snapshot.rowCount) * 72 + CGFloat(snapshot.sectionCount) * 28
-        let viewport = min(CGFloat(capacity) * 72, max(180, contentHeight))
+        let capacity = max(3, min(12, Int((maxHeight - fixedHeight) / CueTaskRowLayout.pitch)))
+        let contentHeight = CGFloat(snapshot.rowCount) * CueTaskRowLayout.pitch + CGFloat(snapshot.sectionCount) * 28
+        let viewport = min(CGFloat(capacity) * CueTaskRowLayout.pitch, max(180, contentHeight))
         let height = fixedHeight + viewport
         view.frame.size = NSSize(width: panelWidth, height: height)
         preferredContentSize = view.frame.size
         label("VibeCue", NSRect(x: 22, y: 16, width: 260, height: 27), size: 18, weight: .semibold)
         label(status, NSRect(x: 22, y: 47, width: 535, height: 19), size: 11, color: .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("monitor-status")
-        button("打开面板", NSRect(x: 18, y: 76, width: 166, height: 30), #selector(openSettings))
-        button("用量统计", NSRect(x: 192, y: 76, width: 166, height: 30), #selector(openUsage))
-        button("测试提醒", NSRect(x: 366, y: 76, width: 166, height: 30), #selector(demo))
-        button("结束", NSRect(x: 540, y: 76, width: 162, height: 30), #selector(quit))
+        let toolbarWidth = (panelWidth - 60) / 4
+        for (index, item) in [("打开面板", #selector(openSettings)), ("用量统计", #selector(openUsage)), ("测试提醒", #selector(demo)), ("结束", #selector(quit))].enumerated() {
+            button(item.0, NSRect(x: 18 + CGFloat(index) * (toolbarWidth + 8), y: 76, width: toolbarWidth, height: 30), item.1)
+        }
         let enable = NSButton(checkboxWithTitle: "启用提醒", target: self, action: #selector(toggleEnabled))
         enable.frame = NSRect(x: 22, y: 119, width: 123, height: 25); enable.state = enabled ? .on : .off; view.addSubview(enable)
         enable.identifier = NSUserInterfaceItemIdentifier("setting-enabled")
@@ -821,7 +842,7 @@ final class CueStatusPopoverController: NSViewController {
             row.refresh(record: record, isRunning: isRunning, recovery: snapshot.recoveryByThread[record.event.threadID], pending: history.followups.contains(record.event.threadID))
             row.frame.origin.y = position
             if batchMode { row.frame.origin.x += 28; batchCheckbox(target, y: position, in: document) }
-            position += 72
+            position += CueTaskRowLayout.pitch
             row.target = self; row.action = #selector(openRow(_:))
             let id = record.event.id
             row.identifier = NSUserInterfaceItemIdentifier(id); row.selected = batchMode ? selectedThreads.contains(record.event.threadID) : selectedID == id
@@ -837,7 +858,7 @@ final class CueStatusPopoverController: NSViewController {
             row.refreshFollowup(followup, running: snapshot.activeThreadIDs.contains(followup.threadID), recovery: snapshot.recoveryByThread[followup.threadID])
             row.frame.origin.y = position
             if batchMode { row.frame.origin.x += 28; batchCheckbox(CueBatchTarget(threadID: followup.threadID, title: followup.title), y: position, in: document) }
-            position += 72
+            position += CueTaskRowLayout.pitch
             row.target = self; row.action = #selector(openRunningRow(_:)); row.selected = batchMode ? selectedThreads.contains(followup.threadID) : selectedID == followup.navigationID
             row.selectRow = { [weak self] in self?.select(id: followup.navigationID) }
             row.contextMenu = { [weak self] in self?.navigationContextMenu(followup.event, followup: followup) ?? NSMenu() }
@@ -859,7 +880,7 @@ final class CueStatusPopoverController: NSViewController {
                 row.refresh(task: task, detail: taskDetails[task.threadID])
                 row.frame.origin.y = position
                 if batchMode { row.frame.origin.x += 28; batchCheckbox(CueBatchTarget(threadID: task.threadID, title: task.title), y: position, in: document) }
-                position += 72
+                position += CueTaskRowLayout.pitch
                 row.target = self; row.action = #selector(openRunningRow(_:)); row.selected = batchMode ? selectedThreads.contains(task.threadID) : selectedID == task.navigationID
                 row.setAccessibilityValue(row.selected ? "已选中" : "")
                 row.selectRow = { [weak self] in self?.select(id: task.navigationID) }
@@ -875,7 +896,7 @@ final class CueStatusPopoverController: NSViewController {
                 let row = CueRunningRowButton(task: task, width: document.frame.width - (batchMode ? 28 : 0))
                 row.refresh(task: task, detail: taskDetails[task.threadID]); row.frame.origin.y = position
                 if batchMode { row.frame.origin.x += 28; batchCheckbox(CueBatchTarget(threadID: task.threadID, title: task.title), y: position, in: document) }
-                position += 72
+                position += CueTaskRowLayout.pitch
                 row.target = self; row.action = #selector(openRunningRow(_:)); row.selected = batchMode ? selectedThreads.contains(task.threadID) : selectedID == task.navigationID
                 row.selectRow = { [weak self] in self?.select(id: task.navigationID) }
                 row.contextMenu = { [weak self] in self?.recoveryContextMenu(task) ?? NSMenu() }
@@ -1065,6 +1086,7 @@ final class CueStatusPopoverController: NSViewController {
         let stableCheckbox = stable.recentDocument?.subviews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "active-thread" }
         let stableRow = stable.recentDocument?.subviews.compactMap { $0 as? CueRunningRowButton }.first { $0.task.threadID == "active-thread" }
         let stableMetrics = stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-metrics:active-thread" }
+        let stableUsage = stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "usage-turn-tokens" }
         let checkboxFrame = stableCheckbox?.frame
         let selectedBeforeRefresh = stable.selectedThreads
         let navigationBeforeRefresh = navigationEvents.count
@@ -1073,7 +1095,9 @@ final class CueStatusPopoverController: NSViewController {
         let updatedCheckbox = stable.recentDocument?.subviews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "active-thread" }
         let updatedMetrics = stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-metrics:active-thread" }
         results["batch_background_refresh_preserves_checkbox_identity_and_frame"] = stableCheckbox != nil && stableCheckbox === updatedCheckbox && stableCheckbox?.frame == checkboxFrame
-        results["batch_background_refresh_preserves_metrics_identity_and_updates_value"] = stableMetrics != nil && stableMetrics === updatedMetrics && stableMetrics?.stringValue == completed.tokenLine() + " · " + completed.secondaryLine
+        results["batch_background_refresh_preserves_metrics_identity_and_updates_value"] = stableMetrics != nil && stableMetrics === updatedMetrics && stableMetrics?.stringValue == completed.secondaryLine
+        let updatedUsage = stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "usage-turn-tokens" }
+        results["batch_background_refresh_updates_usage_without_replacing_the_column"] = stableUsage != nil && stableUsage === updatedUsage && updatedUsage?.stringValue == completed.turnUsage.tokenLine
         results["batch_completed_task_keeps_selection_and_shows_completion_in_place"] = stable.selectedThreads == selectedBeforeRefresh && stableRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "row-state" }?.stringValue == "已完成"
         stable.clearBatchSelection(); stable.selectRunning()
         results["batch_selection_scope_stays_frozen_until_exit"] = stable.selectedThreads == selectedBeforeRefresh && !stable.selectedThreads.contains("new-background") && stableCheckbox === updatedCheckbox
@@ -1212,7 +1236,7 @@ final class CueStatusPopoverController: NSViewController {
         results["second_clock_keeps_waiting_completed_and_interrupted_times_fixed"] = doneBefore == clockField("clock-done")?.stringValue && waitBefore == clockField("clock-wait")?.stringValue && lostBefore == clockField("clock-lost")?.stringValue
         results["second_clock_preserves_document_row_identity_selection_and_scroll"] = clock.recentDocument === clockDocument && pinTime === clockField("clock-pin") && runTime === clockField("clock-run") && followTime === clockField("clock-follow") && clock.selectedID == "clock-pin" && clock.scroll.contentView.bounds.origin == originBeforeClock
         let stateFrame = pinTime?.superview?.subviews.first(where: { $0.identifier?.rawValue == "row-state" })?.frame ?? .zero
-        results["row_elapsed_is_right_aligned_directly_below_state"] = pinTime?.alignment == .right && pinTime?.frame.maxX == stateFrame.maxX && (pinTime?.frame.minY ?? 0) >= stateFrame.maxY && (pinTime?.frame.minX ?? 0) > 300
+        results["row_elapsed_stays_under_state_in_left_information_area"] = pinTime?.alignment == .right && pinTime?.frame.maxX == stateFrame.maxX && (pinTime?.frame.minY ?? 0) >= stateFrame.maxY && (pinTime?.frame.minX ?? 0) > 300
         results["list_clock_uses_common_runloop_timer_only_while_visible"] = clock.elapsedTimer?.isValid == true && clock.elapsedTimer?.timeInterval == 1
         let staleComplete = CueTaskDetail(raw: ["status": "complete", "started_at": clockNow.addingTimeInterval(-1000).timeIntervalSince1970, "finished_at": clockNow.addingTimeInterval(-500).timeIntervalSince1970])
         clock.taskDetails["clock-run"] = staleComplete
@@ -1241,7 +1265,7 @@ final class CueStatusPopoverController: NSViewController {
         var quickActions = CueStatusPopoverActions(openSettings: {}, openUsage: {}, toggleEnabled: {}, toggleSound: {}, pause: {}, demo: {}, quit: {}, openEvent: { _ in quickLocal += 1 })
         quickActions.openInCodex = { quickExternal.append($0.threadID) }
         let quick = CueStatusPopoverController(history: quickHistory, actions: quickActions)
-        let quickDetail = CueTaskDetail(raw: ["status": "running", "model": "gpt-6.1-sol", "reasoning_effort": "high", "service_tier": "fast", "total_tokens": 12000, "tokens_status": "complete"])
+        let quickDetail = CueTaskDetail(raw: ["status": "running", "model": "gpt-6.1-sol", "reasoning_effort": "high", "service_tier": "fast", "total_tokens": 12000, "tokens_status": "complete", "turn_usage": ["total_tokens":12000,"tokens_status":"complete","cost_usd":0.12,"cost_cny":0.86,"cost_status":"complete","currency":"both"], "history_usage":["total_tokens":9876543210,"tokens_status":"partial","cost_usd":173456.78,"cost_cny":1234567.89,"cost_status":"partial","currency":"both"]])
         quick.update(status: "快捷操作验收", enabled: true, soundEnabled: true, paused: false, runningTasks: [running("quick-running")], interruptedTasks: [lost("quick-interrupted")], taskDetails: ["quick-running": quickDetail])
         _ = quick.view
         func quickButton(_ row: NSView?, _ action: String) -> CueRowQuickButton? { row?.subviews.compactMap { $0 as? CueRowQuickButton }.first { $0.identifier?.rawValue == "quick-" + action } }
@@ -1263,7 +1287,18 @@ final class CueStatusPopoverController: NSViewController {
         results["quick_pin_targets_its_row_without_opening_it"] = quickHistory.records.first?.manualPinned == true && quickLocal == 0
         let quickRunning = quick.recentDocument!.subviews.compactMap { $0 as? CueRunningRowButton }.first { $0.task.threadID == "quick-running" }
         let metricsText = quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-metrics:quick-running" }?.stringValue ?? ""
-        results["row_information_exposes_tokens_model_effort_and_speed"] = metricsText.contains("12.0K Tokens") && metricsText.contains("gpt-6.1-sol") && metricsText.contains("高强度") && metricsText.contains("Fast")
+        let turnTokensText = quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "usage-turn-tokens" }?.stringValue ?? ""
+        results["row_separates_turn_tokens_from_model_effort_and_speed"] = turnTokensText.contains("12.0K") && !metricsText.contains("Tokens") && metricsText.contains("gpt-6.1-sol") && metricsText.contains("高强度") && metricsText.contains("Fast")
+        func usageField(_ part: String) -> NSTextField? { quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == part } }
+        let turnColumn = usageField("usage-turn-tokens"), historyColumn = usageField("usage-history-tokens")
+        let actionFrames = quickRunning?.subviews.compactMap { $0 as? CueRowQuickButton }.map(\.frame) ?? []
+        results["row_shortcuts_use_two_compact_rows"] = Set(actionFrames.map(\.minX)).count == 2 && Set(actionFrames.map(\.minY)).count == 2 && actionFrames.allSatisfy { $0.width == 25 && $0.height == 25 }
+        results["row_right_columns_are_turn_history_then_shortcuts"] = (turnColumn?.frame.maxX ?? 0) + 12 <= (historyColumn?.frame.minX ?? 0) && (historyColumn?.frame.maxX ?? 0) + 12 <= (actionFrames.map(\.minX).min() ?? 0) && historyColumn?.alignment == .right && turnColumn?.alignment == .right
+        let modelField = quickRunning?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "task-metrics:quick-running" }
+        results["row_model_and_status_stay_left_of_accounting"] = (modelField?.frame.maxX ?? 0) + 10 < (turnColumn?.frame.minX ?? 0) && (quickRunning?.subviews.first { $0.identifier?.rawValue == "row-state" }?.frame.maxX ?? 0) < (turnColumn?.frame.minX ?? 0)
+        results["row_accounting_scopes_have_independent_headers_and_values"] = usageField("usage-turn-label")?.stringValue == "本轮" && usageField("usage-history-label")?.stringValue == "历史累计" && turnColumn?.stringValue == "12.0K Tokens" && historyColumn?.stringValue == "≥9.9B Tokens"
+        let historyMoney = usageField("usage-history-cost")
+        results["row_full_currency_and_dual_currency_fit_their_column"] = historyMoney?.stringValue.contains("1,234,567.89 ¥") == true && historyMoney?.stringValue.contains("\n") == true && historyMoney.map { field in field.stringValue.components(separatedBy: "\n").allSatisfy { ($0 as NSString).size(withAttributes: [.font: field.font!]).width <= field.frame.width } } == true
         quickButton(quickRunning, "unread")?.invoke?()
         let quickUnread = quickHistory.followups.records.first { $0.threadID == "quick-running" }
         results["running_unread_shortcut_pins_workflow_without_fake_completion"] = quickUnread?.unread == true && quickUnread?.isPinned == true && quickHistory.records.count == 1 && quickLocal == 0
@@ -1304,12 +1339,15 @@ final class CueStatusPopoverController: NSViewController {
         }
         let actions = CueStatusPopoverActions(openSettings: {}, openUsage: {}, toggleEnabled: {}, toggleSound: {}, pause: {}, demo: {}, quit: {}, openEvent: { _ in })
         let panel = CueStatusPopoverController(history: history, actions: actions)
+        func captureUsage(_ tokens: Int, historical: Bool = false, index: Int = 0) -> [String: Any] {
+            ["total_tokens": tokens, "tokens_status": index == 1 ? "partial" : "complete", "cost_usd": historical ? 12345.67 : 0.1742 + Double(index), "cost_cny": historical ? 88543.76 : 1.2493 + Double(index), "cost_status": index == 1 ? "partial" : "complete", "currency": index == 2 ? "both" : "CNY", "updated_at": now.addingTimeInterval(-120).timeIntervalSince1970, "provenance": historical ? "synced_history" : "current_turn"]
+        }
         var details = Dictionary(uniqueKeysWithValues: tasks.enumerated().map { index, task in
-            (task.threadID, CueTaskDetail(raw: ["status":"running", "started_at":task.startDate.timeIntervalSince1970, "last_activity":now.timeIntervalSince1970, "elapsed_status":"complete", "total_tokens":24750 + index * 12300, "input_tokens":2100, "output_tokens":1250, "cache_read_tokens":21400 + index * 12300, "cache_creation_tokens":0, "tokens_status":"complete", "model":"gpt-6.1-sol", "reasoning_effort":"high", "service_tier":"priority", "messages":[["role":"assistant","text":"正在核对本轮变更，完成后会报告验证结果。","created_at":now.timeIntervalSince1970]]]))
+            (task.threadID, CueTaskDetail(raw: ["status":"running", "started_at":task.startDate.timeIntervalSince1970, "last_activity":now.timeIntervalSince1970, "elapsed_status":"complete", "turn_usage":captureUsage(24750 + index * 12300, index:index), "history_usage":captureUsage(234567890 + index * 1230000, historical:true, index:index), "total_tokens":24750 + index * 12300, "input_tokens":2100, "output_tokens":1250, "cache_read_tokens":21400 + index * 12300, "cache_creation_tokens":0, "tokens_status":"complete", "model":"gpt-6.1-sol", "reasoning_effort":"high", "service_tier":"priority", "messages":[["role":"assistant","text":"正在核对本轮变更，完成后会报告验证结果。","created_at":now.timeIntervalSince1970]]]))
         })
         let lost = CueRunningTask(raw: ["thread_id": "fixture-interrupted", "title": "ALV｜重启前的任务，等待手动继续", "started_at": now.addingTimeInterval(-1800).timeIntervalSince1970, "last_activity": now.addingTimeInterval(-600).timeIntervalSince1970, "interrupted_at": now.addingTimeInterval(-590).timeIntervalSince1970, "status": "interrupted", "reason_text": "Codex 进程已结束，保留任务记录。", "turn_id": "fixture-old-turn"])!
         for id in ["fixture-followup", "fixture-interrupted", "pinned-read", "history-0", "history-1"] {
-            details[id] = CueTaskDetail(raw: ["status": id == "fixture-interrupted" ? "interrupted" : "complete", "started_at": now.addingTimeInterval(-760).timeIntervalSince1970, "finished_at": now.addingTimeInterval(-300).timeIntervalSince1970, "elapsed_status": "complete", "total_tokens": 154820, "input_tokens": 7820, "output_tokens": 12000, "cache_read_tokens": 135000, "tokens_status": "complete", "model": "gpt-6.1-sol", "reasoning_effort": "ultra", "service_tier": "standard"])
+            details[id] = CueTaskDetail(raw: ["status": id == "fixture-interrupted" ? "interrupted" : "complete", "started_at": now.addingTimeInterval(-760).timeIntervalSince1970, "finished_at": now.addingTimeInterval(-300).timeIntervalSince1970, "elapsed_status": "complete", "turn_usage":captureUsage(154820), "history_usage":captureUsage(234567890, historical:true), "total_tokens": 154820, "input_tokens": 7820, "output_tokens": 12000, "cache_read_tokens": 135000, "tokens_status": "complete", "model": "gpt-6.1-sol", "reasoning_effort": "ultra", "service_tier": "standard"])
         }
         panel.update(status: "界面样例 · 3 个运行 · 1 个中断待续", enabled: true, soundEnabled: true, paused: false, maximumHeight: 1100, runningTasks: tasks, interruptedTasks: [lost], taskDetails: details, attentionConnected: true)
         if batchMode { panel.toggleBatchMode(); panel.selectPinned(); panel.selectRunning() }
@@ -1472,33 +1510,74 @@ final class CueStatusPopoverController: NSViewController {
     @objc private func openRecoveryFromMenu(_ sender: NSMenuItem) { if let task = sender.representedObject as? CueRunningTask { actions.openEvent(task.ephemeralCueEvent) } }
     @objc private func dismissRecoveryFromMenu(_ sender: NSMenuItem) { if let task = sender.representedObject as? CueRunningTask { actions.dismissInterrupted(task) } }
     private func addDetails(to row: NSButton, threadID: String, title: String, eventDate: Date?) {
-        let line = rowInformation(threadID: threadID, eventDate: eventDate)
-        let metrics = NSTextField(labelWithString: line)
-        metrics.frame = NSRect(x: 42, y: 48, width: row.frame.width - 58, height: 16)
-        metrics.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular); metrics.textColor = .secondaryLabelColor
+        let metrics = NSTextField(labelWithString: rowInformation(threadID: threadID, eventDate: eventDate))
+        metrics.font = .systemFont(ofSize: 10); metrics.textColor = .secondaryLabelColor
         metrics.lineBreakMode = .byTruncatingTail; metrics.identifier = NSUserInterfaceItemIdentifier("task-metrics:" + threadID)
         row.addSubview(metrics)
-        let elapsed = NSTextField(labelWithString: durationLine(threadID: threadID, eventDate: eventDate, now: Date()))
-        elapsed.frame = NSRect(x: row.frame.width - 270, y: 28, width: 145, height: 15)
+        let elapsed = NSTextField(labelWithString: "")
         elapsed.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular); elapsed.textColor = .secondaryLabelColor
         elapsed.alignment = .right; elapsed.lineBreakMode = .byTruncatingHead
         elapsed.identifier = NSUserInterfaceItemIdentifier("task-elapsed:" + threadID)
         row.addSubview(elapsed); row.toolTip = nil
-        configureQuickActions(in: row)
-        row.setAccessibilityHelp(line + "，" + elapsed.stringValue + "。悬停查看本轮详情与最近对话；点击打开对应对话。")
-        metrics.toolTip = taskDetails[threadID]?.settingsTooltip
+        for scope in ["turn", "history"] {
+            for part in ["label", "tokens", "cost"] {
+                let field = NSTextField(labelWithString: "")
+                field.identifier = NSUserInterfaceItemIdentifier("usage-" + scope + "-" + part)
+                field.alignment = .right; field.lineBreakMode = .byClipping
+                field.textColor = part == "label" ? .tertiaryLabelColor : part == "cost" ? .secondaryLabelColor : .labelColor
+                row.addSubview(field)
+            }
+            let separator = NSBox(); separator.boxType = .separator
+            separator.identifier = NSUserInterfaceItemIdentifier("usage-" + scope + "-separator")
+            row.addSubview(separator)
+        }
+        refreshDetails(in: row, threadID: threadID, eventDate: eventDate)
     }
     private func refreshDetails(in row: NSButton, threadID: String, eventDate: Date?) {
+        let layout = CueTaskRowLayout(width: row.bounds.width)
         let line = rowInformation(threadID: threadID, eventDate: eventDate)
-        if let metrics = row.subviews.first(where: { $0.identifier?.rawValue == "task-metrics:" + threadID }) as? NSTextField { metrics.stringValue = line; metrics.toolTip = taskDetails[threadID]?.settingsTooltip }
         let elapsed = durationLine(threadID: threadID, eventDate: eventDate, now: Date())
-        if let field = row.subviews.first(where: { $0.identifier?.rawValue == "task-elapsed:" + threadID }) as? NSTextField { field.stringValue = elapsed }
-        row.setAccessibilityHelp(line + "，" + elapsed + "。悬停查看本轮详情与最近对话；点击打开对应对话。")
+        let detail = taskDetails[threadID] ?? CueTaskDetail(raw: [:])
+        for child in row.subviews {
+            guard let field = child as? NSTextField else { continue }
+            switch field.identifier?.rawValue {
+            case "row-title": field.frame = layout.heading
+            case "row-metadata": field.frame = layout.metadata
+            case "row-state": field.frame = layout.state
+            case "task-metrics:" + threadID: field.stringValue = line; field.frame = layout.model; field.toolTip = detail.settingsTooltip
+            case "task-elapsed:" + threadID: field.stringValue = elapsed; field.frame = layout.elapsed
+            default: break
+            }
+        }
+        let active = runningTasks.first { $0.threadID == threadID && !$0.needsRecovery }
+        let oldTurn = active.map { !$0.turnID.isEmpty && !detail.turnID.isEmpty && $0.turnID != detail.turnID } ?? false
+        let turn = oldTurn ? CueTaskDetail(raw: [:]).turnUsage : detail.turnUsage
+        for (scope, label, value, x) in [("turn", oldTurn ? "本轮" : detail.turnUsageLabel(eventDate: eventDate), turn, layout.turnX), ("history", "历史累计", detail.historyUsage, layout.historyX)] {
+            for child in row.subviews {
+                if let separator = child as? NSBox, separator.identifier?.rawValue == "usage-" + scope + "-separator" {
+                    separator.frame = NSRect(x: x - 8, y: 12, width: 1, height: 54)
+                }
+                guard let field = child as? NSTextField else { continue }
+                let prefix = "usage-" + scope + "-"
+                switch field.identifier?.rawValue {
+                case prefix + "label": field.stringValue = label; field.frame = NSRect(x: x, y: 6, width: layout.columnWidth, height: 14); field.font = .systemFont(ofSize: 9, weight: .medium)
+                case prefix + "tokens": field.stringValue = value.tokenLine; field.frame = NSRect(x: x, y: 24, width: layout.columnWidth, height: 17); field.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+                case prefix + "cost":
+                    field.stringValue = value.costLine; field.frame = NSRect(x: x, y: 44, width: layout.columnWidth, height: 28)
+                    field.maximumNumberOfLines = 2; field.usesSingleLineMode = false
+                    var size: CGFloat = 10.5
+                    while size > 8 && value.costLine.components(separatedBy: "\n").contains(where: { ($0 as NSString).size(withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular)]).width > layout.columnWidth }) { size -= 0.5 }
+                    field.font = .monospacedDigitSystemFont(ofSize: size, weight: .regular)
+                default: continue
+                }
+                field.toolTip = value.tooltip
+            }
+        }
+        row.setAccessibilityHelp(line + "，" + elapsed + "。本轮 " + turn.tokenLine + "，" + turn.costLine + "。历史累计 " + detail.historyUsage.tokenLine + "，" + detail.historyUsage.costLine + "。悬停查看详情；点击打开对应对话。")
         configureQuickActions(in: row)
     }
     private func rowInformation(threadID: String, eventDate: Date?) -> String {
-        guard let detail = taskDetails[threadID] else { return "Tokens 待同步 · 当前设置不可读" }
-        return detail.tokenLine(eventDate: eventDate) + " · " + detail.secondaryLine
+        taskDetails[threadID]?.secondaryLine ?? "当前设置不可读"
     }
     private func configureQuickActions(in row: NSButton) {
         let event: CueEvent, recordID: String?
@@ -1519,7 +1598,7 @@ final class CueStatusPopoverController: NSViewController {
             let (command, symbol, label) = specification
             let button = row.subviews.first { $0.identifier?.rawValue == "quick-" + command } as? CueRowQuickButton ?? CueRowQuickButton(command: command)
             if button.superview == nil { row.addSubview(button) }
-            button.frame = NSRect(x: row.bounds.width - 118 + CGFloat(index) * 27, y: 6, width: 25, height: 25)
+            button.frame = CueTaskRowLayout(width: row.bounds.width).action(index)
             button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
             button.contentTintColor = command == "pin" && effectivePin ? .controlAccentColor : command == "unread" && unread ? .systemBlue : .secondaryLabelColor
             button.toolTip = label; button.setAccessibilityElement(true); button.setAccessibilityLabel(label + "：" + event.title)

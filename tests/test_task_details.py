@@ -143,6 +143,47 @@ class TaskDetailsTests(unittest.TestCase):
         self.send('event_msg', {'type': 'thread_settings_applied', 'thread_settings': {'service_tier': None}}, 1003)
         self.assertEqual(self.snapshot()['service_tier'], 'default')
 
+    def test_usage_retains_each_requests_model_across_setting_changes(self):
+        self.send('turn_context', {'turn_id': 'turn-one', 'model': 'model-a'}, 1001)
+        self.token(1002, last=counts(100, 10, 80))
+        self.send('event_msg', {'type': 'thread_settings_applied', 'thread_settings': {'model': 'model-b'}}, 1003)
+        self.token(1004, last=counts(200, 20, 100))
+        self.send('event_msg', {'type': 'thread_settings_applied', 'thread_settings': {'model': 'model-c'}}, 1005)
+        row = self.snapshot()
+        groups = {group['model']: group for group in row['usage_by_model']}
+        self.assertEqual(set(groups), {'model-a', 'model-b'})
+        self.assertEqual(groups['model-a']['total_tokens'], 110)
+        self.assertEqual(groups['model-b']['total_tokens'], 220)
+        self.assertEqual(groups['model-a']['cache_read_tokens'], 80)
+        self.assertEqual(row['model'], 'model-c')
+
+    def test_mirrored_record_rolls_back_its_original_model_bucket(self):
+        self.send('turn_context', {'turn_id': 'turn-one', 'model': 'model-a'}, 1001)
+        self.send('token_usage_record', {'usage': counts(100, 10), 'response_id': 'one', 'model': 'compaction-model'}, 1002)
+        self.send('event_msg', {'type': 'token_count', 'info': {'last_token_usage': counts(100, 10), 'model': 'model-b'}}, 1003)
+        groups = self.snapshot()['usage_by_model']
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]['model'], 'model-b')
+        self.assertEqual(groups[0]['requests'], 1)
+        self.assertEqual(groups[0]['total_tokens'], 110)
+
+    def test_new_turn_drops_prior_model_usage(self):
+        self.send('turn_context', {'turn_id': 'turn-one', 'model': 'model-a'}, 1001)
+        self.token(1002, last=counts(10, 1))
+        self.send('event_msg', {'type': 'task_started', 'turn_id': 'turn-two'}, 1003)
+        self.assertEqual(self.snapshot()['usage_by_model'], [])
+        self.assertIsNone(self.snapshot()['total_tokens'])
+
+    def test_model_churn_is_bounded_with_explicit_unknown_bucket(self):
+        from vibecue.providers.task_details import MAX_USAGE_MODELS
+        for offset in range(MAX_USAGE_MODELS + 5):
+            self.send('event_msg', {'type': 'token_count', 'info': {
+                'last_token_usage': counts(10, 1), 'model': 'model-' + str(offset)}}, 1001 + offset)
+        row = self.snapshot()
+        self.assertLessEqual(len(row['usage_by_model']), MAX_USAGE_MODELS)
+        self.assertIn('', {group['model'] for group in row['usage_by_model']})
+        self.assertEqual(sum(group['total_tokens'] for group in row['usage_by_model']), row['total_tokens'])
+
     def test_old_or_other_turn_terminal_does_not_override_current_details(self):
         self.token(1005, last=counts(20, 2))
         self.send('event_msg', {'type': 'task_complete', 'turn_id': 'old'}, 1006)

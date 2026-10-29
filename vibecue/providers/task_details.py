@@ -17,6 +17,7 @@ MAX_TEXT_THREADS = 48
 MAX_GLOBAL_TEXT = 120_000
 MAX_DETAIL_BYTES = 1_400_000
 MAX_USAGE_IDENTITIES = 4096
+MAX_USAGE_MODELS = 16
 
 _TOKEN_SECRET = re.compile(r'\b(?:sk-[A-Za-z0-9_-]{12,}|sk_(?:live|test)_[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b')
 _AUTH_SECRET = re.compile(r'(?i)\b(authorization\s*[:=]\s*(?:bearer\s+)?|bearer\s+)[^\s\"\'<>]+')
@@ -73,6 +74,7 @@ class TaskDetails:
         self._saw_usage = False
         self._counts = [0, 0, 0, 0]
         self._request_count = 0
+        self._usage_by_model = {}
         self._entries = OrderedDict()
         self._session_total = None
         self._last_signature = None
@@ -96,6 +98,7 @@ class TaskDetails:
         self._saw_usage = False
         self._counts = [0, 0, 0, 0]
         self._request_count = 0
+        self._usage_by_model.clear()
         self._entries.clear()
         self._pending_record = None
 
@@ -142,10 +145,19 @@ class TaskDetails:
             self.messages.popleft()
             self.content_truncated = True
 
-    def _add(self, key, counts):
+    def _add(self, key, counts, model=None):
         if key in self._entries or not any(counts):
             return
-        self._entries[key] = counts
+        model = self.model if model is None else model
+        # Keep an exact token subtotal even for pathological model churn. The
+        # overflow bucket has no model identity, so it can never acquire a
+        # price by accidentally using the latest selected model.
+        if model not in self._usage_by_model and len(self._usage_by_model) >= MAX_USAGE_MODELS - 1:
+            model = ''
+        group = self._usage_by_model.setdefault(model, {'counts': [0, 0, 0, 0], 'requests': 0})
+        group['counts'] = [group['counts'][i] + counts[i] for i in range(4)]
+        group['requests'] += 1
+        self._entries[key] = (model, counts)
         self._request_count += 1
         self._counts = [self._counts[i] + counts[i] for i in range(4)]
         if len(self._entries) > MAX_USAGE_IDENTITIES:
@@ -160,7 +172,8 @@ class TaskDetails:
                 return
             self._saw_usage = True
             key = digest('record', payload.get('response_id') or timestamp, usage)
-            self._add(key, fresh_counts(usage))
+            observed_model = payload.get('model') or payload.get('model_name')
+            self._add(key, fresh_counts(usage), label(observed_model, 180) if isinstance(observed_model, str) else None)
             self._pending_record = (key, usage)
             return
         info = payload.get('info')
@@ -198,8 +211,14 @@ class TaskDetails:
             elif last[:4] == pending_usage[:4]:
                 removed = self._entries.pop(pending_key, None)
                 if removed:
-                    self._counts = [max(0, self._counts[i] - removed[i]) for i in range(4)]
+                    removed_model, removed_counts = removed
+                    self._counts = [max(0, self._counts[i] - removed_counts[i]) for i in range(4)]
                     self._request_count = max(0, self._request_count - 1)
+                    group = self._usage_by_model[removed_model]
+                    group['counts'] = [max(0, group['counts'][i] - removed_counts[i]) for i in range(4)]
+                    group['requests'] -= 1
+                    if not group['requests']:
+                        del self._usage_by_model[removed_model]
             elif not any(last[:4]):
                 suppress_delta = True
         if repeated:
@@ -274,6 +293,11 @@ class TaskDetails:
                 'cache_read_tokens': self._counts[2] if self._saw_usage else None,
                 'cache_creation_tokens': self._counts[3] if self._saw_usage else None,
                 'tokens_status': ('complete' if self._known_start and not self._partial_usage else 'partial') if self._saw_usage else 'unknown',
+                'usage_by_model': [dict(model=model, requests=group['requests'],
+                                        input_tokens=group['counts'][0], output_tokens=group['counts'][1],
+                                        cache_read_tokens=group['counts'][2], cache_creation_tokens=group['counts'][3],
+                                        total_tokens=sum(group['counts']))
+                                   for model, group in sorted(self._usage_by_model.items())],
                 'last_message': last.get('text', ''), 'last_message_at': last.get('created_at'),
                 'last_role': last.get('role', ''), 'messages': list(self.messages),
                 'content_available': bool(self.messages), 'content_truncated': self.content_truncated}
