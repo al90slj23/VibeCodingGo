@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
@@ -132,6 +133,59 @@ class MoneyTests(unittest.TestCase):
         self.assertEqual(value['sources'][0]['unpriced_requests'],3)
         self.assertEqual(value['logs'][0]['priced_requests'],1)
         self.assertIsNone(value['logs'][1]['cost_usd'])
+
+    def test_decoration_row_memo_matches_uncached_ordered_folds_across_buckets_and_scopes(self):
+        self.cache()
+        snapshot = self.settings()
+        known = self.row(requests=2)
+        other = self.row('unknown', requests=3)
+        groups = [known, other, dict(known, input_tokens=12345678901234567890)]
+        template = dict(summary={}, logs=[dict(known)], models=[{'model':'model-a'}, {'model':'unknown'}],
+                        sources=[{'source':'codex_session','app':'codex'}],
+                        providers=[{'provider_key':'codex|p'}], heatmap_summary={})
+        providers = [dict(group, provider_key='codex|p') for group in groups]
+        def run(uncached=False):
+            result = deepcopy(template)
+            buckets = [(dict(), groups), (dict(), list(reversed(groups))), (dict(), groups)]
+            with patch.object(money, 'settings', side_effect=lambda *args: deepcopy(snapshot)):
+                if uncached:
+                    with patch.object(money, '_DecimalPriceMemo', side_effect=lambda prices: money.price_decimal):
+                        return money.decorate(self.home, result, groups, self.cc, self.now,
+                            provider_groups=providers, series_groups=buckets, heatmap_groups=groups), buckets
+                return money.decorate(self.home, result, groups, self.cc, self.now,
+                    provider_groups=providers, series_groups=buckets, heatmap_groups=groups), buckets
+        expected = run(uncached=True)
+        with patch.object(money, 'price_decimal', wraps=money.price_decimal) as price:
+            actual = run()
+            self.assertEqual(actual, expected)
+            self.assertEqual(price.call_count, 3)
+        snapshot['pricing'][0].update(input=4, source='replacement', source_name='Replacement price')
+        snapshot['fx']['rate'] = 8
+        changed = run()
+        self.assertEqual(changed, run(uncached=True))
+        self.assertNotEqual(changed[0]['summary']['cost_usd'], actual[0]['summary']['cost_usd'])
+        self.assertEqual(changed[0]['logs'][0]['price_source_name'], 'Replacement price')
+        self.assertEqual(changed[0]['summary']['price_sources'], ['replacement'])
+
+    def test_decoration_memo_preserves_raw_validation_types_and_has_a_finite_scope(self):
+        prices, _ = money.catalog(self.home, self.cc)
+        base = self.row(); base.update(input_tokens=1,output_tokens=0,cache_read_tokens=0,cache_creation_tokens=0)
+        memo = money._DecimalPriceMemo(prices)
+        self.assertEqual(memo(base, prices), money.price_decimal(base, prices))
+        self.assertIsNone(memo(dict(base, input_tokens=True), prices))
+        self.assertIsNone(memo(dict(base, input_tokens='1'), prices))
+        self.assertEqual(memo(dict(base, input_tokens=1.0), prices), money.price_decimal(base, prices))
+        self.assertEqual(len(memo.rows), 4)
+        with patch.object(money, 'MAX_DECORATION_COST_ROWS', 2), \
+                patch.object(money, 'price_decimal', wraps=money.price_decimal) as price:
+            bounded = money._DecimalPriceMemo(prices)
+            for amount in [1, 2, 3, 1, 3]:
+                row = dict(base, input_tokens=amount)
+                self.assertEqual(bounded(row, prices), Decimal(amount) * Decimal(2) / Decimal(1000000))
+            self.assertEqual(len(bounded.rows), 2)
+            self.assertEqual(price.call_count, 4)
+        changed_prices = {'model-a': dict(prices['model-a'], input=8)}
+        self.assertEqual(memo(base, changed_prices), money.price_decimal(base, changed_prices))
 
     def test_missing_fx_keeps_usd_and_unknown_does_not_become_free(self):
         result={'summary':{},'logs':[],'models':[],'sources':[]}

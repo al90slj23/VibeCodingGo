@@ -295,6 +295,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var shortcutMenu: NSMenu?
     private var shortcutMenuDirty = true
     private let watcherSnapshots = CueJSONSnapshotReader()
+    private let watcherProjection = CueWatcherProjectionReader()
+    private let watcherFixtureProjection = CueWatcherProjectionBuilder()
     private let eventInbox = CueEventInboxReader()
     private let diagnosticQueue = DispatchQueue(label: "local.vibecue.diagnostics", qos: .utility)
     private var diagnosticWrite: DispatchWorkItem?
@@ -928,91 +930,60 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         if ownsLock {
             watcherSnapshots.read(path, limit: 2_097_152) { [weak self] state in
                 guard let self, !self.shuttingDown else { return }
-                self.applyWatcherHealth(state)
+                self.watcherProjection.project(state, home: self.home) { [weak self] prepared in
+                    guard let self, !self.shuttingDown else { return }
+                    self.applyWatcherHealth(prepared)
+                }
             }
         } else {
             let data = try? Data(contentsOf: path)
-            applyWatcherHealth(data.flatMap { $0.count <= 2_097_152 ? (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] : nil } ?? [:])
+            let state = data.flatMap { $0.count <= 2_097_152 ? (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] : nil } ?? [:]
+            applyWatcherHealth(watcherFixtureProjection.prepare(state, home: home))
         }
     }
-    private func applyWatcherHealth(_ loadedState: [String: Any]) {
+    private func applyWatcherHealth(_ prepared: CueWatcherPreparedSnapshot) {
+        // A long main-loop pause must not make a prepared live snapshot fresh.
+        // Reproject with the current clock before committing its derived state.
+        let commitTime = Date()
+        guard CueWatcherProjectionBuilder.isLive(prepared.state, now: commitTime) == prepared.live,
+              CueWatcherProjectionBuilder.temporalState(details: prepared.details, sideChats: prepared.sideChats, now: commitTime) == prepared.temporalState else { updateWatcherHealth(); return }
+        let commitBegan = ProcessInfo.processInfo.systemUptime
+        defer { watcherProjection.recordMainCommit(started: commitBegan) }
+        let state = prepared.state
         var message = "监控进程未连接"
         let previousManual = manualApprovalConnected
         let previousConnection = codexConnectionState + codexConnectionSummary
-        var nextRunningTasks: [CueRunningTask] = []
-        var nextInterruptedTasks: [CueRunningTask] = []
-        var nextTaskDetails: [String: CueTaskDetail] = [:]
-        var nextSideChats: [String: [CueSideChat]] = [:]
-        var nextRunningSnapshot = Data()
         manualApprovalConnected = false
         codexConnectionState = "reconnecting"
         codexConnectionSummary = "Codex 连接恢复中，后台会自动重试。"
         manualApprovalStatus = approvalLauncher?.isRunning == true ? "等待 Codex 退出后接通" : "人工批准监听未连接"
-        if let launchData = try? Data(contentsOf: home.appendingPathComponent("bridge-launch-state.json")), launchData.count < 65_536,
-           let launch = try? JSONSerialization.jsonObject(with: launchData) as? [String: Any] {
-            switch launch["status"] as? String {
-            case "waiting_for_codex_exit" where approvalLauncher?.isRunning == true: manualApprovalStatus = "等待你退出 Codex 后接通"
-            case "launching" where approvalLauncher?.isRunning == true: manualApprovalStatus = "正在重新打开 Codex"
-            case "launched": manualApprovalStatus = "Codex 已启动，等待人工批准监听连接"
-            case "cancelled": manualApprovalStatus = "监听接通已取消，可以重新连接"
-            case "error": manualApprovalStatus = "监听尚未接通：" + String((launch["message"] as? String ?? "请查看诊断日志").prefix(220))
-            default: break
-            }
+        let launch = prepared.launchState
+        switch launch["status"] as? String {
+        case "waiting_for_codex_exit" where approvalLauncher?.isRunning == true: manualApprovalStatus = "等待你退出 Codex 后接通"
+        case "launching" where approvalLauncher?.isRunning == true: manualApprovalStatus = "正在重新打开 Codex"
+        case "launched": manualApprovalStatus = "Codex 已启动，等待人工批准监听连接"
+        case "cancelled": manualApprovalStatus = "监听接通已取消，可以重新连接"
+        case "error": manualApprovalStatus = "监听尚未接通：" + String((launch["message"] as? String ?? "请查看诊断日志").prefix(220))
+        default: break
         }
-        var state = loadedState
-        var live = false
-        if
-           state["running"] as? Bool == true,
-           let heartbeat = state["heartbeat"] as? Double,
-           (0...15).contains(Date().timeIntervalSince1970 - heartbeat) {
-            live = true
+        if prepared.live {
             let connection = CueCodexConnection(watcher: state)
             codexConnectionState = connection.state; codexConnectionSummary = connection.summary
             manualApprovalConnected = connection.attentionConnected
             manualApprovalStatus = connection.attentionConnected ? "Codex 批准监听已自动连接" : connection.summary
             let count = state["watched_threads"] as? Int ?? 0
-            let taskRows = state["running_tasks"] as? [[String: Any]] ?? []
-            var detailRows = state["task_details"] as? [String: [String: Any]] ?? [:]
-            let selectedSettings = state["current_model_settings"] as? [String: [String: Any]] ?? [:]
-            for (id, settings) in selectedSettings.prefix(256) where CueThreadFollowups.valid(id) {
-                var detail = detailRows[id] ?? ["thread_id": id, "status": "unknown"]
-                detail["current_settings"] = settings
-                detailRows[id] = detail
-            }
-            state["task_details"] = detailRows
-            nextTaskDetails = detailRows.mapValues { CueTaskDetail(raw: $0) }
-            nextRunningTasks = taskRows.compactMap { CueRunningTask(raw: $0) }
-            nextRunningSnapshot = (try? JSONSerialization.data(withJSONObject: ["tasks": taskRows, "details": detailRows], options: [.sortedKeys])) ?? Data()
             let errors = state["read_error_count"] as? Int ?? 0
             if errors > 0 {
                 let cursors = state["cursors"] as? [String: [String: Any]] ?? [:]
                 let denied = cursors.values.contains { ($0["read_error"] as? String ?? "").contains("PermissionError") }
                 message = denied ? "需要授权读取记录 · \(errors) 个文件无法读取" : "部分记录暂时无法读取 · \(errors) 个文件"
-            } else if count == 0 {
-                message = "尚未找到可监控的本机对话"
-            } else {
-                message = "本机监控中 · \(count) 个对话"
-            }
+            } else if count == 0 { message = "尚未找到可监控的本机对话" }
+            else { message = "本机监控中 · \(count) 个对话" }
         }
-        if !live, let rows = state["task_details"] as? [String: [String: Any]] {
-            state["task_details"] = rows.mapValues { row in
-                var value = row
-                value["current_settings"] = ["status": "unavailable", "source": "codex_desktop", "reason": "本机监控连接暂不可用"]
-                return value
-            }
-        }
-        var sideChatState = state["side_chats"] as? [String: Any] ?? [:]
-        if !live { sideChatState["state"] = "disconnected" }
-        nextSideChats = CueSideChat.grouped(raw: sideChatState)
-        if let data = try? JSONSerialization.data(withJSONObject: sideChatState, options: [.sortedKeys]) { nextRunningSnapshot.append(data) }
-        let recovery = CueTaskRecoverySnapshot.read(home: home, state: state, live: live)
         if let recoveryError = state["task_recovery_error"] as? String, !recoveryError.isEmpty { message += " · 中断记录保存异常" }
-        nextInterruptedTasks = recovery.tasks.filter { task in !nextRunningTasks.contains { $0.threadID == task.threadID } }
-        for task in nextInterruptedTasks { if let detail = recovery.details[task.threadID] { nextTaskDetails[task.threadID] = detail } }
-        let recoveryRows = nextInterruptedTasks.map { ["thread_id": $0.threadID, "title": $0.title, "status": $0.recoveryStatus, "reason": $0.recoveryReason, "interrupted_at": $0.interruptedAt?.timeIntervalSince1970 ?? 0, "last_activity": $0.updatedDate.timeIntervalSince1970] as [String: Any] }
-        if let recoveryData = try? JSONSerialization.data(withJSONObject: recoveryRows, options: [.sortedKeys]) { nextRunningSnapshot.append(recoveryData) }
-        let runningChanged = runningTaskSnapshot != nextRunningSnapshot
-        runningTasks = nextRunningTasks; interruptedTasks = nextInterruptedTasks; taskDetails = nextTaskDetails; sideChats = nextSideChats; runningTaskSnapshot = nextRunningSnapshot
+        let runningChanged = runningTaskSnapshot != prepared.signature
+        runningTasks = prepared.running; interruptedTasks = prepared.interrupted
+        taskDetails = prepared.details; sideChats = prepared.sideChats; runningTaskSnapshot = prepared.signature
         if watcherHealthText != message || runningChanged || previousConnection != codexConnectionState + codexConnectionSummary {
             watcherHealthText = message
             if statusItem != nil { refreshMenu() }
@@ -1547,7 +1518,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
             "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
             "codex_connection_state": codexConnectionState, "codex_connection_summary": codexConnectionSummary,
-            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
+            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
         let destination = home.appendingPathComponent("app-status.json")
         let write = {
@@ -2479,12 +2450,14 @@ if let index = CommandLine.arguments.firstIndex(of: "--ccswitch-system-action"),
 if CommandLine.arguments.contains("--ui-performance-measure") {
     _ = NSApplication.shared
     var checks = CueActivityScheduler.validationReport()
+    checks.merge(CueCollectorScheduler.validationReport()) { _, new in new }
+    checks.merge(CueWatcherProjectionReader.validationReport()) { _, new in new }
     checks.merge(CueWorkPipelineChecks.validationReport()) { _, new in new }
     let measurement = CueStatusPopoverController.performanceMeasurement()
     checks["unchanged_list_does_not_rebuild"] = measurement["diff_rebuilds"] as? Int == 0
     checks["unchanged_list_does_not_rerender_rows"] = measurement["diff_row_refreshes"] as? Int == 0
     checks["unchanged_list_retains_document"] = measurement["document_retained"] as? Bool == true
-    let result: [String: Any] = ["checks": checks, "measurement": measurement]
+    let result: [String: Any] = ["checks": checks, "measurement": measurement, "watcher_measurement": CueWatcherProjectionReader.performanceMeasurement()]
     print(String(data: try! JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]), encoding: .utf8)!)
     exit(checks.values.allSatisfy { $0 } ? 0 : 1)
 }
@@ -2497,6 +2470,8 @@ if CommandLine.arguments.contains("--recent-self-test") {
     let cue = CueController(); cue.presentsWindows = false; cue.settings.enabled = false
     var results = CueRecentHistory.validationReport()
     results.merge(CueActivityScheduler.validationReport()) { _, new in new }
+    results.merge(CueCollectorScheduler.validationReport()) { _, new in new }
+    results.merge(CueWatcherProjectionReader.validationReport()) { _, new in new }
     results.merge(CueWorkspacePage.validationReport()) { _, new in new }
     results.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
     results.merge(CueNetworkTestsController.validationReport()) { _, new in new }

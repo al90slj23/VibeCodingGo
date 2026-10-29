@@ -18,10 +18,14 @@ struct CueBatchTarget {
 /// Uses only VibeCoding Go's private control module, never sends a chat message.
 final class CueCodexControlClient {
     let home: URL
+    private let collectorOwner = UUID()
     init(home: URL) { self.home = home }
     func run(_ command: String, input: [String: Any]? = nil, completion: @escaping (Result<[String: Any], Error>) -> Void) {
         let home = home
-        DispatchQueue.global(qos: .utility).async {
+        CueCollectorScheduler.shared.submit(owner: collectorOwner, lane: CueCollectorScheduler.lane(module: "vibecue.codex_control", arguments: [command]), discard: { _ in
+            DispatchQueue.main.async { completion(.failure(Self.error("控制请求仍未执行，请稍后再试。"))) }
+        }) { finished in
+            defer { finished() }
             do {
                 let runtime = home.appendingPathComponent("runtime")
                 guard FileManager.default.fileExists(atPath: runtime.appendingPathComponent("vibecue/codex_control.py").path) else {
@@ -46,9 +50,15 @@ final class CueCodexControlClient {
                 try? stdin.fileHandleForWriting.close()
                 let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 120, execute: timeout)
-                let data = output.fileHandleForReading.readDataToEndOfFile()
+                var data = Data(), exceeded = false
+                while true {
+                    let chunk = output.fileHandleForReading.readData(ofLength: 65_536)
+                    if chunk.isEmpty { break }
+                    if data.count + chunk.count <= 2_097_152 { data.append(chunk) }
+                    else { exceeded = true; if process.isRunning { process.terminate() } }
+                }
                 process.waitUntilExit(); timeout.cancel()
-                guard data.count <= 2_097_152,
+                guard !exceeded,
                       let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     throw Self.error("控制通道未返回有效结果；没有确认的项目不会标为成功。")
                 }

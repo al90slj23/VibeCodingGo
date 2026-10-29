@@ -11,8 +11,8 @@ root = Path(__file__).resolve().parents[1]
 app = root / 'build/VibeCoding Go.app'
 info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 version = tuple(int(value) for value in info['CFBundleShortVersionString'].split('.'))
-if info.get('CFBundleIdentifier') != 'local.vibecue' or version < (0, 28, 2):
-    raise SystemExit('Build VibeCoding Go 0.28.2 or newer before running this check.')
+if info.get('CFBundleIdentifier') != 'local.vibecue' or version < (0, 29, 0):
+    raise SystemExit('Build VibeCoding Go 0.29.0 or newer before running this check.')
 with tempfile.TemporaryDirectory(prefix='vcgo-ui-contract-') as home:
     env = os.environ.copy()
     env['VIBECUE_HOME'] = home
@@ -22,5 +22,8 @@ with tempfile.TemporaryDirectory(prefix='vcgo-ui-contract-') as home:
     output = root / 'build/vcgo-ui-performance.json'
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
     failed = [key for key, value in result['checks'].items() if value is not True]
-    print(json.dumps({'failed': failed, 'measurement': result['measurement'], 'report': str(output)}, ensure_ascii=False))
+    watcher = result.get('watcher_measurement', {})
+    if watcher.get('exact_output_checksum_equal') is not True:
+        failed.append('watcher_measurement_exact_output_checksum')
+    print(json.dumps({'failed': failed, 'measurement': result['measurement'], 'watcher_measurement': watcher, 'report': str(output)}, ensure_ascii=False))
     raise SystemExit(run.returncode or bool(failed))

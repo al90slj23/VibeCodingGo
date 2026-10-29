@@ -27,3 +27,15 @@ Existing native checks additionally verify dirty-row-only updates, hidden-page z
 `app-status.json` contains `performance.scheduler`, task-list counters, conversation read/layout/flush counters and title-cache metrics. Scheduler callbacks over 16 ms are counted for investigation. These diagnostics coalesce on the main thread and serialize/write on a utility queue; they are not a new full-history scan. Raw timings and CPU/RSS samples remain in local `build/` evidence.
 
 This contract is a scoped application architecture, not a system-wide process manager. It does not stop other projects, change macOS settings or attribute unrelated machine-level stalls to this app.
+
+## Exact projections and resource admission (0.29.0)
+
+`CueCollectorScheduler` owns finite Python collector admission across controller instances. Numeric/history reads, small status probes, user input, long synchronization, network refreshes and batch control have separate finite lanes. A history query or sync cannot consume the reserved message/status slots. Closing an owner cancels its queued reads; active processes keep their existing receipt and cancellation rules. Saturation fails before execution, never fabricates a successful result. New collectors must declare their resource lane and bounded output. Admission does not cache results or merge/replay writes.
+
+`CueWatcherProjectionReader` performs bounded, single-flight/latest-only native projections on a utility queue. Long conversation tails have their own exact JSON identity; changing token totals or model verification times does not repeat Unicode cleaning. Only a prepared immutable snapshot is committed on the main thread. Heartbeat, model and side-chat expiry are checked again at commit. Formatting instances are thread-local; values and rounding rules stay unchanged.
+
+The usage ledger remains the source of truth. Disposable numeric SQL projections belong to its persistent identity and transactional mutation generation. INSERT, UPDATE and DELETE on request, provider/detail and archived-daily truth invalidate them. Reads obtain the generation and consuming page in one WAL snapshot. Schema/trigger changes retire the identity; corrupt, shared, absent or oversized cache state falls back to SQL. Cache writes use separate private files, not a write upgrade of the read transaction.
+
+Only the timestamp upper bound may reuse a data-safe watermark from both request and archived records. Rolling lower bounds remain literal. Calendar range, prices, exchange rates, freshness flags and visible request pages still use current inputs. Task cost memoization retains original Decimal arithmetic and group order; it caches the pure numeric fold, not a current/partial/stale judgement. Cache size and parse work are bounded.
+
+Do not add an age-only cache for authoritative totals or settings. A future module must identify its truth epoch, input scope, exact invalidation events and time boundaries, and compare new/corrected/deleted data against the uncached reference. A fast stale result is not an accepted optimization.

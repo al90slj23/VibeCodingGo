@@ -6,18 +6,24 @@ import Foundation
 final class CueUsageClient {
     let home: URL
     private let lock = NSLock()
+    private let collectorOwner = UUID()
     private var active: [UUID: Process] = [:]
     private var stopped = false
     init(home: URL) { self.home = home }
 
     func stop() {
         lock.lock(); stopped = true; let processes = Array(active.values); lock.unlock()
+        CueCollectorScheduler.shared.cancel(owner: collectorOwner)
         for process in processes where process.isRunning { process.terminate() }
     }
 
     func run(_ arguments: [String], module: String = "vibecue.usage", input: Data? = nil, completion: @escaping (Result<[String: Any], Error>) -> Void) {
         let home = self.home
-        DispatchQueue.global(qos: .utility).async {
+        CueCollectorScheduler.shared.submit(owner: collectorOwner, lane: CueCollectorScheduler.lane(module: module, arguments: arguments), discard: { reason in
+            let message = reason == .cancelled ? "此窗口的排队查询已取消。" : "后台查询正在排队，请稍后再试；当前请求尚未执行。"
+            DispatchQueue.main.async { completion(.failure(Self.error(message))) }
+        }) { finished in
+            defer { finished() }
             let id = UUID()
             defer { self.lock.lock(); self.active.removeValue(forKey: id); self.lock.unlock() }
             do {

@@ -30,6 +30,8 @@
 
 0.28.3 将 Codex 桌面的构建号白名单改为逐接口契约检查；兼容的客户端更新自动复用连接，真正变化的接口按功能退化并保留自动复查。见[桌面更新兼容机制](docs/codex-desktop-compatibility.md)。
 
+0.29.0 增加事务版本化的精确聚合复用、后台 watcher 投影及共享采集准入；价格、汇率、到期状态与更正／删除保持精确失效。测量和证据边界见[精确性能优化](docs/performance-exact-2026-10-30.md)。
+
 ## 项目名称与兼容升级
 
 0.26.0 起，项目由 VibeCue 更名为 **VibeCoding Go**，简称 **VCGo**；源码与仓库名称为 `VibeCodingGo`。应用为 `/Applications/VibeCoding Go.app`，可执行程序为 `VCGo`，常用命令入口为 `./scripts/vcgo`。

@@ -18,13 +18,14 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
 import uuid
 
 from .events import vibecue_directory, codex_directory
-from . import usage_opencode, usage_ccswitch
+from . import usage_opencode, usage_ccswitch, usage_query_cache
 
 SCHEMA_VERSION = 1
 CODEX_IMPORT_VERSION = 4
@@ -138,7 +139,8 @@ def connect(home):
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = home / 'usage.sqlite3'
     conn = sqlite3.connect(path, timeout=15)
-    os.chmod(path, 0o600)
+    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+        os.chmod(path, 0o600)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA busy_timeout=15000')
@@ -186,6 +188,7 @@ def connect(home):
     conn.execute("""CREATE INDEX IF NOT EXISTS usage_details_real_provider
       ON usage_request_details(provider_id,request_id)
       WHERE provider_id IS NOT NULL AND provider_id<>'' AND substr(provider_id,1,1)<>'_'""")
+    usage_query_cache.ensure_schema(conn)
     conn.commit()
     return conn
 
@@ -962,14 +965,14 @@ def _where(clauses):
     return ' WHERE ' + ' AND '.join(clauses) if clauses else ''
 
 
-def _provider_groups(conn, price_groups, clauses, params, sums):
+def _provider_groups(conn, price_groups, clauses, params, sums, cache=None):
     # Fold ordinary app/source/model aggregates, then move only rows carrying a
     # real provider ID out of their source fallback. No full-ledger LEFT JOIN.
     residual = {(r['app'], r['source'], r['model']): dict(r) for r in price_groups}
-    actual = [dict(row) for row in conn.execute(
-        'SELECT r.app,r.source,r.model,d.provider_id,MAX(d.provider_name) AS provider_name,COUNT(*) AS requests,' + sums +
-        ' FROM usage_request_details d INDEXED BY usage_details_real_provider JOIN usage_requests r ON r.id=d.request_id' +
-        _where([REAL_PROVIDER] + clauses) + ' GROUP BY r.app,r.source,r.model,d.provider_id', params)]
+    sql = ('SELECT r.app,r.source,r.model,d.provider_id,MAX(d.provider_name) AS provider_name,COUNT(*) AS requests,' + sums +
+           ' FROM usage_request_details d INDEXED BY usage_details_real_provider JOIN usage_requests r ON r.id=d.request_id' +
+           _where([REAL_PROVIDER] + clauses) + ' GROUP BY r.app,r.source,r.model,d.provider_id')
+    actual = cache.rows(sql, params, upper_bounds=(-1,)) if cache else [dict(row) for row in conn.execute(sql, params)]
     groups = []
     for row in actual:
         remaining = residual[(row['app'], row['source'], row['model'])]
@@ -998,7 +1001,7 @@ def _fold_groups(rows, columns):
     return sorted(folded.values(), key=lambda row: (-row['total_tokens'],) + tuple(str(row[column]) for column in columns))
 
 
-def _archived_groups(conn, app, model, source, provider, status, now):
+def _archived_groups(conn, app, model, source, provider, status, now, cache=None):
     # These are known daily residual totals, never fabricated request rows.
     if status not in ('all', 'unknown', None, ''):
         return []
@@ -1007,7 +1010,9 @@ def _archived_groups(conn, app, model, source, provider, status, now):
         if value and value != 'all':
             clauses.append('r.' + field + '=?'); params.append(value)
     rows = []
-    for raw in conn.execute('SELECT r.* FROM usage_archived_daily r' + _where(clauses), params):
+    sql = 'SELECT r.* FROM usage_archived_daily r' + _where(clauses)
+    raw_rows = cache.rows(sql, params, upper_bounds=(0,)) if cache else conn.execute(sql, params)
+    for raw in raw_rows:
         row = dict(raw, requests=raw['request_count'])
         real = row.get('provider_id') and not row['provider_id'].startswith('_')
         row['provider_key'] = row['app'] + '|' + (row['provider_id'] if real else 'source:' + row['source'])
@@ -1048,13 +1053,14 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
         # Keep aggregates, provider subtraction and the visible page on one WAL
         # snapshot while an incremental importer may commit in parallel.
         conn.execute('BEGIN')
+        cache = usage_query_cache.ExactQueryCache(conn, home, now)
         table = 'usage_requests r NOT INDEXED' if start is None and not base_clauses else 'usage_requests r'
-        price_groups = [dict(row) for row in conn.execute(
+        price_groups = cache.rows(
             'SELECT r.app,r.source,r.model,COUNT(*) AS requests,' + sums +
-            ' FROM ' + table + where + ' GROUP BY r.app,r.source,r.model', params)]
-        provider_groups = _provider_groups(conn, price_groups, clauses, params, sums)
+            ' FROM ' + table + where + ' GROUP BY r.app,r.source,r.model', params, upper_bounds=(-1,))
+        provider_groups = _provider_groups(conn, price_groups, clauses, params, sums, cache)
         log_count = sum(row['requests'] for row in price_groups)
-        archived = _archived_groups(conn, app, model, source, provider, status, now)
+        archived = _archived_groups(conn, app, model, source, provider, status, now, cache)
         selected_archived = [row for row in archived if (start is None or row['timestamp'] >= start) and
                              (exclusive is None or row['timestamp'] < exclusive)]
         price_groups += selected_archived
@@ -1086,15 +1092,15 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
         full_daily = start is None or datetime.fromtimestamp(start).date() < heat_start
         heat_clauses = base_clauses + ([] if full_daily else ['r.date>=?']) + ['r.timestamp<=?']
         heat_params = base_params + ([] if full_daily else [heat_start.isoformat()]) + [now]
-        daily_groups = [dict(row) for row in conn.execute(
+        daily_groups = cache.rows(
             'SELECT r.date,r.app,r.source,r.model,COUNT(*) AS requests,' + sums +
             ' FROM usage_requests r NOT INDEXED' + _where(heat_clauses) +
-            ' GROUP BY r.date,r.app,r.source,r.model', heat_params)]
+            ' GROUP BY r.date,r.app,r.source,r.model', heat_params, upper_bounds=(-1,))
         heat_archived = [row for row in archived if row['date'] >= heat_start.isoformat()]
         daily_groups += archived if full_daily else heat_archived
         heat_groups = [row for row in daily_groups if row['date'] >= heat_start.isoformat()]
-        first = conn.execute('SELECT MIN(r.date) FROM usage_requests r' +
-                             _where(base_clauses + ['r.timestamp<=?']), base_params + [now]).fetchone()[0]
+        first = cache.rows('SELECT MIN(r.date) AS first_date FROM usage_requests r' +
+                           _where(base_clauses + ['r.timestamp<=?']), base_params + [now], upper_bounds=(-1,))[0]['first_date']
         if archived:
             first = min([row['date'] for row in archived] + ([first] if first else []))
         selected_start = datetime.fromtimestamp(start).date().isoformat() if start is not None else first or today.isoformat()
@@ -1146,21 +1152,21 @@ def query(home=None, period='all', app='all', model='all', source='all', page=1,
             trend.append(point); trend_price_groups.append((point, rows))
         sources = dict(SOURCES)
         fallback_providers = {}
-        for source_row in conn.execute('SELECT DISTINCT app,source FROM usage_requests ORDER BY app,source'):
+        for source_row in cache.rows('SELECT DISTINCT app,source FROM usage_requests ORDER BY app,source'):
             source_id = source_row['source']
             sources.setdefault(source_id, 'OpenCode · ' + source_id[len('opencode_provider:'):] if source_id.startswith('opencode_provider:') else source_id)
             key = source_row['app'] + '|source:' + source_id
             fallback_providers[key] = {'id': key, 'name': APPS.get(source_row['app'], source_row['app']) + ' · ' + ('会话日志' if source_id.endswith('_session') else '未记录')}
-        for row in conn.execute('SELECT r.app,d.provider_id,MAX(d.provider_name) AS name FROM usage_request_details d INDEXED BY usage_details_real_provider JOIN usage_requests r ON r.id=d.request_id WHERE ' + REAL_PROVIDER + ' GROUP BY r.app,d.provider_id'):
+        for row in cache.rows('SELECT r.app,d.provider_id,MAX(d.provider_name) AS name FROM usage_request_details d INDEXED BY usage_details_real_provider JOIN usage_requests r ON r.id=d.request_id WHERE ' + REAL_PROVIDER + ' GROUP BY r.app,d.provider_id'):
             key = row['app'] + '|' + row['provider_id']
             fallback_providers[key] = {'id': key, 'name': row['name'] or row['provider_id']}
-        for row in conn.execute('SELECT DISTINCT app,source,model,provider_id,provider_name FROM usage_archived_daily'):
+        for row in cache.rows('SELECT DISTINCT app,source,model,provider_id,provider_name FROM usage_archived_daily'):
             sources.setdefault(row['source'], row['source'])
             real = row['provider_id'] and not row['provider_id'].startswith('_')
             key = row['app'] + '|' + (row['provider_id'] if real else 'source:' + row['source'])
             fallback_providers[key] = {'id': key, 'name': row['provider_name'] or row['provider_id'] or '未记录'}
         filters = {'apps': [{'id': key, 'name': value} for key, value in APPS.items()],
-                   'models': [{'id': r[0], 'name': r[0]} for r in conn.execute('SELECT model FROM usage_requests UNION SELECT model FROM usage_archived_daily ORDER BY model')],
+                   'models': [{'id': r['model'], 'name': r['model']} for r in cache.rows('SELECT model FROM usage_requests UNION SELECT model FROM usage_archived_daily ORDER BY model')],
                    'sources': [{'id': key, 'name': value} for key, value in sources.items()],
                    'providers': sorted(fallback_providers.values(), key=lambda row: (row['name'], row['id']))}
         metadata = get_meta(conn, 'sync', {'running': False, 'last_synced_at': None, 'errors': [], 'warnings': [], 'coverage': []})

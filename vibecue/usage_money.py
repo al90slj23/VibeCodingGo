@@ -28,6 +28,8 @@ RATE_URL = 'https://api.frankfurter.dev/v2/rate/usd/cny'
 RATE_SOURCE = 'Frankfurter · USD/CNY 每日参考汇率'
 RATE_TTL = 6 * 60 * 60
 FAILURE_TTL = 15 * 60
+MAX_DECORATION_COST_ROWS = 8192
+_MISSING_ROW_COST = object()
 MAX_JSON = 64 * 1024
 MAX_SETTINGS = 1024 * 1024
 RATE_KEYS = ('input', 'output', 'cache_read', 'cache_creation')
@@ -324,7 +326,48 @@ def price_decimal(row, prices):
         return cost / Decimal(1_000_000)
 
 
+class _DecimalPriceMemo:
+    """One decoration's bounded exact row costs, never a global value cache.
+
+    Prices are the decoration's fixed snapshot. Source labels, request counts,
+    FX multiplication and ordered subtotal addition remain outside this memo.
+    A full memo keeps its existing rows instead of thrashing across repeated
+    chronological scans; excess rows use the original exact function.
+    """
+    def __init__(self, prices):
+        self.prices = prices
+        self.rows = {}
+
+    def __call__(self, row, prices):
+        if prices is not self.prices:
+            return price_decimal(row, prices)
+        model = row.get('model')
+        incoming, output = row.get('input_tokens', 0), row.get('output_tokens', 0)
+        read, creation = row.get('cache_read_tokens', 0), row.get('cache_creation_tokens', 0)
+        if type(model) is str and type(incoming) is int and type(output) is int and type(read) is int and type(creation) is int:
+            # SQL's exact str/int projection is the common path. Its shape
+            # explicitly identifies the types without allocating five pairs.
+            key = (str, model, incoming, output, read, creation)
+        else:
+            values = model, incoming, output, read, creation
+            if any(type(value) not in (str, int, float, bool, type(None)) for value in values):
+                return price_decimal(row, prices)
+            # bool == 1 and 1.0 == 1 cannot share a validation result.
+            key = tuple((type(value), value) for value in values)
+        cached = self.rows.get(key, _MISSING_ROW_COST)
+        if cached is not _MISSING_ROW_COST:
+            return cached
+        cost = price_decimal(row, prices)
+        if len(self.rows) < MAX_DECORATION_COST_ROWS:
+            self.rows[key] = cost
+        return cost
+
+
 def folded_cost(rows, prices, rate):
+    return _folded_cost(rows, prices, rate, price_decimal)
+
+
+def _folded_cost(rows, prices, rate, row_cost):
     total, priced, unpriced = Decimal(0), 0, 0
     price_sources = set()
     with localcontext() as ctx:
@@ -333,7 +376,7 @@ def folded_cost(rows, prices, rate):
             requests = row.get('requests', 1)
             if isinstance(requests, bool) or not isinstance(requests, int) or requests < 0:
                 requests = 1
-            cost = price_decimal(row, prices)
+            cost = row_cost(row, prices)
             if cost is None:
                 unpriced += requests
             else:
@@ -358,10 +401,13 @@ def decorate(home, result, aggregate_groups, cc_path=None, now=None, *, provider
     snapshot = settings(home, cc_path, now)
     prices = {row['model']: row for row in snapshot.pop('pricing')}
     rate = snapshot['fx']['rate']
+    row_cost = _DecimalPriceMemo(prices)
+    def fold(rows):
+        return _folded_cost(rows, prices, rate, row_cost)
     result['money'] = snapshot
-    result['summary'].update(folded_cost(aggregate_groups, prices, rate))
+    result['summary'].update(fold(aggregate_groups))
     for row in result.get('logs', []):
-        row.update(folded_cost([dict(row, requests=1)], prices, rate))
+        row.update(fold([dict(row, requests=1)]))
         selected = prices.get(row.get('model'))
         row['price_source_name'] = selected.get('source_name', selected.get('source')) if selected else None
         for token, component in zip(TOKEN_KEYS, RATE_KEYS):
@@ -373,17 +419,17 @@ def decorate(home, result, aggregate_groups, cc_path=None, now=None, *, provider
                 row[component + '_cost_cny'] = float(usd * Decimal(str(rate))) if usd is not None and rate is not None else (0.0 if usd == 0 else None)
     for row in result.get('models', []):
         groups = [group for group in aggregate_groups if group.get('model') == row.get('model')]
-        row.update(folded_cost(groups, prices, rate))
+        row.update(fold(groups))
     for row in result.get('sources', []):
         groups = [group for group in aggregate_groups if group.get('source') == row.get('source') and group.get('app') == row.get('app')]
-        row.update(folded_cost(groups, prices, rate))
+        row.update(fold(groups))
     for row in result.get('providers', []):
         groups = [group for group in provider_groups if group.get('provider_key') == row.get('provider_key')]
-        row.update(folded_cost(groups, prices, rate))
+        row.update(fold(groups))
     for row, groups in series_groups:
-        row.update(folded_cost(groups, prices, rate))
+        row.update(fold(groups))
     if heatmap_groups is not None:
-        result['heatmap_summary'].update(folded_cost(heatmap_groups, prices, rate))
+        result['heatmap_summary'].update(fold(heatmap_groups))
     return result
 
 

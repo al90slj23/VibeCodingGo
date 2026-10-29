@@ -300,6 +300,20 @@ private final class CuePreferencesSurface: NSView {
 }
 
 enum CueUsageMoney {
+    /// Formatting is presentation-only. Keep the exact NSNumber supplied by the
+    /// backend, while reusing two fixed-format instances per calling thread.
+    private static func amountFormatter(precision: Int) -> NumberFormatter {
+        let key = "local.vibecue.money.amount." + String(precision)
+        if let cached = Thread.current.threadDictionary[key] as? NumberFormatter { return cached }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true; formatter.groupingSeparator = ","; formatter.decimalSeparator = "."
+        formatter.usesSignificantDigits = false; formatter.maximumIntegerDigits = 309
+        formatter.minimumFractionDigits = precision; formatter.maximumFractionDigits = precision
+        formatter.roundingMode = .halfUp
+        Thread.current.threadDictionary[key] = formatter
+        return formatter
+    }
     /// Money always stays in base currency units, including narrow summaries.
     /// `compact` remains in the shared API for callers that compact token counts.
     static func display(_ row: [String: Any], currency: String, compact: Bool = false) -> String {
@@ -309,12 +323,7 @@ enum CueUsageMoney {
             let number = value.doubleValue
             if number > 0 && number < 0.0001 { return prefix + "<0.0001" + suffix }
             let precision = number >= 1 ? 2 : 4
-            let formatter = NumberFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.numberStyle = .decimal
-            formatter.usesGroupingSeparator = true; formatter.groupingSeparator = ","; formatter.decimalSeparator = "."
-            formatter.usesSignificantDigits = false; formatter.maximumIntegerDigits = 309
-            formatter.minimumFractionDigits = precision; formatter.maximumFractionDigits = precision
-            formatter.roundingMode = .halfUp
+            let formatter = amountFormatter(precision: precision)
             guard let formatted = formatter.string(from: value) else { return nil }
             return prefix + formatted + suffix
         }

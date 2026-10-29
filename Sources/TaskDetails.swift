@@ -2,6 +2,21 @@ import AppKit
 import Foundation
 import CoreFoundation
 
+private enum CueTaskTimeLabels {
+    static func string(_ date: Date, format: String, locale: Locale? = nil) -> String {
+        let selected = locale ?? Locale.current
+        let key = "local.vibecue.task-time." + format + "." + (locale == nil ? "current" : "fixed")
+        let formatter: DateFormatter
+        if let existing = Thread.current.threadDictionary[key] as? DateFormatter,
+           existing.locale.identifier == selected.identifier, existing.timeZone.identifier == TimeZone.current.identifier { formatter = existing }
+        else {
+            formatter = DateFormatter(); formatter.locale = selected; formatter.timeZone = TimeZone.current; formatter.dateFormat = format
+            Thread.current.threadDictionary[key] = formatter
+        }
+        return formatter.string(from: date)
+    }
+}
+
 struct CueTaskMessage {
     let role: String
     let text: String
@@ -94,8 +109,7 @@ struct CueTaskUsageSummary {
         }
         if history { lines.append("仅含已成功同步到账本的对话记录；未同步的实时增量尚未计入。") }
         if let updated = updatedAt {
-            let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-            lines.append((history ? "最近账本同步：" : "最近用量记录：") + formatter.string(from: updated))
+            lines.append((history ? "最近账本同步：" : "最近用量记录：") + CueTaskTimeLabels.string(updated, format: "yyyy-MM-dd HH:mm:ss"))
         } else if history { lines.append("最近账本同步：尚未取得") }
         if stale { lines.append("当前为缓存快照，可能尚未反映最新用量。") }
         if !money.isEmpty || costStatus == "unpriced" {
@@ -134,6 +148,42 @@ struct CueTaskUsageSummary {
                 "task_usage_legacy_flat_fields_fallback_to_turn_only": legacy.turnUsage.tokenLine == "500 Tokens" && legacy.turnUsage.costLine == "—" && legacy.historyUsage.tokenLine == "— Tokens" && legacy.turnUsage.tooltip.contains("旧版状态"),
                 "task_usage_explicit_unknown_never_reuses_legacy_total": explicitUnknown.turnUsage.tokenLine == "— Tokens",
                 "task_usage_nested_scopes_remain_separate_from_settings": recorded.turnUsage.tokenLine == "700 Tokens" && recorded.historyUsage.tokenLine == "900 Tokens" && recorded.turnUsage.costLine == "$1.00 USD" && recorded.historyUsage.costLine == "$2.00 USD"]
+    }
+}
+
+/// The bounded conversation tail is immutable while numeric telemetry ticks.
+/// Reuse it independently so model verification timestamps do not re-clean text.
+struct CueTaskDetailContent {
+    let lastMessage: String
+    let lastMessageAt: Date?
+    let lastRole: String
+    let messages: [CueTaskMessage]
+    let contentTruncated: Bool
+    init(raw: [String: Any]) {
+        lastMessage = CueTaskDetail.text(raw["last_message"], limit: 12_000)
+        lastMessageAt = CueTaskDetail.date(raw["last_message_at"])
+        lastRole = CueTaskDetail.label(raw["last_role"], limit: 30)
+        var result: [CueTaskMessage] = []
+        var truncated = raw["content_truncated"] as? Bool == true
+        if (raw["last_message"] as? String ?? "").count > 12_000 { truncated = true }
+        var budget = 12_000
+        let rows = raw["messages"] as? [[String: Any]] ?? []
+        if rows.count > 8 { truncated = true }
+        for row in rows.suffix(8).reversed() {
+            guard let role = row["role"] as? String, ["user", "assistant"].contains(role) else { continue }
+            let value = CueTaskDetail.text(row["text"], limit: 12_000)
+            if (row["text"] as? String ?? "").count > 12_000 { truncated = true }
+            guard !value.isEmpty, budget > 0 else { continue }
+            let kept = String(value.suffix(budget))
+            if kept.count < value.count { truncated = true }
+            budget -= kept.count
+            result.append(CueTaskMessage(role: role, text: kept, date: CueTaskDetail.date(row["created_at"])))
+        }
+        result.reverse()
+        if result.isEmpty, ["user", "assistant"].contains(lastRole), !lastMessage.isEmpty {
+            result = [CueTaskMessage(role: lastRole, text: lastMessage, date: lastMessageAt)]
+        }
+        messages = result; contentTruncated = truncated
     }
 }
 
@@ -180,7 +230,7 @@ struct CueTaskDetail {
     let lastRole: String
     let contentTruncated: Bool
 
-    init(raw: [String: Any]) {
+    init(raw: [String: Any], preparedContent: CueTaskDetailContent? = nil) {
         status = Self.label(raw["status"], limit: 40, fallback: "unknown")
         turnID = Self.label(raw["turn_id"], limit: 160)
         startedAt = Self.date(raw["started_at"])
@@ -216,31 +266,10 @@ struct CueTaskDetail {
         let legacyUsage = raw.filter { ["total_tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "tokens_status", "request_count"].contains($0.key) }
         turnUsage = CueTaskUsageSummary(raw: raw["turn_usage"] as? [String: Any] ?? (raw["turn_usage"] == nil ? legacyUsage : [:]), legacy: raw["turn_usage"] == nil)
         historyUsage = CueTaskUsageSummary(raw: raw["history_usage"] as? [String: Any] ?? [:], history: true)
-        lastMessage = Self.text(raw["last_message"], limit: 12_000)
-        lastMessageAt = Self.date(raw["last_message_at"])
-        lastRole = Self.label(raw["last_role"], limit: 30)
-        var result: [CueTaskMessage] = []
-        var truncated = raw["content_truncated"] as? Bool == true
-        if (raw["last_message"] as? String ?? "").count > 12_000 { truncated = true }
-        var budget = 12_000
-        let rows = raw["messages"] as? [[String: Any]] ?? []
-        if rows.count > 8 { truncated = true }
-        for row in rows.suffix(8).reversed() {
-            guard let role = row["role"] as? String, ["user", "assistant"].contains(role) else { continue }
-            let value = Self.text(row["text"], limit: 12_000)
-            if (row["text"] as? String ?? "").count > 12_000 { truncated = true }
-            guard !value.isEmpty, budget > 0 else { continue }
-            let kept = String(value.suffix(budget))
-            if kept.count < value.count { truncated = true }
-            budget -= kept.count
-            result.append(CueTaskMessage(role: role, text: kept, date: Self.date(row["created_at"])))
-        }
-        result.reverse()
-        if result.isEmpty, ["user", "assistant"].contains(lastRole), !lastMessage.isEmpty {
-            result = [CueTaskMessage(role: lastRole, text: lastMessage, date: lastMessageAt)]
-        }
-        messages = result
-        contentTruncated = truncated
+        let content = preparedContent ?? CueTaskDetailContent(raw: raw)
+        lastMessage = content.lastMessage; lastMessageAt = content.lastMessageAt
+        lastRole = content.lastRole; messages = content.messages
+        contentTruncated = content.contentTruncated
     }
 
     var isActive: Bool { ["running", "waiting"].contains(status) }
@@ -282,10 +311,13 @@ struct CueTaskDetail {
         return "\(scope(eventDate: eventDate)) · \(duration) · \(tokenText)"
     }
 
-    private var currentSettingsReadable: Bool {
+    private var currentSettingsReadable: Bool { hasReadableCurrentSettings(at: Date()) }
+    /// The same predicate drives display and snapshot temporal invalidation.
+    /// No formatted string or model value is cached past its usable lifetime.
+    func hasReadableCurrentSettings(at now: Date) -> Bool {
         guard ["current", "partial"].contains(currentSettingsStatus), !currentSettingsSource.isEmpty else { return false }
-        if let expiry = currentSettingsExpiresAt { return expiry >= Date() }
-        if let observed = currentSettingsObservedAt, !(-10...45).contains(Date().timeIntervalSince(observed)) { return false }
+        if let expiry = currentSettingsExpiresAt { return expiry >= now }
+        if let observed = currentSettingsObservedAt, !(-10...45).contains(now.timeIntervalSince(observed)) { return false }
         return true
     }
     private static func friendlyModel(_ identifier: String, displayName: String = "") -> String {
@@ -335,12 +367,10 @@ struct CueTaskDetail {
         if currentSettingsReadable {
             lines.append("来源：Codex 已保存的对话设置，只读获取。输入框内尚未提交的临时选择不在共享接口内。")
             if let observed = currentSettingsObservedAt {
-                let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"
-                lines.append("读取时间：" + formatter.string(from: observed))
+                lines.append("读取时间：" + CueTaskTimeLabels.string(observed, format: "HH:mm:ss"))
             }
             if let verified = currentSettingsVerifiedAt {
-                let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"
-                lines.append("连接核对时间：" + formatter.string(from: verified))
+                lines.append("连接核对时间：" + CueTaskTimeLabels.string(verified, format: "HH:mm:ss"))
             }
             if currentSettingsStatus == "partial" { lines.append("Codex 尚未提供的字段保持未知，不用历史值补齐。") }
             if selectedModelStatus == "default" { lines.append("没有显式模型覆盖，跟随 Codex 的默认选择；未推断实际默认模型。") }
@@ -363,8 +393,15 @@ struct CueTaskDetail {
     }
 
     static func exact(_ value: Int64) -> String {
-        let formatter = NumberFormatter(); formatter.numberStyle = .decimal
-        formatter.maximumFractionDigits = 0
+        // Formatters have expensive ICU initialization. Thread-local ownership
+        // permits utility projections and AppKit rendering without shared mutation.
+        let key = "local.vibecue.exact-number"
+        let formatter: NumberFormatter
+        if let existing = Thread.current.threadDictionary[key] as? NumberFormatter, existing.locale.identifier == Locale.current.identifier { formatter = existing }
+        else {
+            formatter = NumberFormatter(); formatter.locale = Locale.current; formatter.numberStyle = .decimal
+            formatter.maximumFractionDigits = 0; Thread.current.threadDictionary[key] = formatter
+        }
         return formatter.string(from: NSNumber(value: value)) ?? String(value)
     }
     fileprivate static func compact(_ value: Int64) -> String {
@@ -391,14 +428,19 @@ struct CueTaskDetail {
     fileprivate static func date(_ raw: Any?) -> Date? {
         if let value = number(raw), value > 0 && value < 253_402_300_799 { return Date(timeIntervalSince1970: value) }
         guard let value = raw as? String else { return nil }
-        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        func formatter(_ key: String, fractional: Bool) -> ISO8601DateFormatter {
+            if let cached = Thread.current.threadDictionary[key] as? ISO8601DateFormatter { return cached }
+            let result = ISO8601DateFormatter()
+            if fractional { result.formatOptions = [.withInternetDateTime, .withFractionalSeconds] }
+            Thread.current.threadDictionary[key] = result; return result
+        }
+        return formatter("local.vibecue.iso-fractional", fractional: true).date(from: value) ?? formatter("local.vibecue.iso-plain", fractional: false).date(from: value)
     }
     fileprivate static func label(_ raw: Any?, limit: Int, fallback: String = "") -> String {
         guard let value = raw as? String else { return fallback }
         return String(value.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").prefix(limit))
     }
-    private static func text(_ raw: Any?, limit: Int) -> String {
+    fileprivate static func text(_ raw: Any?, limit: Int) -> String {
         guard let value = raw as? String else { return "" }
         let cleaned = String(value.unicodeScalars.filter { $0 == "\n" || $0 == "\t" || !CharacterSet.controlCharacters.contains($0) })
         return String(cleaned.suffix(limit)).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -604,12 +646,11 @@ final class CueTaskHoverController: NSObject {
         guard !hasRenderedMessages || signature != renderedMessages else { return }
         hasRenderedMessages = true; markdownRenderCount += 1
         let result = NSMutableAttributedString()
-        let date = DateFormatter(); date.locale = Locale(identifier: "zh_CN"); date.dateFormat = "HH:mm:ss"
         let headingStyle = NSMutableParagraphStyle(); headingStyle.paragraphSpacing = 5
         var latest = NSRange(location: 0, length: 0)
         for message in messages {
             latest = NSRange(location: result.length, length: 0)
-            let heading = (message.role == "user" ? "你" : "Codex") + (message.date.map { " · " + date.string(from: $0) } ?? "") + "\n"
+            let heading = (message.role == "user" ? "你" : "Codex") + (message.date.map { " · " + CueTaskTimeLabels.string($0, format: "HH:mm:ss", locale: Locale(identifier: "zh_CN")) } ?? "") + "\n"
             result.append(NSAttributedString(string: heading, attributes: [.font: NSFont.systemFont(ofSize: 10.5, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: headingStyle]))
             result.append(CueHoverMarkdown.render(message.text))
             result.append(NSAttributedString(string: "\n", attributes: [.font: NSFont.systemFont(ofSize: 13)]))

@@ -762,6 +762,7 @@ class Watcher:
             'interrupted_tasks': interrupted,
             'task_recovery_error': self.recovery.error,
             'task_details': bounded_details(detail_rows),
+            'task_usage_cache_metrics': self.task_usage.cache_metrics,
             'current_model_settings': current_settings,
             'side_chats': side_chats,
             'current_task_states': task_states,
