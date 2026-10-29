@@ -133,6 +133,25 @@ private final class CueUsageScrollView: NSScrollView {
     }
 }
 
+/// The table and its pager share one section, rather than a window-level footer.
+private final class CueUsageListSection: NSView {
+    override var isFlipped: Bool { true }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlBackgroundColor.setFill(); bounds.fill()
+        NSColor.separatorColor.setStroke()
+        let border = NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5)); border.lineWidth = 1; border.stroke()
+    }
+}
+
+private final class CueUsagePaginationBar: NSView {
+    override var isFlipped: Bool { true }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlBackgroundColor.setFill(); bounds.fill()
+        NSColor.separatorColor.setStroke()
+        let line = NSBezierPath(); line.move(to: NSPoint(x: 0, y: 0.5)); line.line(to: NSPoint(x: bounds.width, y: 0.5)); line.lineWidth = 1; line.stroke()
+    }
+}
+
 private final class CueUsageMetric: NSView {
     let title = NSTextField(labelWithString: ""), value = NSTextField(labelWithString: "—"), detail = NSTextField(labelWithString: "")
     var preferredValueSize: CGFloat = 25
@@ -296,6 +315,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private let heatmap = CueUsageHeatmap()
     private let tabs = NSSegmentedControl(labels: ["请求日志", "模型", "来源"], trackingMode: .selectOne, target: nil, action: nil)
     private let table = NSTableView(), scroll = CueUsageScrollView()
+    private let listSection = CueUsageListSection(), paginationBar = CueUsagePaginationBar()
     private let pageLabel = NSTextField(labelWithString: ""), detail = NSTextField(labelWithString: "")
     private let previous = NSButton(title: "上一页", target: nil, action: nil), next = NSButton(title: "下一页", target: nil, action: nil)
     private var rows: [[String: Any]] = []
@@ -363,9 +383,14 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
         // Reserved native scroller tracks keep the final row and final header
         // visible; overlay scrollers previously covered the numbers themselves.
-        scroll.scrollerStyle = .legacy; scroll.autohidesScrollers = false; scroll.borderType = .lineBorder
+        scroll.scrollerStyle = .legacy; scroll.autohidesScrollers = false; scroll.borderType = .noBorder
         scroll.automaticallyAdjustsContentInsets = false; scroll.contentInsets = NSEdgeInsetsZero
-        let views: [NSView] = [titleLabel, subtitle, range, app, model, source, syncButton, infoButton, moneyButton, accountsButton, syncLabel, status, heatmapTitle, heatmapRange, heatmap, tabs, scroll, pageLabel, previous, next, detail] + metrics
+        listSection.setAccessibilityElement(true); listSection.setAccessibilityRole(.group)
+        paginationBar.setAccessibilityElement(true); paginationBar.setAccessibilityRole(.group)
+        paginationBar.setAccessibilityLabel("当前列表分页")
+        listSection.addSubview(scroll); listSection.addSubview(paginationBar)
+        [pageLabel, previous, next].forEach { paginationBar.addSubview($0) }
+        let views: [NSView] = [titleLabel, subtitle, range, app, model, source, syncButton, infoButton, moneyButton, accountsButton, syncLabel, status, heatmapTitle, heatmapRange, heatmap, tabs, listSection, detail] + metrics
         views.forEach { surface.addSubview($0) }
         surface.onLayout = { [weak self] in self?.layout() }
         surface.onAppearance = { [weak self] in self?.metrics.forEach { $0.needsDisplay = true }; self?.heatmap.needsDisplay = true }
@@ -486,7 +511,9 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
                 report[prefix + ".monthsWithinCalendar"] = chart.monthLabels.allSatisfy { $0.frame.minX >= chart.grid.minX && $0.frame.maxX <= chart.grid.maxX + 0.1 }
                 report[prefix + ".calendar53x7"] = abs(chart.grid.width - (53 * chart.cell + 52 * chart.gap)) < 0.1 && abs(chart.grid.height - (7 * chart.cell + 6 * chart.gap)) < 0.1
                 report[prefix + ".calendarLegendFits"] = chart.grid.maxY + 27 <= controller.heatmap.bounds.height
-                report[prefix + ".sectionSpacing"] = controller.metrics.allSatisfy { $0.frame.maxY + 12 <= controller.heatmapTitle.frame.minY } && controller.heatmap.frame.maxY + 12 <= controller.tabs.frame.minY && controller.tabs.frame.maxY + 10 <= controller.scroll.frame.minY && controller.scroll.frame.maxY + 8 <= controller.detail.frame.minY && controller.detail.frame.maxY + 6 <= controller.previous.frame.minY
+                report[prefix + ".sectionSpacing"] = controller.metrics.allSatisfy { $0.frame.maxY + 12 <= controller.heatmapTitle.frame.minY } && controller.heatmap.frame.maxY + 12 <= controller.tabs.frame.minY && controller.tabs.frame.maxY + 10 <= controller.listSection.frame.minY && controller.listSection.frame.maxY + 8 <= controller.detail.frame.minY
+                report[prefix + ".paginationBelongsToList"] = controller.scroll.superview === controller.listSection && controller.paginationBar.superview === controller.listSection && [controller.pageLabel, controller.previous, controller.next].allSatisfy { $0.superview === controller.paginationBar } && controller.detail.superview === controller.surface
+                report[prefix + ".paginationBelowTable"] = controller.scroll.frame.maxY <= controller.paginationBar.frame.minY && [controller.pageLabel, controller.previous, controller.next].allSatisfy { controller.paginationBar.bounds.contains($0.frame) }
                 report[prefix + ".filterSpacing"] = zip([controller.range, controller.app, controller.model], [controller.app, controller.model, controller.source]).allSatisfy { $0.0.frame.maxX + 11 <= $0.1.frame.minX } && abs(controller.source.frame.maxX - (size.width - 24)) < 0.1
                 report[prefix + ".metricSpacing"] = zip(controller.metrics, controller.metrics.dropFirst()).allSatisfy { $0.0.frame.maxX + 9 <= $0.1.frame.minX } && controller.metrics.last!.frame.maxX <= size.width - 23
                 let value = controller.metrics[5].value, font = controller.metrics[5].value.font!
@@ -503,6 +530,11 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
                 }
             }
         }
+        let paging = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
+        let overview = paging.metrics.map { $0.value.stringValue }, calendarDays = paging.heatmap.days.count, message = paging.status.stringValue
+        paging.queryInFlight = true // Exercise invalidation without starting a worker.
+        paging.nextPage()
+        report["usage_pagination_changes_only_list_loading"] = paging.page == 2 && paging.rows.isEmpty && paging.pageLabel.stringValue.contains("第 2 页") && paging.metrics.map { $0.value.stringValue } == overview && paging.heatmap.days.count == calendarDays && paging.status.stringValue == message
         return report
     }
 
@@ -573,14 +605,18 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         tabs.frame = NSRect(x: 24, y: tabsY, width: 284, height: 29)
         status.frame = NSRect(x: 326, y: tabsY, width: width - 350, height: 29)
         let tableY = tabsY + 41
-        scroll.frame = NSRect(x: 24, y: tableY, width: width - 48, height: max(120, height - tableY - 86))
+        listSection.frame = NSRect(x: 24, y: tableY, width: width - 48, height: max(160, height - tableY - 42))
+        let sectionWidth = listSection.bounds.width, sectionHeight = listSection.bounds.height
+        scroll.frame = NSRect(x: 1, y: 1, width: sectionWidth - 2, height: sectionHeight - 40)
+        paginationBar.frame = NSRect(x: 1, y: sectionHeight - 39, width: sectionWidth - 2, height: 38)
         let tableWidth = table.tableColumns.reduce(CGFloat(0)) { $0 + $1.width } + CGFloat(max(0, table.tableColumns.count - 1)) * table.intercellSpacing.width
         table.setFrameSize(NSSize(width: max(scroll.contentView.bounds.width, tableWidth), height: max(scroll.contentSize.height, CGFloat(rows.count) * (table.rowHeight + table.intercellSpacing.height))))
         scroll.tile()
-        detail.frame = NSRect(x: 27, y: height - 75, width: width - 54, height: 17)
-        pageLabel.frame = NSRect(x: 27, y: height - 43, width: max(300, width - 260), height: 22)
-        previous.frame = NSRect(x: right - 176, y: height - 46, width: 85, height: 29)
-        next.frame = NSRect(x: right - 85, y: height - 46, width: 85, height: 29)
+        detail.frame = NSRect(x: 27, y: height - 29, width: width - 54, height: 17)
+        let pagerWidth = paginationBar.bounds.width
+        pageLabel.frame = NSRect(x: 12, y: 10, width: max(300, pagerWidth - 215), height: 18)
+        previous.frame = NSRect(x: pagerWidth - 189, y: 5, width: 85, height: 28)
+        next.frame = NSRect(x: pagerWidth - 97, y: 5, width: 85, height: 28)
     }
 
     @objc private func syncNow() { synchronize() }
@@ -597,16 +633,16 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             self.updateStatus(); self.configureBackgroundTimer(); self.query(); self.usageDidChange?()
         }
     }
-    private func query(invalidate: Bool = false) {
+    private func query(invalidate: Bool = false, tableOnly: Bool = false) {
         if invalidate {
             queryID += 1
             // The old numbers describe the previous filter. Do not present
             // them under a new range or a newly selected table's columns.
             rows = []; table.reloadData()
-            metrics.forEach { $0.value.stringValue = "…" }
-            pageLabel.stringValue = "正在查询所选范围…"; detail.stringValue = ""
+            if !tableOnly { metrics.forEach { $0.value.stringValue = "…" } }
+            pageLabel.stringValue = tableOnly ? "正在读取第 \(page) 页…" : "正在查询所选列表…"; detail.stringValue = ""
             previous.isEnabled = false; next.isEnabled = false
-            status.stringValue = "正在查询所选范围…"; status.textColor = .secondaryLabelColor
+            if !tableOnly { status.stringValue = "正在查询所选范围…"; status.textColor = .secondaryLabelColor }
         }
         guard !queryInFlight else { queryPending = true; return }
         queryInFlight = true
@@ -682,7 +718,11 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         let pagination = data["pagination"] as? [String: Any] ?? [:]
         page = max(1, Int(number(pagination, "page"))); pages = max(1, Int(number(pagination, "pages")))
         let total = Int(number(pagination, "total"))
-        pageLabel.stringValue = "共 \(Self.integer(Double(total))) 条 · 第 \(page) / \(pages) 页 · 每页 50 条"
+        let listTitle = ["请求日志", "模型", "来源"][max(0, min(2, tabs.selectedSegment))]
+        listSection.setAccessibilityLabel(listTitle + "列表与分页")
+        previous.setAccessibilityLabel(listTitle + "上一页"); next.setAccessibilityLabel(listTitle + "下一页")
+        previous.toolTip = "查看当前" + listTitle + "列表的上一页"; next.toolTip = "查看当前" + listTitle + "列表的下一页"
+        pageLabel.stringValue = "\(listTitle) · 共 \(Self.integer(Double(total))) 条 · 第 \(page) / \(pages) 页 · 每页 50 条"
         previous.isEnabled = page > 1; next.isEnabled = page < pages
         detail.stringValue = rows.isEmpty ? "当前筛选暂无记录。可点“立即同步”，或查看“数据说明”。" : "用量来自本机会话日志；原日志未记录供应商时，来源显示为“会话日志”。"
         table.reloadData()
@@ -709,8 +749,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
 
     @objc private func changeFilter(_ sender: NSPopUpButton) { page = 1; query(invalidate: true) }
     @objc private func changeTab() { page = 1; configureColumns(); query(invalidate: true) }
-    @objc private func previousPage() { guard page > 1 else { return }; page -= 1; query(invalidate: true) }
-    @objc private func nextPage() { guard page < pages else { return }; page += 1; query(invalidate: true) }
+    @objc private func previousPage() { guard page > 1 else { return }; page -= 1; query(invalidate: true, tableOnly: true) }
+    @objc private func nextPage() { guard page < pages else { return }; page += 1; query(invalidate: true, tableOnly: true) }
     @objc private func showMoneyPreferences() {
         if preferencesController == nil {
             let filters = snapshot["filters"] as? [String: Any] ?? [:]
