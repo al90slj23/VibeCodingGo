@@ -11,8 +11,8 @@ root = Path(__file__).resolve().parents[1]
 app = root / 'build/VibeCoding Go.app'
 info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 version = tuple(int(value) for value in info['CFBundleShortVersionString'].split('.'))
-if info.get('CFBundleIdentifier') != 'local.vibecue' or version < (0, 31, 0):
-    raise SystemExit('Build VibeCoding Go 0.31.0 or newer before running this check.')
+if info.get('CFBundleIdentifier') != 'local.vibecue' or version < (0, 32, 0):
+    raise SystemExit('Build VibeCoding Go 0.32.0 or newer before running this check.')
 with tempfile.TemporaryDirectory(prefix='vcgo-ui-contract-') as home:
     env = os.environ.copy()
     env['VIBECUE_HOME'] = home

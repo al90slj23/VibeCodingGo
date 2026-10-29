@@ -169,7 +169,7 @@ def _route(url):
         return {'proxy': '', 'source': 'bypass'}
     selected = proxies.get(urllib.parse.urlsplit(url).scheme) or proxies.get('all') or proxies.get('socks')
     if selected:
-        return network_tests.proxy_guard(url, proxies={'https': selected, 'no': proxies.get('no', '')})
+        return network_tests.proxy_guard(url, proxies={urllib.parse.urlsplit(url).scheme: selected, 'no': proxies.get('no', '')})
     return network_tests._system_proxy(url)
 
 

@@ -10,6 +10,8 @@ import argparse
 import base64
 import ctypes
 import ctypes.util
+from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 import ipaddress
 import json
 import math
@@ -26,6 +28,8 @@ import urllib.parse
 import urllib.request
 import zlib
 
+from .network_runtime import NetworkRuntime, NetworkCancelled
+
 USER_AGENT = 'VCGo network-tests'
 MAX_INPUT = 8192
 MAX_JSON = 1_048_576
@@ -41,9 +45,13 @@ SOURCES = {
     'proxycheck': {'name': 'proxycheck.io 风险信号', 'url': 'https://proxycheck.io/api/'},
     'globalping': {'name': 'Globalping 社区探针', 'url': 'https://globalping.io/docs/api.globalping.io'},
     'cloudflare': {'name': 'Cloudflare 轻量下载', 'url': 'https://github.com/cloudflare/speedtest'},
+    'cloudflare_trace': {'name': 'Cloudflare 出口观测', 'url': 'https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/'},
     'webrtc': {'name': 'WebRTC 泄露说明', 'url': 'https://www.rfc-editor.org/rfc/rfc8828'},
     'browserleaks': {'name': 'BrowserLeaks 浏览器检测', 'url': 'https://browserleaks.com/webrtc'},
     'dnsleaktest': {'name': 'DNSLeakTest 浏览器检测', 'url': 'https://www.dnsleaktest.com/'},
+    'cf_doh': {'name': 'Cloudflare 公共 DNS 对照', 'url': 'https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/make-api-requests/dns-json/'},
+    'google_doh': {'name': 'Google 公共 DNS 对照', 'url': 'https://developers.google.com/speed/public-dns/docs/doh/json'},
+    'tor': {'name': 'Tor 官方出口列表', 'url': 'https://blog.torproject.org/changes-tor-exit-list-service/'},
 }
 TITLES = {'ip_reputation': 'IP 纯净度与风险信号', 'domain': '域名可达性',
           'ip_trace': 'IP 痕迹与出口检查', 'global_ping': '全球 Ping',
@@ -53,11 +61,29 @@ REGIONS = (('US', '美国'), ('DE', '德国'), ('SG', '新加坡'), ('JP', '日�
 
 
 class TestError(RuntimeError):
-    """Only controlled messages, never exception strings or response bodies."""
+    """Controlled messages and fixed numeric/status metadata only."""
+    def __init__(self, message, *, code=None, status=None, status_code=None,
+                 retry_after=None, retry_after_seconds=None, quota=None):
+        super().__init__(message)
+        self.code = code
+        self.status = self.status_code = status_code if status_code is not None else status
+        self.retry_after = self.retry_after_seconds = retry_after_seconds if retry_after_seconds is not None else retry_after
+        self.quota = dict(quota or {})
+
+
+class Cancelled(TestError):
+    def __init__(self, message='检测已取消。', **kwargs):
+        super().__init__(message, code='cancelled', **kwargs)
+
+
+CancelledError = Cancelled
 
 
 class RateLimited(TestError):
-    pass
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('code', 'rate_limited')
+        kwargs.setdefault('status_code', 429)
+        super().__init__(message, **kwargs)
 
 
 def text(value, limit=180):
@@ -67,7 +93,9 @@ def text(value, limit=180):
 
 
 def finite(value, minimum=0, maximum=1_000_000):
-    return value if type(value) in (int, float) and math.isfinite(value) and minimum <= value <= maximum else None
+    if type(value) not in (int,float): return None
+    try: return value if math.isfinite(value) and minimum <= value <= maximum else None
+    except (OverflowError,ValueError): return None
 
 
 def public_ip(value):
@@ -139,8 +167,9 @@ def _proxy_url(raw):
         raise TestError('代理配置格式无法识别，未绕过代理执行。') from None
 
 
-def _bypass(host, proxies):
-    if urllib.request.proxy_bypass_environment(host, proxies):
+def _bypass(host, proxies, port=None):
+    authority = ("[" + host + "]" if ":" in host else host) + (":" + str(port) if port else "")
+    if urllib.request.proxy_bypass_environment(authority, proxies) or urllib.request.proxy_bypass_environment(host, proxies):
         return True
     try:
         address = ipaddress.ip_address(host)
@@ -164,6 +193,11 @@ def _system_proxy(url, *, settings=None, script=None, timeout=4):
     """
     if sys.platform != 'darwin':
         return {'proxy': '', 'source': 'direct'}
+    operation = NetworkRuntime.current()
+    if operation:
+        try: timeout = operation.remaining(timeout)
+        except NetworkCancelled: raise Cancelled() from None
+        except subprocess.TimeoutExpired: raise TestError('自动代理检查已达到检测时限。', code='timeout') from None
     owned = []
     cf = net = None
     try:
@@ -259,6 +293,7 @@ def _system_proxy(url, *, settings=None, script=None, timeout=4):
         try:
             deadline = time.monotonic() + timeout
             while not completed and time.monotonic() < deadline:
+                if operation and operation.cancelled: raise Cancelled()
                 run(mode, min(.1, max(.001, deadline - time.monotonic())), True)
         finally:
             invalidate(source); remove(loop, source, mode)
@@ -279,12 +314,17 @@ def _system_proxy(url, *, settings=None, script=None, timeout=4):
 
 def proxy_guard(url, *, runner=None, proxies=None):
     """Select one configured route, without publishing its host or credentials."""
-    host = urllib.parse.urlsplit(url).hostname if isinstance(url, str) else None
+    try:
+        parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+        host = parsed.hostname if parsed else None
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80) if parsed else None
+    except ValueError:
+        raise TestError('检测网址无效。') from None
     if not host: raise TestError('检测网址无效。')
     environment = urllib.request.getproxies_environment() if proxies is None else proxies
-    if _bypass(host, environment):
+    if _bypass(host, environment, port):
         return {'proxy': '', 'source': 'bypass'}
-    chosen = environment.get('https') or environment.get('all') or environment.get('socks')
+    chosen = environment.get(parsed.scheme) or environment.get('all') or environment.get('socks')
     if chosen:
         return {'proxy': _proxy_url(chosen), 'source': 'environment'}
     if proxies is not None or sys.platform != 'darwin':
@@ -310,45 +350,56 @@ def _curl_quote(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t') + '"'
 
 
-def _bounded_capture(args, *, input, timeout, env, limit):
-    """Read both pipes with fixed caps; stop the transfer before allocating more."""
-    process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-    selector = selectors.DefaultSelector()
-    output, errors = bytearray(), bytearray()
-    deadline = time.monotonic() + timeout
+def _transport_environment():
+    allowed = ('HOME', 'USER', 'LOGNAME', 'LANG', 'LC_CTYPE', 'TMPDIR', 'TZ')
+    env = {key: value for key in allowed if (value := os.environ.get(key)) is not None}
+    env.update(PATH='/usr/bin:/bin:/usr/sbin:/sbin', LC_ALL='C')
+    return env
+
+
+def _runtime(value=None, timeout=45):
+    return value or NetworkRuntime.current() or NetworkRuntime(timeout=timeout)
+
+
+def _bounded_capture(args, *, input, timeout, env, limit, runtime=None):
+    return _runtime(runtime, timeout=timeout).capture(args, input=input, timeout=timeout, env=env, limit=limit)
+
+
+def _retry_after(value):
+    if not isinstance(value, str) or len(value) > 100:
+        return None
     try:
-        process.stdin.write(input); process.stdin.close()
-        for pipe, target, cap in ((process.stdout, output, limit), (process.stderr, errors, 16384)):
-            os.set_blocking(pipe.fileno(), False)
-            selector.register(pipe, selectors.EVENT_READ, (target, cap))
-        while selector.get_map():
-            left = deadline - time.monotonic()
-            if left <= 0: raise subprocess.TimeoutExpired(args, timeout)
-            for key, _ in selector.select(min(left, .1)):
-                chunk = os.read(key.fileobj.fileno(), 65536)
-                if not chunk:
-                    selector.unregister(key.fileobj); continue
-                target, cap = key.data
-                if len(target) + len(chunk) > cap:
-                    process.kill(); process.wait(timeout=.5)
-                    return subprocess.CompletedProcess(args, -1000, stdout=bytes(output), stderr=b'')
-                target.extend(chunk)
-        process.wait(timeout=max(.001, deadline - time.monotonic()))
-        return subprocess.CompletedProcess(args, process.returncode, stdout=bytes(output), stderr=bytes(errors))
-    finally:
-        selector.close()
-        if process.poll() is None:
-            process.kill()
-            try: process.wait(timeout=.5)
-            except subprocess.TimeoutExpired: pass
-        for pipe in (process.stdin, process.stdout, process.stderr):
-            if pipe and not pipe.closed: pipe.close()
+        if value.strip().isdigit():
+            seconds = int(value.strip())
+        else:
+            stamp = parsedate_to_datetime(value)
+            if stamp.tzinfo is None:
+                return None
+            seconds = max(0, math.ceil(stamp.timestamp() - time.time()))
+        return min(86400, seconds) if seconds >= 0 else None
+    except (ValueError, OverflowError, TypeError):
+        return None
 
 
-def _curl_request(spec, route, *, runner=None):
-    """Credentials and POST data go through stdin, never command arguments."""
+def _safe_redirect(raw, origin):
+    if not isinstance(raw, str) or len(raw) > 2048:
+        return None
+    try:
+        value = urllib.parse.urlsplit(urllib.parse.urljoin(origin, raw))
+        if value.scheme not in ('http', 'https') or not value.hostname or value.username or value.password:
+            return None
+        host = value.hostname.encode('idna').decode('ascii')
+        if ':' in host: host = '[' + host + ']'
+        port = ':' + str(value.port) if value.port is not None else ''
+        return value.scheme + '://' + host + port
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+
+
+def _curl_request(spec, route, *, runner=None, runtime=None):
+    """One finite HTTPS transfer; private configuration travels only on stdin."""
     maximum, timeout = spec['max_bytes'], spec['timeout']
-    headers = ['User-Agent: ' + USER_AGENT, 'Accept: application/json',
+    headers = ['User-Agent: ' + USER_AGENT, 'Accept: ' + spec.get('accept', 'application/json'),
                'Accept-Encoding: ' + ('identity' if spec.get('count_only') is True else 'gzip')]
     if spec.get('etag'): headers.append('If-None-Match: ' + spec['etag'])
     config = ['silent', 'show-error', 'include', 'suppress-connect-headers', 'globoff',
@@ -356,7 +407,7 @@ def _curl_request(spec, route, *, runner=None):
               'url = ' + _curl_quote(spec['url']), 'max-time = ' + str(timeout),
               'connect-timeout = ' + str(min(8, timeout)),
               'proxy = ' + _curl_quote(route.get('proxy', '')), 'noproxy = ""',
-              'write-out = "\\nVCGO_META:%{http_code}:%{time_total}"']
+              'write-out = "\\nVCGO_META:%{http_code}:%{time_total}:%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{size_download}"']
     if spec['method'] == 'HEAD': config.append('head')
     else:
         config.append('request = ' + _curl_quote(spec['method']))
@@ -366,13 +417,16 @@ def _curl_request(spec, route, *, runner=None):
         headers += ['Content-Type: application/json', 'Expect:']
     config += ['header = ' + _curl_quote(value) for value in headers]
     try:
-        env = {key: value for key, value in os.environ.items() if key in ('HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'PATH', 'TZ')}
+        env = _transport_environment()
         arguments = ['/usr/bin/curl', '--disable', '--config', '-']
         payload = ('\n'.join(config) + '\n').encode()
         if runner is None:
-            process = _bounded_capture(arguments, input=payload, timeout=timeout + .3, env=env, limit=maximum + 131072)
+            process = _bounded_capture(arguments, input=payload, timeout=timeout + .3, env=env,
+                                       limit=maximum + 131072, runtime=runtime)
         else:
             process = runner(arguments, input=payload, capture_output=True, timeout=timeout + .3, check=False, env=env)
+    except NetworkCancelled:
+        return {'error': 'cancelled'}
     except subprocess.TimeoutExpired:
         return {'error': 'timeout'}
     except OSError:
@@ -390,39 +444,72 @@ def _curl_request(spec, route, *, runner=None):
     payload, marker, meta = raw.rpartition(b'\nVCGO_META:')
     if not marker: return {'error': 'invalid'}
     try:
-        code, elapsed = meta.decode('ascii').strip().split(':')
-        status, elapsed = int(code), float(elapsed)
+        fields = meta.decode('ascii').strip().split(':')
+        if len(fields) not in (2, 7): return {'error': 'invalid'}
+        status, elapsed = int(fields[0]), float(fields[1])
         if not 100 <= status <= 599 or not math.isfinite(elapsed) or elapsed < 0: raise ValueError()
+        timings = {'total': elapsed}
+        if len(fields) == 7:
+            dns, connect, appconnect, first, size = map(float, fields[2:])
+            if any(not math.isfinite(value) or value < 0 for value in (dns, connect, appconnect, first, size)):
+                raise ValueError()
+            if any(value > elapsed + .001 for value in (dns, connect, appconnect, first)) or size > maximum:
+                raise ValueError()
+            timings.update(dns=dns, tcp=max(0, connect-dns), tls=max(0, appconnect-connect) if appconnect else 0,
+                           first_byte=first, transfer=max(0, elapsed-first))
         final_headers = {}
         while payload.startswith(b'HTTP/'):
             end = payload.find(b'\r\n\r\n')
             if end < 0: return {'error': 'invalid'}
             block, payload = payload[:end], payload[end + 4:]
             if len(block) > 65536: return {'error': 'oversized'}
-            final_headers = {}
-            for line in block.split(b'\r\n')[1:]:
+            lines = block.split(b'\r\n')
+            match = re.fullmatch(rb'HTTP/[0-9.]+\s+([0-9]{3})(?:\s+[^\r\n]*)?', lines[0])
+            if not match: return {'error': 'invalid'}
+            block_status = int(match[1]); final_headers = {}
+            for line in lines[1:]:
                 key, separator, value = line.partition(b':')
                 if separator: final_headers[key.decode('ascii').lower()] = value.strip().decode('latin-1')
+            if 100 <= block_status < 200 and block_status != 101:
+                continue
+            if block_status != status: return {'error': 'invalid'}
+            break  # An HTTP-looking response body is still body, not another header.
+        else:
+            return {'error': 'invalid'}
         if len(payload) > maximum: return {'error': 'oversized'}
-        encoding = '' if spec['method'] == 'HEAD' else final_headers.get('content-encoding', '').lower()
+        encoding = '' if spec['method'] == 'HEAD' or status in (204,304) else final_headers.get('content-encoding', '').lower()
         if spec.get('count_only') is True and encoding not in ('', 'identity'):
             return {'error': 'encoded_speed_response'}
         if encoding == 'gzip':
             decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
             decoded = decoder.decompress(payload, maximum + 1)
-            if len(decoded) > maximum or decoder.unconsumed_tail or not decoder.eof: return {'error': 'oversized'}
+            if len(decoded) > maximum or decoder.unconsumed_tail or decoder.unused_data or not decoder.eof:
+                return {'error': 'oversized'}
             payload = decoded
         elif encoding not in ('', 'identity'):
             return {'error': 'encoding'}
         answer = {'status': status, 'etag': text(final_headers.get('etag'), 200),
-                  'bytes_received': len(payload), 'elapsed': max(.000001, elapsed)}
+                  'bytes_received': len(payload), 'elapsed': elapsed, 'timings': timings}
+        retry = _retry_after(final_headers.get('retry-after'))
+        if retry is not None: answer['retry_after_seconds'] = retry
+        content_type = text(final_headers.get('content-type'), 120)
+        if content_type: answer['content_type'] = content_type
+        length = final_headers.get('content-length', '')
+        if re.fullmatch(r'[0-9]{1,13}', length): answer['content_length'] = int(length)
+        redirect = _safe_redirect(final_headers.get('location'), spec['url'])
+        if redirect: answer['redirect'] = redirect
+        quota = {}
+        for name in ('limit', 'remaining'):
+            value = final_headers.get('ratelimit-' + name, final_headers.get('x-ratelimit-' + name, ''))
+            if re.fullmatch(r'[0-9]{1,12}', value): quota[name] = int(value)
+        if quota: answer['quota'] = quota
         if spec.get('count_only') is not True: answer['body'] = base64.b64encode(payload).decode('ascii')
         return answer
     except (ValueError, TypeError, UnicodeError, zlib.error):
         return {'error': 'invalid'}
 
 
-def _http_worker(spec):
+def _http_worker(spec, *, runtime=None):
     """One bounded request using the proxy route selected by the parent."""
     url, method = spec.get('url'), spec.get('method', 'GET')
     if not isinstance(url, str) or len(url) > 2048 or method not in ('GET', 'HEAD', 'POST'):
@@ -439,46 +526,114 @@ def _http_worker(spec):
     etag = spec.get('etag')
     if etag is not None and (not isinstance(etag, str) or len(etag) > 200 or any(ord(c) < 32 for c in etag)):
         raise TestError('检测缓存标识无效。')
+    if spec.get('accept', 'application/json') not in ('application/json', 'application/dns-json'):
+        raise TestError('检测响应类型无效。')
     route = spec.get('route') or proxy_guard(url)
     if not isinstance(route, dict) or route.get('source') not in ('environment', 'system', 'pac', 'bypass', 'direct'):
         raise TestError('检测代理路径无效。')
     if route.get('proxy'): route = dict(route, proxy=_proxy_url(route['proxy']))
-    return _curl_request(dict(spec, method=method, max_bytes=maximum, timeout=timeout), route)
+    operation = _runtime(runtime, timeout=min(35, timeout + .5))
+    with operation.signals():
+        return _curl_request(dict(spec, method=method, max_bytes=maximum, timeout=timeout), route, runtime=operation)
 
 
 class HTTPClient:
-    def __init__(self, *, clock=time.monotonic, sleep=time.sleep, runner=subprocess.run, proxy_check=proxy_guard):
-        self.clock, self.sleep, self.runner, self.proxy_check = clock, sleep, runner, proxy_check
+    def __init__(self, *, clock=time.monotonic, sleep=time.sleep, runner=None, proxy_check=proxy_guard, runtime=None):
+        self.clock, self.runner, self.proxy_check = clock, runner, proxy_check
+        self.runtime = runtime or NetworkRuntime(timeout=45, clock=clock)
+        self._custom_sleep = None if sleep is time.sleep else sleep
         self.routes = {}
         self.route_reports = []
+        self.last_response_meta = {}
+
+    @property
+    def cancelled(self):
+        return self.runtime.cancelled
+
+    def is_cancelled(self):
+        return self.cancelled
+
+    def _check(self):
+        try:
+            self.runtime.check()
+        except NetworkCancelled:
+            raise Cancelled() from None
+        except subprocess.TimeoutExpired:
+            raise TestError('网络检测已达到总时限，请稍后重试。', code='timeout') from None
+
+    @contextmanager
+    def operation_scope(self):
+        with self.runtime.signals():
+            yield self
+
+    signals = operation_scope
+
+    def sleep(self, seconds):
+        self._check()
+        try:
+            if self._custom_sleep is None:
+                self.runtime.sleep(seconds)
+            else:
+                self._custom_sleep(seconds)
+        except NetworkCancelled:
+            raise Cancelled() from None
+        except subprocess.TimeoutExpired:
+            raise TestError('网络检测已达到总时限。', code='timeout') from None
+        self._check()
 
     def ensure_route(self, url):
+        self._check()
         if url not in self.routes:
-            route = self.proxy_check(url)
+            try:
+                with self.runtime.signals():
+                    route = self.proxy_check(url)
+            except NetworkCancelled:
+                raise Cancelled() from None
+            except subprocess.TimeoutExpired:
+                raise TestError('代理规则检查已达到检测时限。', code='timeout') from None
             self.routes[url] = route
             if isinstance(route, dict):
                 label = route_label(route)
                 if label not in self.route_reports: self.route_reports.append(label)
+        self._check()
         return self.routes[url]
 
-    def request(self, url, *, deadline, method='GET', json_body=None, max_bytes=MAX_JSON, etag=None, count_only=False, rate_limit=True):
+    def request(self, url, *, deadline, method='GET', json_body=None, max_bytes=MAX_JSON, etag=None,
+                count_only=False, rate_limit=True, accept='application/json'):
+        self.last_response_meta = {}
         route = self.ensure_route(url)
-        left = deadline - self.clock()
+        self._check()
+        left = min(deadline - self.clock(), self.runtime.deadline - self.runtime.clock())
         if left <= .05:
-            raise TestError('检测已超时，请稍后重试。')
+            raise TestError('检测已超时，请稍后重试。', code='timeout')
         seconds = min(12 if count_only else 20, left)
         spec = {'url': url, 'method': method, 'json_body': json_body, 'max_bytes': max_bytes,
-                'etag': etag, 'count_only': count_only, 'timeout': max(.05, seconds - .5), 'route': route}
+                'etag': etag, 'count_only': count_only, 'timeout': max(.05, seconds - .5), 'route': route,
+                'accept': accept}
         try:
-            worker = self.runner([sys.executable, '-m', 'vibecue.network_tests', '_fetch'],
-                                 input=json.dumps(spec).encode(), capture_output=True,
-                                 timeout=seconds, check=False)
-        except (subprocess.TimeoutExpired, OSError):
-            raise TestError('网络检测超时或连接不可用。') from None
-        try:
-            value = json.loads(worker.stdout)
-        except (ValueError, TypeError):
-            raise TestError('检测来源返回了无法识别的数据。') from None
+            if self.runner is None:
+                # curl itself is a bounded DNS/network subprocess. Do not start
+                # another Python interpreter for every request or poll.
+                value = _http_worker(spec, runtime=self.runtime)
+                returncode = 0
+            else:
+                # Retain the injection boundary used by deterministic fixtures.
+                worker = self.runner([sys.executable, '-m', 'vibecue.network_tests', '_fetch'],
+                                     input=json.dumps(spec).encode(), capture_output=True,
+                                     timeout=seconds, check=False)
+                returncode = worker.returncode
+                if not isinstance(worker.stdout, bytes) or len(worker.stdout) > 8 * 1024 * 1024:
+                    raise TestError('检测来源返回的数据过大。', code='oversized')
+                value = json.loads(worker.stdout)
+        except NetworkCancelled:
+            raise Cancelled() from None
+        except subprocess.TimeoutExpired:
+            raise TestError('网络检测超时或连接不可用。', code='timeout') from None
+        except OSError:
+            raise TestError('系统网络传输暂不可用。', code='transport_unavailable') from None
+        except (ValueError, TypeError, RecursionError):
+            raise TestError('检测来源返回了无法识别的数据。', code='invalid') from None
+        self._check()
         errors = {'proxy_dns': '代理服务器地址未能解析，请检查代理配置。',
                   'proxy_connect': '无法连接当前代理，或代理握手失败；未改走直连。',
                   'proxy_network': '当前代理链路未完成请求；未改走直连。',
@@ -491,34 +646,43 @@ class HTTPClient:
                   'oversized': '检测来源响应超过上限，未读取过大的数据。',
                   'encoded_speed_response': '测速响应经过压缩，未生成不准确的速度值。',
                   'transport_unavailable': '系统网络传输工具暂不可用。'}
-        if worker.returncode or not isinstance(value, dict) or value.get('error'):
-            raise TestError(errors.get(value.get('error') if isinstance(value, dict) else '', '检测来源返回的数据无效或连接未完成。'))
+        error = value.get('error') if isinstance(value, dict) else 'invalid'
+        if error == 'cancelled': raise Cancelled()
+        if returncode or not isinstance(value, dict) or error:
+            raise TestError(errors.get(error, '检测来源返回的数据无效或连接未完成。'), code=error or 'invalid')
         status = value.get('status')
         if type(status) is not int or not 100 <= status <= 599:
-            raise TestError('检测来源没有返回有效状态。')
-        if status == 407:
-            raise TestError('代理要求有效认证，请在原代理工具中核对。')
-        if status == 429 and rate_limit:
-            raise RateLimited('检测来源已达到请求限额，请稍后重试。')
+            raise TestError('检测来源没有返回有效状态。', code='invalid')
+        encoded = value.get('body', '')
+        if not isinstance(encoded, str) or len(encoded) > ((max_bytes + 2) // 3) * 4:
+            raise TestError('检测来源返回的数据过大。', code='oversized')
         try:
-            body = base64.b64decode(value.get('body', ''), validate=True)
-        except (ValueError, TypeError):
-            raise TestError('检测来源返回了无法识别的数据。') from None
+            body = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError, RecursionError):
+            raise TestError('检测来源返回了无法识别的数据。', code='invalid') from None
         if len(body) > max_bytes:
-            raise TestError('检测来源返回的数据过大。')
+            raise TestError('检测来源返回的数据过大。', code='oversized')
         value['body'] = body
+        self.last_response_meta = {key: value[key] for key in
+                                  ('status', 'elapsed', 'timings', 'retry_after_seconds', 'quota', 'content_type', 'content_length', 'redirect')
+                                  if key in value}
+        if status == 407:
+            raise TestError('代理要求有效认证，请在原代理工具中核对。', code='proxy_auth', status=status)
+        if status == 429 and rate_limit:
+            raise RateLimited('检测来源已达到请求限额，请稍后重试。', status=status,
+                              retry_after_seconds=value.get('retry_after_seconds'), quota=value.get('quota'))
         return value
 
     def json(self, url, *, deadline, **kwargs):
         response = self.request(url, deadline=deadline, **kwargs)
         if response['status'] not in (200, 202):
-            raise TestError('检测来源暂不可用，未取得可确认的数据。')
+            raise TestError('检测来源暂不可用，未取得可确认的数据。', code='source_http_status', status=response['status'])
         try:
             value = json.loads(response['body'])
-        except (ValueError, UnicodeError):
-            raise TestError('检测来源返回了无法识别的数据。') from None
+        except (ValueError, UnicodeError, RecursionError):
+            raise TestError('检测来源返回了无法识别的数据。', code='invalid') from None
         if not isinstance(value, dict):
-            raise TestError('检测来源返回了无法识别的数据。')
+            raise TestError('检测来源返回了无法识别的数据。', code='invalid')
         return value
 
 
@@ -528,65 +692,34 @@ def discover_ip(client, deadline):
 
 
 def ip_reputation(params, client):
-    deadline = client.clock() + 25
-    address = public_ip(params['target']) if params.get('target') else discover_ip(client, deadline)
-    rows = [row('检测 IP', address)]
-    notes = ['风险标签反映来源数据库的记录；无标记不等于绝对纯净，也不能保证某个服务一定接受此 IP。',
-             '此查询把检测 IP 发送给 ipapi.is 和 proxycheck.io；匿名次数及缓存由来源决定。']
-    partial = False
-    try:
-        network = client.json('https://api.ipapi.is/?q=' + urllib.parse.quote(address, safe=''), deadline=deadline)
-        returned = network.get('ip')
-        if returned is not None and public_ip(returned) != address:
-            raise TestError('来源返回的 IP 与检测目标不一致。')
-        asn = network.get('asn')
-        if isinstance(asn, dict):
-            asn = ' · '.join(str(v) for v in (asn.get('asn'), asn.get('org')) if type(v) in (str, int))
-        country = network.get('country')
-        if isinstance(network.get('location'), dict):
-            country = network['location'].get('country', country)
-        partial = partial or not text(asn) or not text(country)
-        rows.extend([row('ASN / 网络', text(asn) or '未确认'), row('地区（估计）', text(country) or '未确认')])
-    except TestError:
-        partial = True
-        rows.append(row('网络归属', '未确认', '来源暂不可用，不使用猜测值。'))
-    try:
-        value = client.json('https://proxycheck.io/v3/' + urllib.parse.quote(address, safe='') + '?tag=0', deadline=deadline)
-        if value.get('status') not in ('ok', 'warning') or not isinstance(value.get(address), dict):
-            raise TestError('风险来源没有返回可核对的目标记录。')
-        detection = value[address].get('detections')
-        if not isinstance(detection, dict):
-            raise TestError('风险来源缺少检测字段。')
-        known, flagged = 0, []
-        for key, name in (('proxy', '代理'), ('vpn', 'VPN'), ('tor', 'Tor 出口'), ('hosting', '数据中心'), ('compromised', '被滥用记录'), ('anonymous', '匿名网络')):
-            mark = detection.get(key)
-            if type(mark) is bool:
-                known += 1
-                if mark:
-                    flagged.append(name)
-                rows.append(row(name, '有标记' if mark else '未见标记', '来源：proxycheck.io；并非本机行为审计。'))
-            else:
-                rows.append(row(name, '未确认'))
-        score = finite(detection.get('risk'), maximum=100)
-        rows.append(row('proxycheck.io 风险分', f'{score:g} / 100' if score is not None else '未确认', '来源原始风险分，不换算为“纯净度”。'))
-        partial = partial or known < 6 or score is None or value['status'] == 'warning'
-        if value['status'] == 'warning':
-            notes.append('来源返回 warning，结果可能受匿名查询额度或缓存限制。')
-        summary = '来源标记：' + '、'.join(flagged) if flagged else '来源暂未报告已知风险标记；这不构成绝对纯净证明。' if known else '风险信号未确认。'
-    except TestError as error:
-        partial = True
-        summary = '风险信号未确认，已保留能够取得的网络归属信息。'
-        rows.append(row('风险数据', '未确认', str(error)))
-    return result('ip_reputation', 'partial' if partial else 'ok', summary, rows, ('ipify', 'ipapi', 'proxycheck'), notes)
+    from .network_inspection import ip_reputation as implementation
+    return implementation(params, client, api=sys.modules[__name__])
 
 
 _RESOLVE_SCRIPT = "import socket,json,sys;print(json.dumps(sorted({v[4][0] for v in socket.getaddrinfo(sys.argv[1],443,type=socket.SOCK_STREAM)})))"
 
 
-def resolve(host, runner=None):
-    runner = runner or subprocess.run
+def _local_capture(args, *, timeout, limit=65536, runner=None, deadline=None):
+    if deadline is not None:
+        operation = NetworkRuntime.current()
+        now = operation.clock() if operation is not None else time.monotonic()
+        left = deadline - now
+        if not math.isfinite(left) or left <= .001:
+            raise subprocess.TimeoutExpired(args, 0)
+        timeout = min(timeout, left)
+    if runner is not None:
+        return runner(args, capture_output=True, timeout=timeout, check=False)
+    operation = _runtime(timeout=timeout)
     try:
-        value = runner([sys.executable, '-c', _RESOLVE_SCRIPT, host], capture_output=True, timeout=5, check=False)
+        with operation.signals():
+            return operation.capture(args, timeout=timeout, input=b'', env=_transport_environment(), limit=limit)
+    except NetworkCancelled:
+        raise Cancelled() from None
+
+
+def resolve(host, runner=None, *, deadline=None):
+    try:
+        value = _local_capture([sys.executable, '-I', '-c', _RESOLVE_SCRIPT, host], timeout=5, runner=runner, deadline=deadline)
         addresses = json.loads(value.stdout)
         if value.returncode or not isinstance(addresses, list) or not addresses or len(addresses) > 64:
             raise ValueError()
@@ -595,12 +728,11 @@ def resolve(host, runner=None):
         raise TestError('本机 DNS 未取得有效地址。') from None
 
 
-def tunnel_route(address, runner=None):
+def tunnel_route(address, runner=None, *, deadline=None):
     """Recognize benchmark fake-IP only when its actual local route is a tunnel."""
     if sys.platform != 'darwin': return False
-    runner = runner or subprocess.run
     try:
-        value = runner(['/sbin/route', '-n', 'get', address], capture_output=True, timeout=2, check=False)
+        value = _local_capture(['/sbin/route', '-n', 'get', address], timeout=2, runner=runner, deadline=deadline)
         output = value.stdout.decode('utf-8', errors='replace') if isinstance(value.stdout, bytes) else value.stdout
         return value.returncode == 0 and isinstance(output, str) and len(output) <= 65536 and re.search(r'^\s*interface:\s*(?:utun|tun|tap)[0-9]+\s*$', output, flags=re.M) is not None
     except (OSError, subprocess.TimeoutExpired):
@@ -608,57 +740,17 @@ def tunnel_route(address, runner=None):
 
 
 def domain_test(params, client):
-    host = target_host(params.get('target'))
-    deadline = client.clock() + 15
-    host_url = '[' + host + ']' if ':' in host else host
-    if hasattr(client, 'ensure_route'):
-        client.ensure_route('https://' + host_url + '/')
-    route = client.ensure_route('https://' + host_url + '/') if hasattr(client, 'ensure_route') else None
-    remote_dns = isinstance(route, dict) and urllib.parse.urlsplit(route.get('proxy', '')).scheme in ('http', 'https', 'socks4a', 'socks5h')
-    dns_unknown = False
-    try:
-        addresses = resolve(host)
-    except TestError:
-        addresses = []; dns_unknown = True
-        if not remote_dns:
-            return result('domain', 'partial', '本机 DNS 未解析成功；不能据此判定全网或某地区封禁。', [row('目标', host), row('本机 DNS', '未确认')], notes=['此项仅检测本机当前网络。区域差异请使用全球 HTTP 检测。'])
-    rows = [row('目标', host), row('本机 DNS', '未确认，继续核对代理端 HTTPS' if dns_unknown else '解析成功')]
-    if addresses: rows.append(row('解析地址', '、'.join(addresses), '系统 DNS 的当前结果，不证明 DNS 未被干预。'))
-    blocked = [address for address in addresses if not ipaddress.ip_address(address).is_global or ipaddress.ip_address(address).is_multicast]
-    fake_network = ipaddress.ip_network('198.18.0.0/15')
-    fake_answers = blocked and all(ipaddress.ip_address(address) in fake_network for address in blocked)
-    through_tunnel = fake_answers and not remote_dns and tunnel_route(blocked[0])
-    fake_only = fake_answers and (remote_dns or through_tunnel)
-    if blocked and not remote_dns and not fake_only:
-        return result('domain', 'partial', '域名解析到非公网地址，未发起外部 HTTP 检测。', rows,
-                      notes=['请在本机开发工具中检查内网服务；区域检测仅支持公网目标。'])
-    if blocked and remote_dns:
-        rows.append(row('代理 DNS 路径', '本机 DNS 返回非公网记录；由所选代理解析原域名', '只向代理提交已校验的公开域名，不把本机私网解析地址当作 HTTPS 目标。'))
-    elif fake_only:
-        if remote_dns:
-            rows.append(row('代理 DNS 路径', '本机返回测试网段地址；通过代理端解析原域名', '仅向配置中的代理提交原始公网域名，不直接连接测试网段地址。'))
-        else:
-            rows.append(row('TUN DNS 路径', '测试网段地址由系统网络隧道路由接管', '使用原域名验证 HTTPS 证书；不会把 TUN fake-IP 误判为域名被封禁。'))
-    host_url = '[' + host + ']' if ':' in host else host
-    try:
-        response = client.request('https://' + host_url + '/', deadline=deadline, method='HEAD', max_bytes=4096, rate_limit=False)
-        code = response['status']
-        rows.extend([row('HTTPS / TLS', '已建立可验证的 HTTPS 响应'), row('HTTP 状态', str(code), '403/404 等表示已到达服务；重定向不继续访问其他站点。')])
-        summary = '代理路径已取得 HTTPS 响应；本机 DNS 仍未确认。' if dns_unknown else '代理路径已到达该 HTTPS 服务；本机解析地址未用作连接目标。' if blocked and remote_dns else '本机可以到达该 HTTPS 服务；不能代表所有国家、地区或账号都可访问。'
-        return result('domain', 'partial' if dns_unknown else 'ok', summary, rows,
-                      notes=['服务可能按地区、账号或请求方式限制访问。要对比不同地区，请运行全球 HTTP 检测。'])
-    except TestError as error:
-        rows.append(row('HTTPS / TLS', '未确认', str(error)))
-        return result('domain', 'partial', 'DNS 已解析，但 HTTPS 尚未确认；失败不等于全网封禁。', rows,
-                      notes=['证书、链路、代理、服务器配置或地区限制都可能造成失败。'])
+    from .network_inspection import domain_test as implementation
+    return implementation(params, client, api=sys.modules[__name__])
 
 
-def system_network(runner=None):
-    runner = runner or subprocess.run
+def system_network(runner=None, *, deadline=None):
     rows = []
     try:
-        response = runner(['/usr/sbin/scutil', '--proxy'], capture_output=True, timeout=3, check=False)
+        response = _local_capture(['/usr/sbin/scutil', '--proxy'], timeout=3, runner=runner, deadline=deadline)
         output = response.stdout.decode('utf-8', errors='replace') if isinstance(response.stdout, bytes) else response.stdout
+        if not isinstance(output, str) or len(output) > 65536:
+            output = ''; response.returncode = -1
         flags = set()
         for key in ('HTTPEnable', 'HTTPSEnable', 'SOCKSEnable', 'ProxyAutoConfigEnable', 'ProxyAutoDiscoveryEnable'):
             match = re.search(r'^\s*' + key + r'\s*:\s*([01])\s*$', output or '', flags=re.M)
@@ -674,8 +766,9 @@ def system_network(runner=None):
     inherited_proxy = any(bool(os.environ.get(key)) for key in ('http_proxy','https_proxy','all_proxy','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY'))
     rows.append(row('当前进程代理环境', '已设置' if inherited_proxy else '未设置', '环境变量开关不能代表浏览器或 VPN 的实际路由。'))
     try:
-        response = runner(['/usr/sbin/scutil', '--dns'], capture_output=True, timeout=3, check=False)
+        response = _local_capture(['/usr/sbin/scutil', '--dns'], timeout=3, runner=runner, deadline=deadline)
         output = response.stdout.decode('utf-8', errors='replace') if isinstance(response.stdout, bytes) else response.stdout
+        if response.returncode or not isinstance(output, str) or len(output) > 65536: output = ''
         values = []
         for value in re.findall(r'^\s*nameserver\[\d+\]\s*:\s*([^\s]+)', output or '', flags=re.M):
             try:
@@ -691,142 +784,18 @@ def system_network(runner=None):
 
 
 def ip_trace(params, client):
-    deadline = client.clock() + 20
-    rows, ips = [], []
-    try:
-        first = discover_ip(client, deadline)
-        ips.append(first)
-        rows.append(row('ipify 观察到的出口', first))
-    except TestError as error:
-        rows.append(row('ipify 观察到的出口', '未确认', str(error)))
-    try:
-        response = client.request(TRACE, deadline=deadline, max_bytes=16384)
-        if response['status'] != 200:
-            raise TestError('出口来源暂不可用。')
-        fields = dict(line.split('=', 1) for line in response['body'].decode('utf-8', errors='replace').splitlines() if '=' in line)
-        second = public_ip(fields.get('ip'))
-        ips.append(second)
-        rows.append(row('Cloudflare 观察到的出口', second))
-        if fields.get('loc'):
-            rows.append(row('Cloudflare 地区（估计）', text(fields['loc'], 40)))
-    except TestError as error:
-        rows.append(row('Cloudflare 观察到的出口', '未确认', str(error)))
-    rows.extend(system_network())
-    complete = len(ips) == 2
-    same = complete and ips[0] == ips[1]
-    summary = '两个来源观察到相同出口；仍不能据此排除浏览器 WebRTC 或 DNS 泄露。' if same else '两个来源观察到不同出口，请检查分流、代理及 IPv4 / IPv6 路径；这不是“真实地址泄露”的单独证据。' if complete else '出口来源覆盖不完整，尚不能比较网络路径。'
-    return result('ip_trace', 'ok' if same else 'partial', summary, rows,
-                  ('ipify', 'cloudflare', 'webrtc', 'browserleaks', 'dnsleaktest'),
-                  ('这里只检查 VCGo 当前进程与系统配置，不代表 Chrome、Safari 或其他浏览器。',
-                   'IP 定位通常是网络归属和大致地区，不等于你的精确家庭地址。浏览器检测需在实际使用的浏览器中进行。'))
+    from .network_inspection import ip_trace as implementation
+    return implementation(params, client, api=sys.modules[__name__])
 
 
 def global_test(params, client, kind):
-    host = target_host(params.get('target'))
-    requested = params.get('regions')
-    allowed = dict(REGIONS)
-    if requested is None:
-        countries = list(allowed)[:params.get('probe_limit', 3)]
-    elif isinstance(requested, list) and 1 <= len(requested) <= PROBE_LIMIT and all(isinstance(v, str) and v in allowed for v in requested):
-        countries = list(dict.fromkeys(requested))[:params.get('probe_limit', 3)]
-    else:
-        raise TestError('请选择受支持的检测地区（最多 6 个）。')
-    deadline = client.clock() + GLOBAL_SECONDS
-    measure_type = 'ping' if kind == 'global_ping' else 'http'
-    body = {'type': measure_type, 'target': host, 'limit': len(countries), 'timeout': 20,
-            'locations': [{'country': country} for country in countries], 'inProgressUpdates': True}
-    if measure_type == 'ping':
-        body['measurementOptions'] = {'packets': 3}
-    else:
-        body['measurementOptions'] = {'request': {'method': 'HEAD'}, 'protocol': 'HTTPS'}
-    # POST exactly once. A lost response never triggers a duplicate measurement.
-    try:
-        created = client.json(GLOBALPING, deadline=deadline, method='POST', json_body=body)
-    except RateLimited:
-        raise
-    except TestError:
-        raise TestError('全球测量提交结果未确认；不会自动重发。') from None
-    identifier = created.get('id')
-    if not isinstance(identifier, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,100}', identifier) is None:
-        raise TestError('全球检测没有返回可核对的测量 ID。提交可能已发生；不会自动重发。')
-    address = GLOBALPING + '/' + identifier
-    etag, latest, successful = None, None, False
-    while client.clock() + 1 < deadline:
-        client.sleep(1)
-        response = client.request(address, deadline=deadline, etag=etag)
-        if response['status'] == 304:
-            continue
-        if response['status'] != 200:
-            raise TestError('全球检测结果暂不可读取；不会重新提交测量。')
-        try:
-            value = json.loads(response['body'])
-        except (ValueError, UnicodeError):
-            raise TestError('全球检测返回了无法识别的结果。') from None
-        if (not isinstance(value, dict) or value.get('id') != identifier
-                or value.get('target') != host or value.get('type') != measure_type):
-            raise TestError('全球检测结果与本次测量不一致。')
-        latest = value
-        etag = text(response.get('etag'), 200) or None
-        if value.get('status') == 'finished':
-            successful = True
-            break
-        if value.get('status') not in ('in-progress', None):
-            break
-    rows = [row('目标', host), row('地区', '、'.join(allowed[v] for v in countries)),
-            row('测量 ID', identifier, '目标与结果由 Globalping 保存，可能形成公开可检索记录。')]
-    results = latest.get('results') if isinstance(latest, dict) else None
-    recognized = 0
-    if isinstance(results, list):
-        for item in results[:PROBE_LIMIT]:
-            if not isinstance(item, dict):
-                continue
-            probe = item.get('probe') if isinstance(item.get('probe'), dict) else {}
-            location = probe.get('location') if isinstance(probe.get('location'), dict) else {}
-            label = ' · '.join(filter(None, (text(location.get('country'), 40), text(location.get('city'), 60)))) or '社区探针'
-            answer = item.get('result') if isinstance(item.get('result'), dict) else {}
-            if measure_type == 'ping':
-                stats = answer.get('stats') if isinstance(answer.get('stats'), dict) else {}
-                avg, loss = finite(stats.get('avg'), maximum=60000), finite(stats.get('loss'), maximum=100)
-                if avg is not None:
-                    recognized += 1
-                rows.append(row(label, f'{avg:g} ms' if avg is not None else '未确认', f'丢包 {loss:g}%' if loss is not None else '丢包率未确认'))
-            else:
-                status = answer.get('statusCode')
-                timings = answer.get('timings') if isinstance(answer.get('timings'), dict) else {}
-                total, first = finite(timings.get('total'), maximum=120000), finite(timings.get('firstByte'), maximum=120000)
-                if type(status) is int and 100 <= status <= 599:
-                    recognized += 1
-                else:
-                    status = None
-                detail = ' · '.join(filter(None, (f'总耗时 {total:g} ms' if total is not None else '', f'首字节 {first:g} ms' if first is not None else '')))
-                rows.append(row(label, 'HTTP ' + str(status) if status is not None else '未确认', detail or 'HTTP 时间未确认'))
-    if results is None or not rows[3:]:
-        rows.append(row('探针结果', '尚未取得'))
-    complete = successful and recognized == len(countries)
-    return result(kind, 'ok' if complete else 'partial',
-                  '已取得全球节点结果。' if complete else '已取得部分结果或仍在检测；不会自动重复提交。', rows,
-                  ('globalping',), ('节点位置与覆盖由社区探针决定，不保证每次覆盖全部地区。',
-                                   '部分节点超时、丢包或 HTTP 拒绝不等于域名被全网封禁。',
-                                   '此项是跨地区延迟 / 可达性测量，不是全球下载带宽测速。'))
+    from .network_measurements import global_test as implementation
+    return implementation(params, client, kind, api=sys.modules[__name__])
 
 
 def speed_test(params, client):
-    deadline = client.clock() + 12
-    started = client.clock()
-    download_bytes = params.get('download_bytes', 1024 * 1024)
-    response = client.request('https://speed.cloudflare.com/__down?bytes=' + str(download_bytes),
-                              deadline=deadline, max_bytes=download_bytes, count_only=True)
-    elapsed = finite(response.get('elapsed'), minimum=.000001, maximum=12)
-    size = response.get('bytes_received')
-    if response['status'] != 200 or type(size) is not int or size != download_bytes or elapsed is None:
-        raise TestError('轻量下载未完整完成，未生成速度数值。')
-    if client.clock() - started > 12.2:
-        raise TestError('轻量下载已超时，未生成速度数值。')
-    mbps = size * 8 / elapsed / 1_000_000
-    return result('speed', 'ok', '已完成本机出口到 Cloudflare 的单连接轻量下载。',
-                  [row('下载速度', f'{mbps:.2f} Mbps'), row('下载数据', f'{download_bytes // (1024 * 1024)} MiB'), row('请求耗时', f'{elapsed:.2f} 秒')],
-                  ('cloudflare',), (f'仅下载，不上传。本次 {download_bytes // (1024 * 1024)} MiB，12 秒超时；本结果不是公网峰值带宽。',
-                                   'Cloudflare 会观察到本次请求的公网出口 IP；不同地区带宽需在对应节点分别测试。'))
+    from .network_measurements import speed_test as implementation
+    return implementation(params, client, api=sys.modules[__name__])
 
 
 def run(params, client=None):
@@ -836,7 +805,7 @@ def run(params, client=None):
     kind = ALIASES.get(raw_kind, raw_kind) if isinstance(raw_kind, str) else None
     if kind not in TITLES:
         return result('', 'error', '请选择支持的检测类型。')
-    if set(params) - {'kind', 'target', 'regions', 'probe_limit', 'download_bytes'}:
+    if set(params) - {'kind', 'target', 'regions', 'probe_limit', 'download_bytes', 'measurement_id'}:
         return result(kind, 'error', '检测参数包含不支持的字段。')
     if (type(params.get('probe_limit', 3)) is not int or params.get('probe_limit', 3) not in (3, 5, 6)
             or type(params.get('download_bytes', 1024 * 1024)) is not int
@@ -844,6 +813,8 @@ def run(params, client=None):
         return result(kind, 'error', '节点数可选 3 / 5 / 6，下载量可选 1 / 3 / 5 MiB。')
     if params.get('target') is not None and not isinstance(params.get('target'), str):
         return result(kind, 'error', '检测目标必须是文本。')
+    if params.get('measurement_id') is not None and kind not in ('global_ping','global_http'):
+        return result(kind, 'error', '测量 ID 只能用于读取已有全球测量。')
     client = client or HTTPClient()
     try:
         if kind == 'ip_reputation':
@@ -857,7 +828,10 @@ def run(params, client=None):
         else:
             answer = speed_test(params, client)
     except TestError as error:
-        answer = result(kind, 'error', str(error), notes=['未取得有效结果时不会显示“纯净”“未封禁”或虚构速度。'])
+        state = 'cancelled' if isinstance(error,Cancelled) else 'rate_limited' if isinstance(error,RateLimited) else 'error'
+        answer = result(kind, state, str(error), notes=['未取得有效结果时不会显示“纯净”“未封禁”或虚构速度。'])
+        answer['error_code'] = error.code
+        if error.retry_after_seconds is not None: answer['retry_after_seconds'] = error.retry_after_seconds
     except (OSError, ValueError, TypeError, OverflowError):
         answer = result(kind, 'error', '检测未完成，未使用不完整数据生成结论。')
 
@@ -873,7 +847,7 @@ def main(argv=None):
     raw = sys.stdin.buffer.read(MAX_INPUT + 1)
     try:
         params = json.loads(raw) if len(raw) <= MAX_INPUT else None
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         params = None
     if args.operation == '_fetch':
         try:
@@ -881,7 +855,9 @@ def main(argv=None):
         except (TestError, ValueError, TypeError, OverflowError):
             value = {'error': 'invalid'}
     else:
-        value = run(params)
+        client = HTTPClient()
+        with client.operation_scope():
+            value = run(params,client)
     print(json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
 
 

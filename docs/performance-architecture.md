@@ -58,7 +58,7 @@ A new module uses the existing work scheduler and bounded collector admission, a
 
 The fourth workbench module owns one lazy `CueEngineeringToolsController` shared by its environment/API/log routes. Construction, navigation, file selection and visibility restoration do not create a collector. Native fixture checks exercise all three routes and require zero requests/clients. No new scheduler lease is registered. One explicit Run creates one finite `vibecue.engineering_tools` process in the dedicated `engineering` lane (limit 1), preserving chat/status capacity.
 
-The Python module imports the HTTP adapter only for an API command. The one-shot runtime permits fixed argv tools, never shell text; it drains input/output pipes, caps time/bytes, disables Corepack downloads, and cleans only its own process group. Closing a tool owner cancels queued work and sends SIGTERM; a one-second engineering-only termination fallback prevents a signal-ignoring worker holding the lane. Mutation/send collectors keep their existing receipt semantics.
+The Python module imports the HTTP adapter only for an API command. The one-shot runtime permits fixed argv tools, never shell text; it drains input/output pipes, caps time/bytes, disables Corepack downloads, and cleans only its own process group. Closing a tool owner cancels queued work and sends SIGTERM; a one-second finite-diagnostics termination fallback prevents a signal-ignoring worker holding the lane. Mutation/send collectors keep their existing receipt semantics.
 
 Input bounds are 256 KiB. Log reads are at most five files, 512 KiB each and 2 MiB combined, with no absolute-line-number rescan or continuous file watch. Only a bounded redacted tail reaches optional lnav, through private temporary files that are removed. HTTP previews/transport and Hurl collections have independent size/count/time limits. Missing optional engines produce honest capability/fallback output, not a fabricated successful engine result.
 
@@ -70,3 +70,16 @@ Native geometry has an explicit identity (root size, kind, API mode, busy state 
 使用既有 CueActivityScheduler 的一个内存截止检查，启动延后两分钟。未到期、已有工作或工程/维护通道忙碌时不启动进程。到期复用 maintenance 槽和后台 QoS，单次总预算 145 秒，原生终止兜底 180 秒，子进程有输出和执行上限。
 
 状态页只读小型元数据，哈希和兼容测试在后台维护中执行。配置和维护状态各自有单调版本，页面与调度缓存拒绝旧回包。候选准备不占用运行使用锁；只有链接/清单提交取短暂独占锁，忙碌则缓存候选延期。没有新增独立定时器、工具守护服务或主线程目录扫描。
+
+
+## Network diagnostics (0.32.0)
+
+The six network routes share one lazy controller and the existing finite network lane. Opening a page, changing a source, restoring visibility and copying a cached report create no process or network request. One explicit Run creates one bounded Python operation; production HTTP runs system curl directly instead of spawning an extra Python interpreter for every request or poll. DNS, PAC, route lookup, curl and Globalping polling share one operation deadline (default 45 seconds, clamped to 55). Download tests additionally cap at 12 seconds and at most 5 MiB.
+
+NetworkRuntime uses nonblocking bounded input/output and monotonic deadlines. It owns each child process group and drains both output pipes; cancellation terminates and reaps that group, including descendants holding pipes. Native Stop also cancels queued work and uses the finite-diagnostics SIGTERM-to-SIGKILL fallback. Message/send collectors retain their original receipt and cancellation behavior. The engineering updater defers while the network lane is active or queued, so it does not begin a tool download during a requested speed sample.
+
+An accepted Globalping measurement ID is retained independently of polling success. Resume GETs that same ID, checks type/target/regions and never recreates it. Stop may accept only the matching operation's bounded cancellation receipt to recover an already-created ID; a new run, target/source change or navigation invalidates that receipt. Retry-After gates explicit retry without a timer.
+
+Report preparation runs on a utility queue and caps the entire Unicode document at 96 KiB. At most six reports are held in memory. Hidden, minimized and occluded completions update cache without applying TextKit. Two window event observers restore the current cache; no new polling timer is registered. Document/layout identities prevent unchanged geometry and idle text layout. The performance snapshot exposes counts and state, not targets or addresses.
+
+The build gate now includes 25 network native fixture invariants and a finite diagnostic termination invariant. Installed --network-self-test includes 47 checks. The 0.32.0 regression run passed 118 focused network tests, 1,022 full Python tests and 134 native/performance checks. Live source/proxy observations and the distinction between offline rendering, installed backend tests and interactive UI acceptance are recorded in [network delivery evidence](network-solid-2026-10-30.md).

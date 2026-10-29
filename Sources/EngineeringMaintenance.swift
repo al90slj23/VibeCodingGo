@@ -20,7 +20,7 @@ final class CueEngineeringMaintenanceMonitor {
 
     init(home: URL, clock: @escaping () -> TimeInterval = { Date().timeIntervalSince1970 }, idle: @escaping () -> Bool = {
         let metrics = CueCollectorScheduler.shared.metrics
-        return metrics["engineering_active", default: 0] == 0 && metrics["engineering_queued", default: 0] == 0 && metrics["maintenance_active", default: 0] == 0 && metrics["maintenance_queued", default: 0] == 0
+        return metrics["engineering_active", default: 0] == 0 && metrics["engineering_queued", default: 0] == 0 && metrics["maintenance_active", default: 0] == 0 && metrics["maintenance_queued", default: 0] == 0 && metrics["network_active", default: 0] == 0 && metrics["network_queued", default: 0] == 0
     }, runner: Runner? = nil) {
         self.home = home; self.clock = clock; self.idle = idle; fixtureRun = runner
         nextAttempt = clock() + 120
@@ -116,7 +116,7 @@ final class CueEngineeringMaintenanceMonitor {
         return ["engineering_updates_late_state_and_configuration_cannot_regress_schedule":orderedState && orderedConfig,
                 "engineering_updates_construct_without_io_client_or_jobs":lazy,
                 "engineering_updates_delay_startup_and_use_one_cached_deadline":startup && cached,
-                "engineering_updates_defer_while_engineering_or_history_lane_is_busy":idle,
+                "engineering_updates_defer_while_engineering_history_or_network_lane_is_busy":idle,
                 "engineering_updates_are_single_flight_on_existing_activity_clock":one,
                 "engineering_updates_run_once_when_due_without_catchup_burst":due,
                 "engineering_updates_transport_failures_back_off_without_polling":backoff,

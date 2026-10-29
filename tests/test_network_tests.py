@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 from vibecue import network_tests as network
@@ -35,6 +36,11 @@ class FakeClient:
 
     def json(self, url, **kwargs):
         self.calls.append(('json', url, kwargs))
+        if url.startswith(('https://cloudflare-dns.com/dns-query?', 'https://dns.google/resolve?')):
+            query=urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            name=query['name'][0];kind=1 if query['type'][0]=='A' else 28
+            return {'Status':0,'Question':[{'name':name+'.','type':kind}],
+                    'Answer':[{'name':name+'.','type':kind,'TTL':300,'data':IP if kind==1 else '2606:4700:4700::1111'}]}
         if not self.json_values:
             raise network.TestError('Fixture: source unavailable')
         value = self.json_values.pop(0)
@@ -54,7 +60,7 @@ class FakeClient:
 
 def response(value=None, status=200, etag=''):
     if isinstance(value, dict) and 'results' in value:
-        value = dict({'id':'measurement-1','target':'example.com','type':'ping'}, **value)
+        value = dict({'id':'measurement-1','target':'example.com','type':'ping','probesCount':len(value['results'])}, **value)
     return {'status': status, 'body': json.dumps(value).encode() if value is not None else b'', 'etag': etag}
 
 
@@ -71,10 +77,10 @@ def values(result):
 
 
 def probe(country='US', *, http=False):
-    answer = {'statusCode': 403, 'timings': {'total': 40, 'firstByte': 25},
+    answer = {'status':'finished','statusCode': 403, 'timings': {'total': 40, 'firstByte': 25},
               'headers': {'Set-Cookie':'PRIVATE_SECRET', 'statusCode':200},
-              'rawOutput':'PRIVATE_RAW'} if http else {'stats': {'avg': 12.5, 'loss': 0}, 'rawOutput':'PRIVATE_RAW'}
-    return {'probe': {'location': {'country': country, 'city': 'Test city'}}, 'result': answer}
+              'rawOutput':'PRIVATE_RAW'} if http else {'status':'finished','stats': {'avg': 12.5, 'loss': 0}, 'rawOutput':'PRIVATE_RAW'}
+    return {'probe': {'country': country, 'city': 'Test city','asn':15169,'network':'Fixture'}, 'result': answer}
 
 
 class InputAndReputationTests(unittest.TestCase):
@@ -161,7 +167,8 @@ class LocalNetworkTests(unittest.TestCase):
                     client = FakeClient()
                     answer = network.run({'kind':'domain','target':'example.com'}, client)
                     self.assertEqual(answer['status'], 'partial')
-                    self.assertEqual(client.calls, [])
+                    self.assertTrue(client.calls)
+                    self.assertTrue(all(call[0]=='json' and ('dns-query?' in call[1] or '/resolve?' in call[1]) for call in client.calls))
                     self.assertNotIn('PRIVATE_SECRET', json.dumps(answer))
 
     def test_dns_child_uses_argument_array_and_a_deadline(self):
@@ -192,33 +199,34 @@ class LocalNetworkTests(unittest.TestCase):
         with patch.object(network,'system_network',return_value=[]):
             answer = network.run({'kind':'ip_trace'},client)
         self.assertEqual(answer['status'],'partial')
-        self.assertIn('不是“真实地址泄露”的单独证据',answer['summary'])
+        self.assertIn('不能单独证明真实地址泄露',answer['summary'])
         self.assertNotIn('PRIVATE_SECRET',json.dumps(answer))
-        self.assertTrue(any('不代表 Chrome' in note for note in answer['notes']))
+        self.assertTrue(any('Chrome/Safari' in note and 'WebRTC' in note for note in answer['notes']))
 
 
 class GlobalAndSpeedTests(unittest.TestCase):
-    def test_global_ping_posts_once_then_polls_with_etag_at_one_second_intervals(self):
+    def test_global_ping_posts_once_then_polls_with_etag_after_each_response(self):
         client = FakeClient([{'id':'measurement-1'}], [
-            response({'id':'measurement-1','status':'in-progress','results':[probe()]},etag='"first"'),
-            response(status=304), response({'id':'measurement-1','status':'finished','results':[probe() for _ in range(3)]},etag='"last"')])
+            response({'id':'measurement-1','status':'in-progress','probesCount':3,'results':[probe()]},etag='"first"'),
+            response(status=304), response({'id':'measurement-1','status':'finished','results':[probe(country) for country in ('US','DE','SG')]},etag='"last"')])
         answer = network.run({'kind':'global_ping','target':'example.com','probe_limit':3,'download_bytes':MIB},client)
         self.assertEqual(answer['status'],'ok')
         self.assertEqual(len([call for call in client.calls if call[0]=='json']),1)
         submitted = client.calls[0][2]['json_body']
-        self.assertEqual(submitted['limit'],3)
+        self.assertNotIn('limit',submitted)
+        self.assertEqual([x['limit'] for x in submitted['locations']],[1,1,1])
         self.assertEqual(len(submitted['locations']),3)
         self.assertEqual(submitted['measurementOptions']['packets'],3)
-        self.assertEqual(client.sleeps,[1,1,1])
+        self.assertEqual(client.sleeps,[.6,.6])
         self.assertEqual(client.calls[2][2]['etag'],'"first"')
         self.assertNotIn('PRIVATE_RAW',json.dumps(answer))
 
     def test_global_http_uses_official_status_field_and_omits_sensitive_headers(self):
-        client = FakeClient([{'id':'measurement-1'}], [response({'type':'http','status':'finished','results':[probe(http=True) for _ in range(3)]})])
+        client = FakeClient([{'id':'measurement-1'}], [response({'type':'http','status':'finished','results':[probe(country,http=True) for country in ('US','DE','SG')]})])
         answer = network.run({'kind':'global_http','target':'example.com','probe_limit':3},client)
         self.assertEqual(answer['status'],'ok')
         self.assertEqual(client.calls[0][2]['json_body']['measurementOptions'],{'request':{'method':'HEAD'},'protocol':'HTTPS'})
-        self.assertTrue(all(value['value']=='HTTP 403' for value in answer['rows'][3:]))
+        self.assertTrue(all(value['value']=='HTTP 403' for value in answer['rows'][4:]))
         self.assertNotIn('PRIVATE_',json.dumps(answer))
         self.assertNotIn('Set-Cookie',json.dumps(answer))
 
@@ -236,15 +244,20 @@ class GlobalAndSpeedTests(unittest.TestCase):
             with self.subTest(submitted=submitted):
                 client=FakeClient([submitted],poll)
                 answer=network.run({'kind':'global_ping','target':'example.com'},client)
-                self.assertEqual(answer['status'],'error')
+                self.assertEqual(answer['status'],'partial' if poll and isinstance(poll[0],network.RateLimited) else 'error')
+                if poll and isinstance(poll[0],network.RateLimited):
+                    self.assertEqual(answer['measurement']['id'],'measurement-1')
+                    self.assertTrue(answer['measurement']['resume_allowed'])
                 self.assertEqual(len([call for call in client.calls if call[0]=='json']),1)
 
     def test_ui_parameter_choices_really_limit_probe_and_download_work(self):
         for limit in (3,5,6):
-            client=FakeClient([{'id':'measurement-1'}],[response({'status':'finished','results':[probe() for _ in range(limit)]})])
+            client=FakeClient([{'id':'measurement-1'}],[response({'status':'finished','results':[probe(country) for country,_ in network.REGIONS[:limit]]})])
             answer=network.run({'kind':'global_ping','target':'example.com','probe_limit':limit,'download_bytes':MIB},client)
             self.assertEqual(answer['status'],'ok')
-            self.assertEqual(client.calls[0][2]['json_body']['limit'],limit)
+            self.assertNotIn('limit',client.calls[0][2]['json_body'])
+            self.assertEqual(len(client.calls[0][2]['json_body']['locations']),limit)
+            self.assertTrue(all(location['limit']==1 for location in client.calls[0][2]['json_body']['locations']))
         for size in (MIB,3*MIB,5*MIB):
             client=FakeClient(response_values=[{'status':200,'bytes_received':size,'elapsed':1.5}])
             answer=network.run({'kind':'speed','target':'','probe_limit':3,'download_bytes':size},client)
@@ -367,7 +380,7 @@ class ProxyRouteTests(unittest.TestCase):
         self.assertEqual(calls,[])
 
     def test_global_reply_must_match_id_target_and_measurement_type(self):
-        baseline={'id':'measurement-1','target':'example.com','type':'ping','status':'finished','results':[probe()]*3}
+        baseline={'id':'measurement-1','target':'example.com','type':'ping','status':'finished','results':[probe(country) for country in ('US','DE','SG')]}
         for field,value in (('id','wrong'),('target','wrong.example'),('type','http')):
             with self.subTest(field=field):
                 changed=dict(baseline);changed[field]=value
@@ -498,7 +511,7 @@ class ProxyRouteTests(unittest.TestCase):
             client.ensure_route=lambda url:{'proxy':'','source':'system'}
             with self.subTest(tunnel=tunnel),patch.object(network,'resolve',return_value=['198.18.0.1']),patch.object(network,'tunnel_route',return_value=tunnel):
                 answer=network.run({'kind':'domain','target':'example.com'},client)
-                self.assertEqual(bool(client.calls),tunnel)
+                self.assertEqual(any(call[0]=='request' for call in client.calls),tunnel)
                 if tunnel:self.assertIn('TUN DNS 路径',values(answer))
         self.assertIn('系统 / TUN',network.route_label({'proxy':'','source':'system'}))
 

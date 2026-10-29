@@ -1534,7 +1534,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
             "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
             "codex_connection_state": codexConnectionState, "codex_connection_summary": codexConnectionSummary,
-            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "engineering": settingsPanel?.engineeringController?.performanceSnapshot ?? ["created": false], "engineering_updates": engineeringMaintenance?.performanceSnapshot ?? ["created": false], "engineering_settings": settingsPanel?.engineeringSettingsController?.performanceSnapshot ?? ["created": false], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
+            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "engineering": settingsPanel?.engineeringController?.performanceSnapshot ?? ["created": false], "engineering_updates": engineeringMaintenance?.performanceSnapshot ?? ["created": false], "engineering_settings": settingsPanel?.engineeringSettingsController?.performanceSnapshot ?? ["created": false], "network": networkTests?.performanceSnapshot ?? ["created": false], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
         let destination = home.appendingPathComponent("app-status.json")
         let write = {
@@ -1564,6 +1564,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         engineeringMaintenance?.stop()
         settingsPanel?.engineeringSettingsController?.stop()
         settingsPanel?.engineeringController?.stop()
+        networkTests?.stopEmbeddedWork()
         conversationWindows.values.forEach { $0.stop() }; conversationClient?.stop(); recoveryClient?.stop()
         approvalLauncher?.terminate()
         try? approvalLaunchLog?.close(); approvalLaunchLog = nil
@@ -1763,6 +1764,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .priceSources: pricesController?.activateEmbedded()
         case .engineeringEnvironment, .engineeringAPI, .engineeringLogs: engineeringController?.activateEmbedded()
         case .engineeringSettings: engineeringSettingsController?.activateEmbedded()
+        case .networkTests, .networkIP, .networkDomain, .networkTrace, .networkPing, .networkHTTP, .networkSpeed: cue.networkTests?.activateEmbedded()
         default: break
         }
     }
@@ -2536,6 +2538,7 @@ if CommandLine.arguments.contains("--ui-performance-measure") {
     checks.merge(CueEngineeringSettingsController.validationReport()) { _, new in new }
     checks.merge(CueEngineeringMaintenanceMonitor.validationReport()) { _, new in new }
     checks.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
+    checks.merge(CueNetworkTestsController.validationReport()) { _, new in new }
     checks.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
     let measurement = CueStatusPopoverController.performanceMeasurement()
     checks["unchanged_list_does_not_rebuild"] = measurement["diff_rebuilds"] as? Int == 0
@@ -2552,6 +2555,15 @@ if let index = CommandLine.arguments.firstIndex(of: "--capture-engineering-fixtu
     let kind = kindIndex.flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil } ?? "environment"
     let passed = CueEngineeringToolsController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), kind: kind)
     exit(passed ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--network-self-test") {
+    _ = NSApplication.shared
+    var results = CueNetworkTestsController.validationReport()
+    results.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
+    results.merge(CueCollectorScheduler.validationReport()) { _, new in new }
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
 }
 
 if CommandLine.arguments.contains("--engineering-self-test") {
