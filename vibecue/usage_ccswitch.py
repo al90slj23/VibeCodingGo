@@ -128,7 +128,28 @@ def normalized(row, provider_names=None):
                 quality=quality, external_source=source)
 
 
-def sync(conn, cc_path=None, progress=None):
+def _source_fingerprint(path):
+    """Numeric source identity without opening private or authorization tables.
+
+    SQLite WAL commits need not touch the main file, so include both files.
+    Changes during a read prevent reuse on the next invocation.
+    """
+    try:
+        resolved = path.resolve()
+        main = resolved.stat()
+        fingerprint = [str(resolved), [main.st_dev, main.st_ino, main.st_size, main.st_mtime_ns]]
+        wal = Path(str(resolved) + '-wal')
+        try:
+            state = wal.stat()
+            fingerprint.append([state.st_dev, state.st_ino, state.st_size, state.st_mtime_ns])
+        except FileNotFoundError:
+            fingerprint.append(None)
+        return fingerprint
+    except OSError:
+        return None
+
+
+def sync(conn, cc_path=None, progress=None, *, native_unchanged=False):
     started=time.monotonic()
     def phase(name):
         if progress is not None: progress(name,round(time.monotonic()-started,2))
@@ -152,6 +173,20 @@ def sync(conn, cc_path=None, progress=None):
             # An explicitly isolated ledger must not silently read another
             # user's default CC database (including unit-test scratch homes).
             path=Path.home()/'.cc-switch/cc-switch.db' if home.resolve()==vibecue_directory().resolve() else home/'cc-switch-usage.sqlite3'
+    fingerprint = _source_fingerprint(path)
+    cached = conn.execute("SELECT value FROM usage_cc_import_state WHERE key='unchanged_snapshot_v1'").fetchone()
+    if native_unchanged and fingerprint is not None and cached:
+        try:
+            snapshot = json.loads(cached[0])
+            if snapshot.get('source') == fingerprint and snapshot.get('report', {}).get('available'):
+                report = dict(snapshot['report'], scanned=0, imported=0, reused_snapshot=True)
+                phase('cached_unchanged_source')
+                return report
+        except (ValueError, TypeError, AttributeError):
+            pass
+    # A failed/incomplete refresh may have changed local identities. Never let
+    # a prior cache survive it and incorrectly cover that changed ledger.
+    conn.execute("DELETE FROM usage_cc_import_state WHERE key='unchanged_snapshot_v1'")
     report = {'available': False, 'scanned': 0, 'imported': 0, 'matched': 0, 'invalid': 0,
               'note': 'CC Switch 仅补充数值与时序；原生三种工具不会重复导入其会话用量。'}
     try:
@@ -309,6 +344,11 @@ def sync(conn, cc_path=None, progress=None):
              timing_estimated,CASE WHEN timing_estimated=1 THEN 'CC Switch · 会话时间戳推算' ELSE 'CC Switch · 代理实测' END
         FROM usage_cc_metrics WHERE app NOT IN ('''+native+''')
           AND cc_id NOT IN (SELECT cc_id FROM usage_cc_gemini_mirrors)''')
+    # Reuse only a fully read, unchanged source. A capped import must continue
+    # from its watermark next time rather than cache an unfinished catalogue.
+    if report['scanned'] <= MAX_ROWS and fingerprint is not None and _source_fingerprint(path) == fingerprint:
+        conn.execute("INSERT OR REPLACE INTO usage_cc_import_state VALUES('unchanged_snapshot_v1',?)",
+                     (json.dumps({'source': fingerprint, 'report': report}),))
     conn.commit()
     return report
 

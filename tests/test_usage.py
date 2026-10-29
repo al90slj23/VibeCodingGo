@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from vibecue.usage import query, sync, connect, zstd_program, number, stamp
 
@@ -82,6 +83,21 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(coverage['files'],1)
         self.assertTrue(coverage['available'])
         self.assertEqual(sync(self.home)['sync']['imported'],0)
+
+    def test_bridge_reuse_hint_only_when_native_usage_did_not_change(self):
+        from vibecue import usage_ccswitch
+        path = self.write('native.jsonl', [meta(), context('model'), token(last=counts(10, 1))])
+        with patch.object(usage_ccswitch, 'sync', wraps=usage_ccswitch.sync) as bridge_sync:
+            first = sync(self.home)
+            self.assertFalse(bridge_sync.call_args.kwargs['native_unchanged'])
+            second = sync(self.home)
+            self.assertTrue(bridge_sync.call_args.kwargs['native_unchanged'])
+            with path.open('ab') as stream:
+                stream.write((json.dumps(token(last=counts(20, 2), timestamp='2026-10-01T02:00:00Z')) + '\n').encode())
+            sync(self.home)
+            self.assertFalse(bridge_sync.call_args.kwargs['native_unchanged'])
+        self.assertEqual(second['sync']['bytes_read'], 0)
+        self.assertEqual(first['summary']['requests'], 1)
 
     def test_coverage_warning_survives_unchanged_incremental_scan(self):
         self.write('bad.jsonl', [meta(), token(last=counts(10,1))], partial=b'not-json\n')

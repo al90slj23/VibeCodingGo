@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import ctypes.util
 import ipaddress
 import json
 import math
 import os
 import re
+import selectors
 import socket
 import ssl
 import subprocess
@@ -23,7 +26,7 @@ import urllib.parse
 import urllib.request
 import zlib
 
-USER_AGENT = 'VCGo/0.27 network-tests'
+USER_AGENT = 'VCGo network-tests'
 MAX_INPUT = 8192
 MAX_JSON = 1_048_576
 MAX_DOWNLOAD = 5 * 1024 * 1024
@@ -122,45 +125,180 @@ def result(kind, status, summary, rows=None, sources=(), notes=()):
             'notes': [text(note, 500) for note in notes][:12]}
 
 
-def proxy_guard(url, *, runner=None, proxies=None):
-    """Validate the route urllib will actually use; never disclose its values.
-
-    Explicit HTTPS proxies take precedence over ALL_PROXY or system fallback.
-    NO_PROXY is an intentional bypass. PAC/WPAD and SOCKS-only paths cannot be
-    evaluated by urllib and must never silently become an unproxied request.
-    """
-    host = urllib.parse.urlsplit(url).hostname if isinstance(url, str) else None
-    effective = urllib.request.getproxies() if proxies is None else proxies
-    environment = urllib.request.getproxies_environment()
-    if host and urllib.request.proxy_bypass_environment(host, environment):
-        return
-    https = effective.get('https')
-    if https:
-        try:
-            parsed = urllib.parse.urlsplit(https if '://' in https else 'http://' + https)
-            if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.port == 0:
-                raise ValueError()
-        except (ValueError, TypeError):
-            raise TestError('当前 HTTPS 代理路径不受支持，未绕过代理执行检测。') from None
-        return
-    if effective.get('all') or effective.get('socks'):
-        raise TestError('当前 ALL_PROXY / SOCKS 路径无法由此检测器验证，未绕过代理执行。')
-    if sys.platform != 'darwin':
-        return
-    runner = runner or subprocess.run
+def _proxy_url(raw):
+    if not isinstance(raw, str) or len(raw) > 4096 or any(ord(c) < 33 for c in raw):
+        raise TestError('代理配置格式无法识别，未绕过代理执行。')
     try:
-        state = runner(['/usr/sbin/scutil', '--proxy'], capture_output=True, timeout=3, check=False)
-        if state.returncode:
+        parsed = urllib.parse.urlsplit(raw if '://' in raw else 'http://' + raw)
+        if (parsed.scheme not in ('http', 'https', 'socks4', 'socks4a', 'socks5', 'socks5h')
+                or not parsed.hostname or parsed.port == 0 or parsed.path not in ('', '/')
+                or parsed.query or parsed.fragment):
             raise ValueError()
-        raw = state.stdout.decode('utf-8', errors='replace') if isinstance(state.stdout, bytes) else state.stdout
-        if not isinstance(raw, str) or '<dictionary>' not in raw or len(raw) > 65536:
-            raise ValueError()
-        enabled = {key for key in ('SOCKSEnable', 'HTTPSEnable', 'ProxyAutoConfigEnable', 'ProxyAutoDiscoveryEnable')
-                   if re.search(r'^\s*' + key + r'\s*:\s*1\s*$', raw, flags=re.M)}
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        raise TestError('无法核验当前系统代理路径，未发起外部检测。') from None
-    if enabled:
-        raise TestError('当前自动代理或 SOCKS 路径无法核实，未绕过配置执行检测。')
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, '', '', ''))
+    except (ValueError, TypeError):
+        raise TestError('代理配置格式无法识别，未绕过代理执行。') from None
+
+
+def _bypass(host, proxies):
+    if urllib.request.proxy_bypass_environment(host, proxies):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    for entry in str(proxies.get('no', '')).split(',')[:256]:
+        try:
+            if '/' in entry and address in ipaddress.ip_network(entry.strip(), strict=False):
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _system_proxy(url, *, settings=None, script=None, timeout=4):
+    """Use Apple's per-URL policy, including bounded native PAC evaluation.
+
+    Values stay inside this process and its request pipe. The chosen first rule
+    is authoritative; an unreachable proxy never silently falls back to DIRECT.
+    Optional settings/script pointers are used only by local native fixtures.
+    """
+    if sys.platform != 'darwin':
+        return {'proxy': '', 'source': 'direct'}
+    owned = []
+    cf = net = None
+    try:
+        cf = ctypes.CDLL(ctypes.util.find_library('CoreFoundation'))
+        net = ctypes.CDLL(ctypes.util.find_library('CFNetwork'))
+        ptr, index = ctypes.c_void_p, ctypes.c_long
+        def bind(lib, name, args, result):
+            function = getattr(lib, name); function.argtypes = args; function.restype = result
+            return function
+        string_new = bind(cf, 'CFStringCreateWithCString', [ptr, ctypes.c_char_p, ctypes.c_uint32], ptr)
+        string_get = bind(cf, 'CFStringGetCString', [ptr, ctypes.c_char_p, index, ctypes.c_uint32], ctypes.c_bool)
+        url_new = bind(cf, 'CFURLCreateWithString', [ptr, ptr, ptr], ptr)
+        array_count = bind(cf, 'CFArrayGetCount', [ptr], index)
+        array_get = bind(cf, 'CFArrayGetValueAtIndex', [ptr, index], ptr)
+        dictionary_get = bind(cf, 'CFDictionaryGetValue', [ptr, ptr], ptr)
+        equal = bind(cf, 'CFEqual', [ptr, ptr], ctypes.c_bool)
+        number_get = bind(cf, 'CFNumberGetValue', [ptr, ctypes.c_int, ptr], ctypes.c_bool)
+        release = bind(cf, 'CFRelease', [ptr], None)
+        def constant(name):
+            return ctypes.c_void_p.in_dll(net if name.startswith('kCFProxy') else cf, name).value
+        def string(value):
+            if not value: return ''
+            buffer = ctypes.create_string_buffer(8193)
+            if not string_get(value, buffer, len(buffer), 0x08000100): raise ValueError()
+            return buffer.value.decode('utf-8')
+        target_string = string_new(None, url.encode('utf-8'), 0x08000100); owned.append(target_string)
+        target = url_new(None, target_string, None); owned.append(target)
+        if not target: raise ValueError()
+        if settings is None:
+            copied = bind(net, 'CFNetworkCopySystemProxySettings', [], ptr)()
+            if not copied: raise ValueError()
+            owned.append(copied); settings = copied
+        def entries(array):
+            if not array or not 1 <= array_count(array) <= 64: raise ValueError()
+            answer = []
+            for i in range(array_count(array)):
+                item = array_get(array, i)
+                kind = dictionary_get(item, constant('kCFProxyTypeKey'))
+                if not kind: raise ValueError()
+                if equal(kind, constant('kCFProxyTypeNone')):
+                    answer.append({'proxy': '', 'source': 'system'})
+                elif equal(kind, constant('kCFProxyTypeAutoConfigurationURL')):
+                    answer.append({'auto_url': dictionary_get(item, constant('kCFProxyAutoConfigurationURLKey'))})
+                elif equal(kind, constant('kCFProxyTypeAutoConfigurationJavaScript')):
+                    answer.append({'auto_script': dictionary_get(item, constant('kCFProxyAutoConfigurationJavaScriptKey'))})
+                else:
+                    is_socks = equal(kind, constant('kCFProxyTypeSOCKS'))
+                    if not is_socks and not any(equal(kind, constant(name)) for name in ('kCFProxyTypeHTTP', 'kCFProxyTypeHTTPS')):
+                        raise ValueError()
+                    host = string(dictionary_get(item, constant('kCFProxyHostNameKey')))
+                    port_value = dictionary_get(item, constant('kCFProxyPortNumberKey')); port = ctypes.c_longlong()
+                    if not host or not port_value or not number_get(port_value, 4, ctypes.byref(port)) or not 1 <= port.value <= 65535:
+                        raise ValueError()
+                    username = string(dictionary_get(item, constant('kCFProxyUsernameKey')))
+                    password = string(dictionary_get(item, constant('kCFProxyPasswordKey')))
+                    auth = urllib.parse.quote(username, safe='') + ':' + urllib.parse.quote(password, safe='') + '@' if username or password else ''
+                    endpoint = '[' + host + ']' if ':' in host else host
+                    scheme = 'socks5h' if is_socks else 'http'
+                    answer.append({'proxy': _proxy_url(f'{scheme}://{auth}{endpoint}:{port.value}'), 'source': 'system'})
+            return answer
+        if script is None:
+            array = bind(net, 'CFNetworkCopyProxiesForURL', [ptr, ptr], ptr)(target, settings)
+            if not array: raise ValueError()
+            owned.append(array); first = entries(array)[0]
+        else:
+            first = {'auto_script': script}
+        if 'auto_url' not in first and 'auto_script' not in first:
+            return first
+        completed = []
+        callback_type = ctypes.CFUNCTYPE(None, ptr, ptr, ptr)
+        def finished(context, array, error):
+            try:
+                completed.append(entries(array) if not error else None)
+            except (ValueError, TypeError, TestError):
+                completed.append(None)
+        callback = callback_type(finished)
+        class Context(ctypes.Structure):
+            _fields_ = [('version', index), ('info', ptr), ('retain', ptr), ('release', ptr), ('description', ptr)]
+        context = Context(0, None, None, None, None)
+        function = 'CFNetworkExecuteProxyAutoConfigurationURL' if 'auto_url' in first else 'CFNetworkExecuteProxyAutoConfigurationScript'
+        source_value = first.get('auto_url') or first.get('auto_script')
+        if not source_value: raise ValueError()
+        source = bind(net, function, [ptr, ptr, callback_type, ctypes.POINTER(Context)], ptr)(source_value, target, callback, ctypes.byref(context))
+        if not source: raise ValueError()
+        owned.append(source)
+        loop = bind(cf, 'CFRunLoopGetCurrent', [], ptr)()
+        mode = ctypes.c_void_p.in_dll(cf, 'kCFRunLoopDefaultMode').value
+        add = bind(cf, 'CFRunLoopAddSource', [ptr, ptr, ptr], None)
+        remove = bind(cf, 'CFRunLoopRemoveSource', [ptr, ptr, ptr], None)
+        invalidate = bind(cf, 'CFRunLoopSourceInvalidate', [ptr], None)
+        run = bind(cf, 'CFRunLoopRunInMode', [ptr, ctypes.c_double, ctypes.c_bool], ctypes.c_int32)
+        add(loop, source, mode)
+        try:
+            deadline = time.monotonic() + timeout
+            while not completed and time.monotonic() < deadline:
+                run(mode, min(.1, max(.001, deadline - time.monotonic())), True)
+        finally:
+            invalidate(source); remove(loop, source, mode)
+        if not completed or not completed[0]:
+            raise TestError('系统自动代理规则未能在时限内解析，请检查代理应用或 PAC 配置。未绕过代理执行。')
+        route = completed[0][0]
+        if 'proxy' not in route: raise ValueError()
+        return dict(route, source='pac')
+    except TestError:
+        raise
+    except (AttributeError, OSError, ValueError, TypeError, UnicodeError):
+        raise TestError('无法读取当前系统代理规则，未绕过配置执行检测。') from None
+    finally:
+        if cf:
+            for value in reversed(owned):
+                if value: cf.CFRelease(ctypes.c_void_p(value))
+
+
+def proxy_guard(url, *, runner=None, proxies=None):
+    """Select one configured route, without publishing its host or credentials."""
+    host = urllib.parse.urlsplit(url).hostname if isinstance(url, str) else None
+    if not host: raise TestError('检测网址无效。')
+    environment = urllib.request.getproxies_environment() if proxies is None else proxies
+    if _bypass(host, environment):
+        return {'proxy': '', 'source': 'bypass'}
+    chosen = environment.get('https') or environment.get('all') or environment.get('socks')
+    if chosen:
+        return {'proxy': _proxy_url(chosen), 'source': 'environment'}
+    if proxies is not None or sys.platform != 'darwin':
+        return {'proxy': '', 'source': 'direct'}
+    return _system_proxy(url)
+
+
+def route_label(route):
+    source = {'environment': '环境代理', 'system': '系统代理规则', 'pac': '系统自动代理规则（PAC）',
+              'bypass': 'NO_PROXY 规则直连', 'direct': '直连 / 系统网络隧道'}.get(route.get('source'), '当前网络')
+    scheme = urllib.parse.urlsplit(route.get('proxy', '')).scheme.upper()
+    if not scheme and route.get('source') in ('direct', 'system'):
+        return '未配置显式代理 · 沿用系统 / TUN 路由'
+    return source + (' · ' + scheme if scheme else ' · DIRECT')
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -168,8 +306,124 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # A response already proves reachability; do not visit another host.
 
 
+def _curl_quote(value):
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t') + '"'
+
+
+def _bounded_capture(args, *, input, timeout, env, limit):
+    """Read both pipes with fixed caps; stop the transfer before allocating more."""
+    process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    selector = selectors.DefaultSelector()
+    output, errors = bytearray(), bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        process.stdin.write(input); process.stdin.close()
+        for pipe, target, cap in ((process.stdout, output, limit), (process.stderr, errors, 16384)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, (target, cap))
+        while selector.get_map():
+            left = deadline - time.monotonic()
+            if left <= 0: raise subprocess.TimeoutExpired(args, timeout)
+            for key, _ in selector.select(min(left, .1)):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj); continue
+                target, cap = key.data
+                if len(target) + len(chunk) > cap:
+                    process.kill(); process.wait(timeout=.5)
+                    return subprocess.CompletedProcess(args, -1000, stdout=bytes(output), stderr=b'')
+                target.extend(chunk)
+        process.wait(timeout=max(.001, deadline - time.monotonic()))
+        return subprocess.CompletedProcess(args, process.returncode, stdout=bytes(output), stderr=bytes(errors))
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+            try: process.wait(timeout=.5)
+            except subprocess.TimeoutExpired: pass
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe and not pipe.closed: pipe.close()
+
+
+def _curl_request(spec, route, *, runner=None):
+    """Credentials and POST data go through stdin, never command arguments."""
+    maximum, timeout = spec['max_bytes'], spec['timeout']
+    headers = ['User-Agent: ' + USER_AGENT, 'Accept: application/json',
+               'Accept-Encoding: ' + ('identity' if spec.get('count_only') is True else 'gzip')]
+    if spec.get('etag'): headers.append('If-None-Match: ' + spec['etag'])
+    config = ['silent', 'show-error', 'include', 'suppress-connect-headers', 'globoff',
+              'proto = "=https"', 'proto-redir = "=https"', 'retry = 0',
+              'url = ' + _curl_quote(spec['url']), 'max-time = ' + str(timeout),
+              'connect-timeout = ' + str(min(8, timeout)),
+              'proxy = ' + _curl_quote(route.get('proxy', '')), 'noproxy = ""',
+              'write-out = "\\nVCGO_META:%{http_code}:%{time_total}"']
+    if spec['method'] == 'HEAD': config.append('head')
+    else:
+        config.append('request = ' + _curl_quote(spec['method']))
+        config.append('max-filesize = ' + str(maximum))
+    if spec.get('json_body') is not None:
+        config.append('data-binary = ' + _curl_quote(json.dumps(spec['json_body'], separators=(',', ':'), ensure_ascii=True)))
+        headers += ['Content-Type: application/json', 'Expect:']
+    config += ['header = ' + _curl_quote(value) for value in headers]
+    try:
+        env = {key: value for key, value in os.environ.items() if key in ('HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'PATH', 'TZ')}
+        arguments = ['/usr/bin/curl', '--disable', '--config', '-']
+        payload = ('\n'.join(config) + '\n').encode()
+        if runner is None:
+            process = _bounded_capture(arguments, input=payload, timeout=timeout + .3, env=env, limit=maximum + 131072)
+        else:
+            process = runner(arguments, input=payload, capture_output=True, timeout=timeout + .3, check=False, env=env)
+    except subprocess.TimeoutExpired:
+        return {'error': 'timeout'}
+    except OSError:
+        return {'error': 'transport_unavailable'}
+    if process.returncode:
+        mapping = {-1000: 'oversized', 5: 'proxy_dns', 6: 'dns', 7: 'proxy_connect' if route.get('proxy') else 'connect',
+                   28: 'timeout', 35: 'tls', 51: 'certificate', 60: 'certificate', 63: 'oversized',
+                   67: 'proxy_auth', 97: 'proxy_connect'}
+        if route.get('proxy') and re.search(rb'(?:response|HTTP/[^ ]+)\s+407\b', process.stderr or b''):
+            return {'error': 'proxy_auth'}
+        return {'error': mapping.get(process.returncode, 'proxy_network' if route.get('proxy') else 'network')}
+    raw = process.stdout
+    if not isinstance(raw, bytes) or len(raw) > maximum + 131072:
+        return {'error': 'oversized'}
+    payload, marker, meta = raw.rpartition(b'\nVCGO_META:')
+    if not marker: return {'error': 'invalid'}
+    try:
+        code, elapsed = meta.decode('ascii').strip().split(':')
+        status, elapsed = int(code), float(elapsed)
+        if not 100 <= status <= 599 or not math.isfinite(elapsed) or elapsed < 0: raise ValueError()
+        final_headers = {}
+        while payload.startswith(b'HTTP/'):
+            end = payload.find(b'\r\n\r\n')
+            if end < 0: return {'error': 'invalid'}
+            block, payload = payload[:end], payload[end + 4:]
+            if len(block) > 65536: return {'error': 'oversized'}
+            final_headers = {}
+            for line in block.split(b'\r\n')[1:]:
+                key, separator, value = line.partition(b':')
+                if separator: final_headers[key.decode('ascii').lower()] = value.strip().decode('latin-1')
+        if len(payload) > maximum: return {'error': 'oversized'}
+        encoding = '' if spec['method'] == 'HEAD' else final_headers.get('content-encoding', '').lower()
+        if spec.get('count_only') is True and encoding not in ('', 'identity'):
+            return {'error': 'encoded_speed_response'}
+        if encoding == 'gzip':
+            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            decoded = decoder.decompress(payload, maximum + 1)
+            if len(decoded) > maximum or decoder.unconsumed_tail or not decoder.eof: return {'error': 'oversized'}
+            payload = decoded
+        elif encoding not in ('', 'identity'):
+            return {'error': 'encoding'}
+        answer = {'status': status, 'etag': text(final_headers.get('etag'), 200),
+                  'bytes_received': len(payload), 'elapsed': max(.000001, elapsed)}
+        if spec.get('count_only') is not True: answer['body'] = base64.b64encode(payload).decode('ascii')
+        return answer
+    except (ValueError, TypeError, UnicodeError, zlib.error):
+        return {'error': 'invalid'}
+
+
 def _http_worker(spec):
-    """One request in this disposable process; parent enforces total wall time."""
+    """One bounded request using the proxy route selected by the parent."""
     url, method = spec.get('url'), spec.get('method', 'GET')
     if not isinstance(url, str) or len(url) > 2048 or method not in ('GET', 'HEAD', 'POST'):
         raise TestError('请求参数无效。')
@@ -177,69 +431,44 @@ def _http_worker(spec):
     if parsed.scheme != 'https' or parsed.username or parsed.password or parsed.port is not None or not parsed.hostname:
         raise TestError('只允许无账号信息的 HTTPS 检测请求。')
     maximum = spec.get('max_bytes', MAX_JSON)
-    if type(maximum) is not int or not 1 <= maximum <= MAX_DOWNLOAD:
-        raise TestError('检测响应上限无效。')
-    proxy_guard(url)
-    headers = {'User-Agent': USER_AGENT, 'Accept': 'application/json',
-               'Accept-Encoding': 'identity' if spec.get('count_only') is True else 'gzip'}
-    etag = text(spec.get('etag'), 200)
-    if etag:
-        headers['If-None-Match'] = etag
-    data = None
-    if spec.get('json_body') is not None:
-        data = json.dumps(spec['json_body'], separators=(',', ':')).encode()
-        if len(data) > MAX_INPUT:
-            raise TestError('检测参数过大。')
-        headers['Content-Type'] = 'application/json'
     timeout = finite(spec.get('timeout'), minimum=.05, maximum=35)
-    if timeout is None:
-        raise TestError('检测时限无效。')
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    started = time.monotonic()
-    try:
-        try:
-            response = urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout)
-        except urllib.error.HTTPError as error:
-            response = error
-        with response:
-            status = response.status
-            raw = response.read(maximum + 1)
-            if len(raw) > maximum:
-                return {'error': 'oversized'}
-            encoding = response.headers.get('Content-Encoding', '').lower()
-            if spec.get('count_only') is True and encoding not in ('', 'identity'):
-                return {'error': 'encoded_speed_response'}
-            if encoding == 'gzip':
-                decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                decoded = decoder.decompress(raw, maximum + 1)
-                if len(decoded) > maximum or decoder.unconsumed_tail or not decoder.eof:
-                    return {'error': 'oversized'}
-                raw = decoded
-            elapsed = max(.000001, time.monotonic() - started)
-            answer = {'status': status, 'etag': text(response.headers.get('ETag'), 200),
-                      'bytes_received': len(raw), 'elapsed': elapsed}
-            if spec.get('count_only') is not True:
-                answer['body'] = base64.b64encode(raw).decode('ascii')
-            return answer
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError, zlib.error, ssl.SSLError):
-        return {'error': 'network'}
+    if type(maximum) is not int or not 1 <= maximum <= MAX_DOWNLOAD or timeout is None:
+        raise TestError('检测响应上限或时限无效。')
+    if spec.get('json_body') is not None and len(json.dumps(spec['json_body']).encode()) > MAX_INPUT:
+        raise TestError('检测参数过大。')
+    etag = spec.get('etag')
+    if etag is not None and (not isinstance(etag, str) or len(etag) > 200 or any(ord(c) < 32 for c in etag)):
+        raise TestError('检测缓存标识无效。')
+    route = spec.get('route') or proxy_guard(url)
+    if not isinstance(route, dict) or route.get('source') not in ('environment', 'system', 'pac', 'bypass', 'direct'):
+        raise TestError('检测代理路径无效。')
+    if route.get('proxy'): route = dict(route, proxy=_proxy_url(route['proxy']))
+    return _curl_request(dict(spec, method=method, max_bytes=maximum, timeout=timeout), route)
 
 
 class HTTPClient:
     def __init__(self, *, clock=time.monotonic, sleep=time.sleep, runner=subprocess.run, proxy_check=proxy_guard):
         self.clock, self.sleep, self.runner, self.proxy_check = clock, sleep, runner, proxy_check
+        self.routes = {}
+        self.route_reports = []
 
     def ensure_route(self, url):
-        self.proxy_check(url)
+        if url not in self.routes:
+            route = self.proxy_check(url)
+            self.routes[url] = route
+            if isinstance(route, dict):
+                label = route_label(route)
+                if label not in self.route_reports: self.route_reports.append(label)
+        return self.routes[url]
 
     def request(self, url, *, deadline, method='GET', json_body=None, max_bytes=MAX_JSON, etag=None, count_only=False, rate_limit=True):
-        self.ensure_route(url)
+        route = self.ensure_route(url)
         left = deadline - self.clock()
         if left <= .05:
             raise TestError('检测已超时，请稍后重试。')
-        seconds = min(12 if count_only else 8, left)
+        seconds = min(12 if count_only else 20, left)
         spec = {'url': url, 'method': method, 'json_body': json_body, 'max_bytes': max_bytes,
-                'etag': etag, 'count_only': count_only, 'timeout': seconds}
+                'etag': etag, 'count_only': count_only, 'timeout': max(.05, seconds - .5), 'route': route}
         try:
             worker = self.runner([sys.executable, '-m', 'vibecue.network_tests', '_fetch'],
                                  input=json.dumps(spec).encode(), capture_output=True,
@@ -250,11 +479,25 @@ class HTTPClient:
             value = json.loads(worker.stdout)
         except (ValueError, TypeError):
             raise TestError('检测来源返回了无法识别的数据。') from None
+        errors = {'proxy_dns': '代理服务器地址未能解析，请检查代理配置。',
+                  'proxy_connect': '无法连接当前代理，或代理握手失败；未改走直连。',
+                  'proxy_network': '当前代理链路未完成请求；未改走直连。',
+                  'proxy_auth': '代理要求有效认证，请在原代理工具中核对。',
+                  'dns': '当前网络路径未能解析检测服务域名。',
+                  'connect': '检测服务连接未建立，请检查当前网络或隧道。',
+                  'timeout': '当前网络或代理路径超时，请稍后重试。',
+                  'certificate': 'HTTPS 证书校验失败；未关闭安全校验，请检查代理证书与系统信任。',
+                  'tls': 'HTTPS / TLS 握手失败，请检查代理或服务链路。',
+                  'oversized': '检测来源响应超过上限，未读取过大的数据。',
+                  'encoded_speed_response': '测速响应经过压缩，未生成不准确的速度值。',
+                  'transport_unavailable': '系统网络传输工具暂不可用。'}
         if worker.returncode or not isinstance(value, dict) or value.get('error'):
-            raise TestError('检测来源响应过大或连接不可用。')
+            raise TestError(errors.get(value.get('error') if isinstance(value, dict) else '', '检测来源返回的数据无效或连接未完成。'))
         status = value.get('status')
         if type(status) is not int or not 100 <= status <= 599:
             raise TestError('检测来源没有返回有效状态。')
+        if status == 407:
+            raise TestError('代理要求有效认证，请在原代理工具中核对。')
         if status == 429 and rate_limit:
             raise RateLimited('检测来源已达到请求限额，请稍后重试。')
         try:
@@ -352,27 +595,57 @@ def resolve(host, runner=None):
         raise TestError('本机 DNS 未取得有效地址。') from None
 
 
+def tunnel_route(address, runner=None):
+    """Recognize benchmark fake-IP only when its actual local route is a tunnel."""
+    if sys.platform != 'darwin': return False
+    runner = runner or subprocess.run
+    try:
+        value = runner(['/sbin/route', '-n', 'get', address], capture_output=True, timeout=2, check=False)
+        output = value.stdout.decode('utf-8', errors='replace') if isinstance(value.stdout, bytes) else value.stdout
+        return value.returncode == 0 and isinstance(output, str) and len(output) <= 65536 and re.search(r'^\s*interface:\s*(?:utun|tun|tap)[0-9]+\s*$', output, flags=re.M) is not None
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def domain_test(params, client):
     host = target_host(params.get('target'))
     deadline = client.clock() + 15
     host_url = '[' + host + ']' if ':' in host else host
     if hasattr(client, 'ensure_route'):
         client.ensure_route('https://' + host_url + '/')
+    route = client.ensure_route('https://' + host_url + '/') if hasattr(client, 'ensure_route') else None
+    remote_dns = isinstance(route, dict) and urllib.parse.urlsplit(route.get('proxy', '')).scheme in ('http', 'https', 'socks4a', 'socks5h')
+    dns_unknown = False
     try:
         addresses = resolve(host)
     except TestError:
-        return result('domain', 'partial', '本机 DNS 未解析成功；不能据此判定全网或某地区封禁。', [row('目标', host), row('本机 DNS', '未确认')], notes=['此项仅检测本机当前网络。区域差异请使用全球 HTTP 检测。'])
-    rows = [row('目标', host), row('本机 DNS', '解析成功'), row('解析地址', '、'.join(addresses), '系统 DNS 的当前结果，不证明 DNS 未被干预。')]
-    # A public hostname resolving locally must not cause a private-network probe.
-    if any(not ipaddress.ip_address(address).is_global or ipaddress.ip_address(address).is_multicast for address in addresses):
+        addresses = []; dns_unknown = True
+        if not remote_dns:
+            return result('domain', 'partial', '本机 DNS 未解析成功；不能据此判定全网或某地区封禁。', [row('目标', host), row('本机 DNS', '未确认')], notes=['此项仅检测本机当前网络。区域差异请使用全球 HTTP 检测。'])
+    rows = [row('目标', host), row('本机 DNS', '未确认，继续核对代理端 HTTPS' if dns_unknown else '解析成功')]
+    if addresses: rows.append(row('解析地址', '、'.join(addresses), '系统 DNS 的当前结果，不证明 DNS 未被干预。'))
+    blocked = [address for address in addresses if not ipaddress.ip_address(address).is_global or ipaddress.ip_address(address).is_multicast]
+    fake_network = ipaddress.ip_network('198.18.0.0/15')
+    fake_answers = blocked and all(ipaddress.ip_address(address) in fake_network for address in blocked)
+    through_tunnel = fake_answers and not remote_dns and tunnel_route(blocked[0])
+    fake_only = fake_answers and (remote_dns or through_tunnel)
+    if blocked and not remote_dns and not fake_only:
         return result('domain', 'partial', '域名解析到非公网地址，未发起外部 HTTP 检测。', rows,
                       notes=['请在本机开发工具中检查内网服务；区域检测仅支持公网目标。'])
+    if blocked and remote_dns:
+        rows.append(row('代理 DNS 路径', '本机 DNS 返回非公网记录；由所选代理解析原域名', '只向代理提交已校验的公开域名，不把本机私网解析地址当作 HTTPS 目标。'))
+    elif fake_only:
+        if remote_dns:
+            rows.append(row('代理 DNS 路径', '本机返回测试网段地址；通过代理端解析原域名', '仅向配置中的代理提交原始公网域名，不直接连接测试网段地址。'))
+        else:
+            rows.append(row('TUN DNS 路径', '测试网段地址由系统网络隧道路由接管', '使用原域名验证 HTTPS 证书；不会把 TUN fake-IP 误判为域名被封禁。'))
     host_url = '[' + host + ']' if ':' in host else host
     try:
         response = client.request('https://' + host_url + '/', deadline=deadline, method='HEAD', max_bytes=4096, rate_limit=False)
         code = response['status']
         rows.extend([row('HTTPS / TLS', '已建立可验证的 HTTPS 响应'), row('HTTP 状态', str(code), '403/404 等表示已到达服务；重定向不继续访问其他站点。')])
-        return result('domain', 'ok', '本机可以到达该 HTTPS 服务；不能代表所有国家、地区或账号都可访问。', rows,
+        summary = '代理路径已取得 HTTPS 响应；本机 DNS 仍未确认。' if dns_unknown else '代理路径已到达该 HTTPS 服务；本机解析地址未用作连接目标。' if blocked and remote_dns else '本机可以到达该 HTTPS 服务；不能代表所有国家、地区或账号都可访问。'
+        return result('domain', 'partial' if dns_unknown else 'ok', summary, rows,
                       notes=['服务可能按地区、账号或请求方式限制访问。要对比不同地区，请运行全球 HTTP 检测。'])
     except TestError as error:
         rows.append(row('HTTPS / TLS', '未确认', str(error)))
@@ -574,18 +847,23 @@ def run(params, client=None):
     client = client or HTTPClient()
     try:
         if kind == 'ip_reputation':
-            return ip_reputation(params, client)
-        if kind == 'domain':
-            return domain_test(params, client)
-        if kind == 'ip_trace':
-            return ip_trace(params, client)
-        if kind in ('global_ping', 'global_http'):
-            return global_test(params, client, kind)
-        return speed_test(params, client)
+            answer = ip_reputation(params, client)
+        elif kind == 'domain':
+            answer = domain_test(params, client)
+        elif kind == 'ip_trace':
+            answer = ip_trace(params, client)
+        elif kind in ('global_ping', 'global_http'):
+            answer = global_test(params, client, kind)
+        else:
+            answer = speed_test(params, client)
     except TestError as error:
-        return result(kind, 'error', str(error), notes=['未取得有效结果时不会显示“纯净”“未封禁”或虚构速度。'])
+        answer = result(kind, 'error', str(error), notes=['未取得有效结果时不会显示“纯净”“未封禁”或虚构速度。'])
     except (OSError, ValueError, TypeError, OverflowError):
-        return result(kind, 'error', '检测未完成，未使用不完整数据生成结论。')
+        answer = result(kind, 'error', '检测未完成，未使用不完整数据生成结论。')
+
+    reports = getattr(client, 'route_reports', [])
+    if reports: answer['rows'].insert(0, row('连接路径', '；'.join(reports), '按当前配置执行；不会因代理失败自动改走直连。'))
+    return answer
 
 
 def main(argv=None):

@@ -271,7 +271,12 @@ class RunningTaskTests(unittest.TestCase):
         return watcher
 
     def status(self, watcher, approvals=None):
-        with patch('vibecue.providers.codex.approval_status', return_value=approvals or {'connected': False}):
+        # This fixture exercises transcript readability and manual waits. Real
+        # desktop owner churn belongs to test_task_recovery's explicit snapshots.
+        # Reading this Mac's live process list makes recovery nondeterministic.
+        runtime = {'available': False, 'observed_at': self.now, 'desktop': [], 'cli': []}
+        with patch('vibecue.providers.codex.approval_status', return_value=approvals or {'connected': False}), \
+                patch('vibecue.providers.codex.codex_process_snapshot', return_value=runtime):
             watcher.write_status()
         return json.loads((watcher.vibecue_home / 'watcher-state.json').read_text())
 

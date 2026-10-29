@@ -214,8 +214,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit { timer?.invalidate(); saveWork?.cancel(); stopLifecycleObservers() }
 
-    /// The main shell owns presentation; this window remains only for old
-    /// callers and fixture captures. Moving the root never displays a new window.
+    /// Retained for old embedded callers and migration fixtures. Normal task
+    /// navigation always presents this controller's independent chat window.
     func embeddedContentView() -> NSView {
         if !embedded {
             embedded = true; remembersWindowGeometry = false
@@ -253,8 +253,25 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         return true
     }
 
+    /// Safely recover a controller previously hosted inside the workbench.
+    /// Keep the same editor, transcript, send receipt and operation ownership.
+    @discardableResult private func prepareStandalonePresentation() -> Bool {
+        guard embedded else { return true }
+        presentationWindow?.makeFirstResponder(nil)
+        guard saveDraft(), setEmbeddedVisible(false), let window else { return false }
+        if let previousHost = root.window, previousHost !== window, previousHost.contentView === root {
+            previousHost.contentView = NSView(frame: root.frame)
+        }
+        root.removeFromSuperview()
+        embedded = false; embeddedVisible = false; onEmbeddedDismiss = nil
+        remembersWindowGeometry = false
+        window.contentView = root
+        root.autoresizingMask = [.width, .height]
+        layout()
+        return true
+    }
     override func showWindow(_ sender: Any?) {
-        if embedded { _ = setEmbeddedVisible(true); return }
+        guard prepareStandalonePresentation() else { return }
         remembersWindowGeometry = false
         if !fixtureMode, window?.isVisible != true { restoreWindowGeometry() }
         super.showWindow(sender); handled = false; window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
@@ -780,6 +797,15 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         failingEmbedded.fixtureMode = true; _ = failingEmbedded.embeddedContentView(); _ = failingEmbedded.setEmbeddedVisible(true)
         failingEmbedded.composer.string = "尚未写入磁盘的编辑"
         results["embedded_draft_save_failure_blocks_switching_away"] = !failingEmbedded.setEmbeddedVisible(false) && failingEmbedded.isEmbeddedActive && failingEmbedded.composer.string == "尚未写入磁盘的编辑"
+        results["standalone_migration_preserves_editor_on_draft_failure"] = !failingEmbedded.prepareStandalonePresentation() && failingEmbedded.isEmbeddedActive && failingEmbedded.composer.string == "尚未写入磁盘的编辑"
+        _ = embeddedViewer.setEmbeddedVisible(true)
+        embeddedViewer.composer.string = "独立对话继续草稿"; embeddedViewer.note.string = "下一次继续"
+        embeddedViewer.pendingRequestID = "migration-pending"; embeddedViewer.sending = true
+        let moved = embeddedViewer.prepareStandalonePresentation()
+        let migrationDraft = CueConversationDrafts(home: geometryHome).values(embeddedEvent.threadID)
+        results["standalone_migration_reuses_chat_canvas_without_module_controls"] = moved && !embeddedViewer.isEmbeddedActive && embeddedViewer.presentationWindow === embeddedViewer.window && embeddedViewer.window?.contentView === embeddedRoot && embeddedRoot.window === embeddedViewer.window && shell.contentView !== embeddedRoot && embeddedViewer.onEmbeddedDismiss == nil
+        results["standalone_migration_preserves_draft_note_and_inflight_receipt"] = embeddedViewer.composer.string == "独立对话继续草稿" && embeddedViewer.note.string == "下一次继续" && embeddedViewer.hasInFlightOperation && embeddedViewer.pendingRequestID == "migration-pending" && migrationDraft["draft"] == "独立对话继续草稿" && migrationDraft["note"] == "下一次继续" && migrationDraft["pending_request_id"] == "migration-pending"
+        embeddedViewer.sending = false
         return results
     }
 

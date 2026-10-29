@@ -131,6 +131,71 @@ class CCUsageInteropTests(unittest.TestCase):
         bridge.sync(self.conn,self.source)
         self.assertEqual(self.logs()[0]['duration_ms'],2000)
 
+    def test_isolated_ledger_never_defaults_to_real_cc_database(self):
+        opened = []
+        original = sqlite3.connect
+        def guarded(path, *args, **kwargs):
+            opened.append(str(path))
+            self.assertNotIn(str(Path.home() / '.cc-switch'), str(path))
+            return original(path, *args, **kwargs)
+        with patch.object(bridge.sqlite3, 'connect', side_effect=guarded):
+            report = bridge.sync(self.conn)
+        self.assertFalse(report['available'])
+        self.assertTrue(opened)
+        self.assertIn('cc-switch-usage.sqlite3', opened[0])
+
+    def test_unchanged_source_and_native_reuse_snapshot_without_full_matching(self):
+        self.native(); self.cc(); bridge.sync(self.conn, self.source)
+        statements = []; self.conn.set_trace_callback(statements.append)
+        with patch.object(bridge, 'normalized', side_effect=AssertionError('numeric source reread')):
+            result = bridge.sync(self.conn, self.source, native_unchanged=True)
+        self.conn.set_trace_callback(None)
+        self.assertTrue(result['reused_snapshot'])
+        self.assertEqual((result['scanned'], result['imported'], result['matched']), (0, 0, 1))
+        self.assertFalse(any('FROM usage_requests' in sql or 'FROM usage_cc_metrics' in sql for sql in statements))
+
+    def test_source_wal_change_invalidates_unchanged_snapshot(self):
+        self.native(); self.cc()
+        source = sqlite3.connect(self.source)
+        self.addCleanup(source.close)
+        source.execute('PRAGMA journal_mode=WAL')
+        bridge.sync(self.conn, self.source)
+        before = self.source.stat().st_mtime_ns
+        source.execute('UPDATE proxy_request_logs SET output_tokens=301')
+        source.commit()
+        self.assertEqual(self.source.stat().st_mtime_ns, before)
+        result = bridge.sync(self.conn, self.source, native_unchanged=True)
+        self.assertFalse(result.get('reused_snapshot', False))
+        self.assertGreater(result['scanned'], 0)
+        self.assertNotIn('duration_ms', self.logs()[0])
+
+    def test_changed_native_hint_rechecks_and_revokes_prior_match(self):
+        self.native(); self.cc(); bridge.sync(self.conn, self.source)
+        self.conn.execute("UPDATE usage_requests SET output_tokens=301,total_tokens=1301 WHERE id='native-one'")
+        self.conn.commit()
+        result = bridge.sync(self.conn, self.source, native_unchanged=False)
+        self.assertFalse(result.get('reused_snapshot', False))
+        self.assertNotIn('duration_ms', self.logs()[0])
+
+    def test_pure_native_delete_invalidates_reuse_even_without_import_counters(self):
+        self.native(); self.cc(); bridge.sync(self.conn, self.source)
+        usage.track_native_mutations(self.conn)
+        self.conn.execute("DELETE FROM usage_requests WHERE id='native-one'"); self.conn.commit()
+        unchanged = not self.conn.execute('SELECT changed FROM usage_native_mutations').fetchone()[0]
+        result = bridge.sync(self.conn, self.source, native_unchanged=unchanged)
+        self.assertFalse(result.get('reused_snapshot', False))
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM usage_request_details').fetchone()[0], 0)
+
+    def test_capped_bridge_import_never_caches_incomplete_source(self):
+        self.cc(request_id='one'); self.cc(request_id='two')
+        with patch.object(bridge, 'MAX_ROWS', 1):
+            first = bridge.sync(self.conn, self.source)
+        self.assertGreater(first['scanned'], 1)
+        self.assertIsNone(self.conn.execute("SELECT value FROM usage_cc_import_state WHERE key='unchanged_snapshot_v1'").fetchone())
+        second = bridge.sync(self.conn, self.source, native_unchanged=True)
+        self.assertFalse(second.get('reused_snapshot', False))
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM usage_cc_metrics').fetchone()[0], 2)
+
     def gemini_session(self, **updates):
         values=dict(request_id='gemini-session',app_type='gemini',data_source='gemini_session',provider_id='_gemini_session')
         values.update(updates);self.cc(**values)

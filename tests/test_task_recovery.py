@@ -189,6 +189,17 @@ class RecoveryTests(unittest.TestCase):
         with patch('vibecue.providers.task_recovery.subprocess.run', side_effect=PermissionError()):
             self.assertFalse(codex_process_snapshot()['available'])
 
+    def test_code_mode_helper_does_not_change_task_owner_snapshot(self):
+        owner = '123 Tue Oct 27 01:02:03 2026 /Applications/Codex.app/Contents/Resources/codex\n'
+        helper = '456 Tue Oct 27 01:02:03 2026 /Applications/Codex.app/Contents/Resources/codex-code-mode-host\n'
+        with patch('vibecue.providers.task_recovery.subprocess.run', return_value=subprocess.CompletedProcess([], 0, owner, '')):
+            before = codex_process_snapshot(200)
+        with patch('vibecue.providers.task_recovery.subprocess.run', return_value=subprocess.CompletedProcess([], 0, owner + helper, '')):
+            after = codex_process_snapshot(200)
+        self.assertEqual(before, after)
+        self.assertEqual(len(after['desktop']), 1)
+        self.assertEqual(after['cli'], [])
+
     def test_watcher_reopens_retained_path_outside_recent_metadata(self):
         path = self.home / 'retained.jsonl'; now = time.time()
         def event(kind, timestamp):

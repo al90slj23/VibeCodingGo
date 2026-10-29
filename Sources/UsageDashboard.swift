@@ -218,6 +218,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var hostObservers: [NSObjectProtocol] = []
     private var presentationWindow: NSWindow? { surface.window ?? (isEmbedded ? nil : window) }
     private let client: CueUsageClient
+    private let statusClient: CueUsageClient
     private let surface = CueUsageSurface()
     private let titleLabel = NSTextField(labelWithString: "用量统计")
     private let subtitle = NSTextField(labelWithString: "本机历史与 CC Switch 数值记录")
@@ -256,6 +257,8 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var pageSize = 50
     private var queryID = 0
     private var queryInFlight = false
+    private var statusInFlight = false
+    private var statusRetryAfter: Date?
     private var queryPending = false
     private var syncing = false
     private var backendRunning = false
@@ -273,6 +276,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var pricingRetryAfter: Date?
     private var lastSync = Date.distantPast
     private var syncError = ""
+    private var progressError = ""
     private var queryError = ""
     private var warnings: [String] = []
     private var preferencesController: CueUsagePreferencesController?
@@ -289,7 +293,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
 
     init(home: URL, useSavedColumns: Bool = true) {
         self.useSavedColumns = useSavedColumns
-        self.home = home; client = CueUsageClient(home: home); schedule = CueUsageSchedulePreferences(home: home)
+        self.home = home; client = CueUsageClient(home: home); statusClient = CueUsageClient(home: home); schedule = CueUsageSchedulePreferences(home: home)
         if useSavedColumns { columnOverrides = UserDefaults.standard.dictionary(forKey: "VibeCueUsageLogColumns") as? [String: Bool] ?? [:] }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 850), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "VibeCoding Go · 用量统计"; window.isReleasedWhenClosed = false
@@ -433,9 +437,10 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         // A separate process can already own the import lock. Poll its numeric
         // status without rapidly retrying the expensive history scan.
         let fire = (syncing || backendRunning) ? Date().addingTimeInterval(max(5, min(schedule.displayInterval, schedule.syncInterval))) : max(Date().addingTimeInterval(0.2), due)
-        let timer = Timer(fire: fire, interval: 0, repeats: false) { [weak self] _ in
+        let nextFire = statusRetryAfter.map { max(fire, $0) } ?? fire
+        let timer = Timer(fire: nextFire, interval: 0, repeats: false) { [weak self] _ in
             guard let self else { return }; self.backgroundTimer = nil
-            if self.syncing || self.backendRunning { self.query() }
+            if self.syncing || self.backendRunning { self.pollSyncStatus() }
             else { self.synchronize() }
             self.configureBackgroundTimer()
         }
@@ -446,13 +451,13 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         initialAutomaticCheck = true
         // Read the persisted ledger timestamp before deciding whether a scan is
         // due, so restarting the app respects the selected history interval.
-        query(); refreshPricing()
+        pollSyncStatus(); refreshPricing()
     }
     func stopBackgroundSync() {
         stopped = true; backgroundStarted = false
         heatmap.hidePreview()
         backgroundTimer?.invalidate(); backgroundTimer = nil; visibleTimer?.invalidate(); visibleTimer = nil
-        pricingTimer?.invalidate(); pricingTimer = nil; client.stop()
+        pricingTimer?.invalidate(); pricingTimer = nil; client.stop(); statusClient.stop()
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if sender === detailController?.window, sender.sheetParent != nil { closeDetails(); return false }
@@ -526,6 +531,25 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         scheduled.configureBackgroundTimer()
         report["usage_schedule_manual_toggle_cancels_existing_timer"] = scheduled.backgroundTimer == nil
         scheduled.backgroundStarted = false
+        let progressOnly = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
+        progressOnly.syncing = true; progressOnly.statusInFlight = true
+        progressOnly.query()
+        report["usage_running_import_refresh_coalesces_into_status_instead_of_full_query"] = !progressOnly.queryInFlight && !progressOnly.queryPending && progressOnly.statusInFlight
+        progressOnly.applySyncStatus(["sync": ["running": true, "files_scanned": 2, "files_total": 10]])
+        report["usage_status_poll_updates_progress_without_aggregating"] = progressOnly.backendRunning && (progressOnly.syncMetadata["files_scanned"] as? Int) == 2 && !progressOnly.queryInFlight
+        progressOnly.syncing = false
+        progressOnly.applySyncStatus(["sync": ["running": false, "last_synced_at": Date().timeIntervalSince1970]])
+        report["usage_completed_import_does_not_query_hidden_dashboard"] = !progressOnly.backendRunning && !progressOnly.queryInFlight && !progressOnly.queryPending
+        progressOnly.backgroundStarted = true; progressOnly.lastSync = .distantPast; progressOnly.lastSyncAttempt = nil
+        progressOnly.schedule = CueUsageSchedulePreferences(syncInterval: 300, displayInterval: 17)
+        progressOnly.applySyncStatus(["available": false, "sync": ["running": false, "errors": ["进度暂不可读"]]])
+        progressOnly.configureBackgroundTimer()
+        report["usage_unreadable_progress_backs_off_without_tight_sync_retry"] = (progressOnly.backgroundTimer?.fireDate.timeIntervalSinceNow ?? 0) > 15 && (progressOnly.statusRetryAfter?.timeIntervalSinceNow ?? 0) > 15
+        progressOnly.backgroundTimer?.invalidate(); progressOnly.backgroundTimer = nil; progressOnly.backgroundStarted = false
+        progressOnly.progressError = "暂态进度读取失败"
+        progressOnly.applySyncStatus(["available": true, "sync": ["running": false]])
+        report["usage_recovered_status_clears_only_transient_progress_error"] = progressOnly.progressError.isEmpty && progressOnly.statusRetryAfter == nil
+        progressOnly.window?.orderOut(nil)
         let priced = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
         priced.backgroundStarted = true
         let dueMetadata: [String: Any] = ["pricing_next_refresh_at": Date().addingTimeInterval(-1).timeIntervalSince1970, "pricing_refresh_due": true]
@@ -724,10 +748,51 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
                 self.lastSync = Date(); self.readSync(data)
             case .failure(let error): self.syncError = error.localizedDescription
             }
-            self.updateStatus(); self.configureBackgroundTimer(); self.query(); self.usageDidChange?()
+            self.updateStatus(); self.configureBackgroundTimer(); if self.dashboardVisible { self.query() }; self.usageDidChange?()
+        }
+    }
+    private var dashboardVisible: Bool {
+        guard let host = presentationWindow else { return false }
+        return host.isVisible && !host.isMiniaturized && (!isEmbedded || embeddedVisible)
+    }
+    private func pollSyncStatus() {
+        guard !stopped, !statusInFlight else { return }
+        statusInFlight = true
+        statusClient.run(["sync-status"]) { [weak self] result in
+            guard let self else { return }; self.statusInFlight = false
+            guard !self.stopped else { return }
+            switch result {
+            case .success(let data): self.applySyncStatus(data)
+            case .failure(let error):
+                self.progressError = error.localizedDescription
+                self.statusRetryAfter = Date().addingTimeInterval(max(5, min(60, self.schedule.displayInterval)))
+                self.updateStatus()
+            }
+            if self.initialAutomaticCheck { self.initialAutomaticCheck = false }
+            self.configureBackgroundTimer()
+        }
+    }
+    private func applySyncStatus(_ data: [String: Any]) {
+        let wasRunning = backendRunning
+        if data["available"] as? Bool == false {
+            let sync = data["sync"] as? [String: Any] ?? [:]
+            warnings = sync["errors"] as? [String] ?? []
+            if !warnings.isEmpty { statusRetryAfter = Date().addingTimeInterval(max(5, min(60, schedule.displayInterval))) }
+            else { statusRetryAfter = nil }
+            updateStatus(); return
+        }
+        statusRetryAfter = nil; progressError = ""
+        readSync(data); updateStatus()
+        if wasRunning && !backendRunning && !syncing {
+            if dashboardVisible { query() }
+            usageDidChange?()
         }
     }
     private func query(invalidate: Bool = false, tableOnly: Bool = false) {
+        guard !stopped else { return }
+        // Automatic display refresh during import only needs progress. Keep a
+        // deliberate filter/page change responsive via the normal query path.
+        if !invalidate && (syncing || backendRunning) { pollSyncStatus(); return }
         if invalidate {
             queryID += 1
             // The old numbers describe the previous filter. Do not present
@@ -849,7 +914,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             default: syncLabel.stringValue = "正在读取本机历史，已有统计仍可查看"
             }
         } else { syncLabel.stringValue = lastSync == .distantPast ? "尚未同步" : "上次同步 \(formatter.string(from: lastSync))" }
-        let error = queryError.isEmpty ? syncError : queryError
+        let error = !queryError.isEmpty ? queryError : !syncError.isEmpty ? syncError : progressError
         if !error.isEmpty { status.stringValue = error; status.textColor = .systemRed; status.toolTip = error }
         else if rebuilding && busy { status.stringValue = "正在按分叉历史去重规则重建 Codex 用量，已导入部分仍可查看。"; status.textColor = .secondaryLabelColor; status.toolTip = syncMetadata["rebuild_reason"] as? String }
         else if !warnings.isEmpty { status.stringValue = "部分记录未导入 · \(warnings.count) 项，请查看数据说明"; status.textColor = .systemOrange; status.toolTip = warnings.joined(separator: "\n") }

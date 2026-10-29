@@ -729,13 +729,13 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         var components = URLComponents()
         components.scheme = "codex"; components.host = "threads"; components.path = "/" + event.threadID
         guard let url = components.url, openConversationURL(url) else { return false }
-        _ = recentHistory.markOpened(id: event.id, didOpen: true)
+        _ = recentHistory.markConversationOpened(event: event, didOpen: true)
         refreshMenu(); writeStatus()
         return true
     }
     @objc func openRecent(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String, let event = recent.first(where: { $0.id == id }) else { return }
-        showConversation(event: event)
+        guard let id = sender.representedObject as? String, let record = recentHistory.displayRecord(for: id) else { return }
+        showConversation(event: record.event)
     }
     @objc func openRunningRecent(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
@@ -771,11 +771,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             }
         }
         guard let controller = conversationWindows[event.threadID] else { return }
-        openSettings()
-        guard settingsPanel?.presentConversation(controller) == true else { return }
-        for (id, old) in conversationWindows where id != event.threadID && !old.isEmbeddedActive && !old.hasInFlightOperation {
-            conversationWindows.removeValue(forKey: id)?.stop()
-        }
+        // A task opens its own compact conversation window. Module navigation
+        // belongs to the workbench and must never surround an individual chat.
+        controller.showWindow(nil)
+        guard controller.window?.isVisible == true else { return }
         recentHistory.beginReview(event: event)
         refreshConversationHistory()
     }
@@ -1288,54 +1287,55 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 item.isEnabled = false; codingMenu.addItem(item)
             }
+            func countSuffix(_ id: String) -> String {
+                let count = recentHistory.notificationCount(threadID: id)
+                return count > 1 ? " · \(count) 次" : ""
+            }
             func reminder(_ record: CueRecentRecord) {
                 let event = record.event
                 let isRunning = runningTasks.contains { $0.threadID == event.threadID && event.provider == "codex" }
-                let title = "\(record.isOpened ? "↗" : "●") \(event.title.prefix(52))\(isRunning ? " · 运行中" : "")"
+                let title = "\(record.isOpened ? "↗" : "●") \(event.title.prefix(52))\(isRunning ? " · 运行中" : "")" + (record.notificationCount > 1 ? " · \(record.notificationCount) 次" : "")
                 let item = NSMenuItem(title: title, action: #selector(openRecent(_:)), keyEquivalent: "")
                 item.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: record.isOpened ? NSColor.secondaryLabelColor : NSColor.systemBlue, .font: NSFont.systemFont(ofSize: 13, weight: record.isOpened ? .regular : .semibold)])
                 item.target = self; item.representedObject = event.id; item.isEnabled = record.canOpen
                 item.toolTip = "\(event.label) · \(event.title)"; codingMenu.addItem(item)
             }
-            let pinned = recentHistory.records.filter(\.isPinned)
+            let snapshot = CueStatusListSnapshot(records: recentHistory.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: recentHistory.followups.records)
+            let pinned = snapshot.pinned
             if !pinned.isEmpty { heading("置顶提醒 · \(pinned.count) 条"); pinned.forEach(reminder) }
-            let alertPinnedThreads = Set(pinned.filter { $0.event.provider == "codex" }.map { $0.event.threadID })
-            let pinnedFollowups = recentHistory.followups.records.filter { $0.isPinned && !alertPinnedThreads.contains($0.threadID) }
+            let pinnedFollowups = snapshot.pinnedFollowups
             if !pinnedFollowups.isEmpty {
                 heading("置顶任务 · \(pinnedFollowups.count) 项")
                 for task in pinnedFollowups {
-                    let item = NSMenuItem(title: "\(task.unread ? "● " : "📌 ")\(task.title.prefix(52))", action: #selector(openFollowupRecent(_:)), keyEquivalent: "")
+                    let item = NSMenuItem(title: "\(task.unread ? "● " : "📌 ")\(task.title.prefix(52))" + countSuffix(task.threadID), action: #selector(openFollowupRecent(_:)), keyEquivalent: "")
                     item.target = self; item.representedObject = task.threadID; codingMenu.addItem(item)
                 }
             }
-            let pinnedThreads = alertPinnedThreads.union(pinnedFollowups.map(\.threadID))
-            let active = runningTasks.filter { !pinnedThreads.contains($0.threadID) }.sorted(by: CueRunningTask.titleAscending)
+            let active = snapshot.running
             if !active.isEmpty {
                 heading("正在运行 · \(active.count) 项")
                 for task in active {
-                    let item = NSMenuItem(title: "◉ \(task.title.prefix(52))", action: #selector(openRunningRecent(_:)), keyEquivalent: "")
+                    let item = NSMenuItem(title: "◉ \(task.title.prefix(52))" + countSuffix(task.threadID), action: #selector(openRunningRecent(_:)), keyEquivalent: "")
                     item.target = self; item.representedObject = task.threadID; codingMenu.addItem(item)
                 }
             }
-            let interrupted = interruptedTasks.filter { !pinnedThreads.contains($0.threadID) }
+            let interrupted = snapshot.interrupted
             if !interrupted.isEmpty {
                 heading("中断待续 · \(interrupted.count) 项")
                 for task in interrupted {
-                    let item = NSMenuItem(title: "⚠ \(task.title.prefix(52)) · \(task.recoveryLabel)", action: #selector(openRunningRecent(_:)), keyEquivalent: "")
+                    let item = NSMenuItem(title: "⚠ \(task.title.prefix(52)) · \(task.recoveryLabel)" + countSuffix(task.threadID), action: #selector(openRunningRecent(_:)), keyEquivalent: "")
                     item.target = self; item.representedObject = task.threadID; item.toolTip = task.recoveryReason; codingMenu.addItem(item)
                 }
             }
-            let activeIDs = Set((runningTasks + interruptedTasks).map(\.threadID))
-            let pending = recentHistory.followups.records.filter { !activeIDs.contains($0.threadID) && !pinnedThreads.contains($0.threadID) }
+            let pending = snapshot.followups
             if !pending.isEmpty {
                 heading("待续 · \(pending.count) 项")
                 for task in pending {
-                    let item = NSMenuItem(title: "🔖 \(task.title.prefix(52))", action: #selector(openFollowupRecent(_:)), keyEquivalent: "")
+                    let item = NSMenuItem(title: "🔖 \(task.title.prefix(52))" + countSuffix(task.threadID), action: #selector(openFollowupRecent(_:)), keyEquivalent: "")
                     item.target = self; item.representedObject = task.threadID; codingMenu.addItem(item)
                 }
             }
-            let pendingIDs = Set(recentHistory.followups.records.map(\.threadID))
-            let ordinary = recentHistory.records.filter { !$0.isPinned && !($0.event.provider == "codex" && (activeIDs.contains($0.event.threadID) || pendingIDs.contains($0.event.threadID))) }
+            let ordinary = snapshot.ordinary
             if !ordinary.isEmpty { heading("历史提醒 · \(ordinary.count) 条"); ordinary.forEach(reminder) }
         }
         for (title, submenu) in [("任务提醒", remindersMenu), ("编程助手", codingMenu), ("网络检测", testMenu)] {
@@ -1603,7 +1603,6 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     var preferencesController: CueUsagePreferencesController?
     var scheduleController: CueUsageScheduleController?
     var pricesController: CuePriceSourcesController?
-    var conversationController: CueConversationController?
     private var layingOut = false
     var healthLabel: NSTextField?
     var threadLabel: NSTextField?
@@ -1683,7 +1682,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     @objc func changeModule(_ sender: NSSegmentedControl) {
         guard CueWorkspacePage.moduleTitles.indices.contains(sender.selectedSegment) else { return }
         let name = CueWorkspacePage.moduleTitles[sender.selectedSegment]
-        let children = CueWorkspacePage.children(of: name, hasConversation: conversationController != nil)
+        let children = CueWorkspacePage.children(of: name)
         selectPage((moduleLastPage[name] ?? children[0]).rawValue)
     }
     @objc func changeSecondary(_ sender: NSSegmentedControl) {
@@ -1693,7 +1692,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     private func updateTags() {
         let route = CueWorkspacePage.canonical(page)
         primary.selectedSegment = CueWorkspacePage.moduleTitles.firstIndex(of: route.module) ?? -1
-        secondaryPages = CueWorkspacePage.children(of: route.module, hasConversation: conversationController != nil)
+        secondaryPages = CueWorkspacePage.children(of: route.module)
         secondary.segmentCount = secondaryPages.count
         for (index, child) in secondaryPages.enumerated() {
             secondary.setLabel(child.title, forSegment: index)
@@ -1706,23 +1705,12 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
     @discardableResult func selectPage(_ value: Int) -> Bool {
         let route = CueWorkspacePage.canonical(value)
-        if route == .conversation && conversationController == nil { return selectPage(CueWorkspacePage.codingTasks.rawValue) }
         if route.rawValue != page {
             window?.makeFirstResponder(nil)
             guard deactivateCurrentEmbedded() else { updateTags(); return false }
             page = route.rawValue
             if CueWorkspacePage.moduleTitles.contains(route.module) { moduleLastPage[route.module] = route }
         }
-        rebuild(); return true
-    }
-    @discardableResult func presentConversation(_ controller: CueConversationController) -> Bool {
-        window?.makeFirstResponder(nil)
-        guard deactivateCurrentEmbedded() else { return false }
-        conversationController = controller
-        controller.onEmbeddedDismiss = { [weak self] in self?.selectPage(CueWorkspacePage.codingTasks.rawValue) }
-        renderedPage = nil
-        page = CueWorkspacePage.conversation.rawValue
-        moduleLastPage["编程助手"] = .conversation
         rebuild(); return true
     }
     private func usageController() -> CueUsageDashboardController {
@@ -1733,7 +1721,6 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
     @discardableResult private func deactivateCurrentEmbedded() -> Bool {
         switch CueWorkspacePage.canonical(renderedPage ?? page) {
-        case .conversation: if conversationController?.setEmbeddedVisible(false) == false { return false }
         case .codingTasks: taskController?.setEmbeddedVisible(false)
         case .usage: cue.usageDashboard?.deactivateEmbedded()
         case .accountQuota: accountsController?.deactivateEmbedded()
@@ -1748,7 +1735,6 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     private func activateCurrentEmbedded() {
         guard window?.isVisible == true else { return }
         switch CueWorkspacePage.canonical(page) {
-        case .conversation: _ = conversationController?.setEmbeddedVisible(true)
         case .codingTasks: taskController?.setEmbeddedVisible(true)
         case .usage: cue.usageDashboard?.activateEmbedded()
         case .accountQuota: accountsController?.activateEmbedded()
@@ -1776,7 +1762,6 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .codingTasks:
             if taskController == nil { taskController = CueStatusPopoverController(history: cue.recentHistory, actions: cue.makeTaskActions(), embedded: true) }
             updateEmbeddedTasks(); return taskController?.view
-        case .conversation: return conversationController?.embeddedContentView()
         case .usage: return usageController().embeddedContentView()
         case .accountQuota:
             if accountsController == nil { accountsController = CueCCAccountsController(home: cue.home) }
@@ -1818,7 +1803,6 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         case .usageSchedule: minimum = NSSize(width: 620, height: 385); fixed = true
         case .accountQuota: minimum = NSSize(width: 640, height: 420)
         case .codingTasks: minimum = NSSize(width: 680, height: 430)
-        case .conversation: minimum = NSSize(width: 760, height: 590)
         default: if route.networkKind != nil { minimum = NSSize(width: 760, height: 430) }
         }
         let size = NSSize(width: max(minimum.width, pageScroll.contentSize.width), height: max(minimum.height, pageScroll.contentSize.height))
@@ -2489,9 +2473,9 @@ if CommandLine.arguments.contains("--recent-self-test") {
     }
     cue.enqueue(event("first")); cue.enqueue(event("second"))
     cue.openConversationURL = { _ in false }
-    results["rejected_url_handoff_stays_unopened"] = !cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 2
+    results["rejected_url_handoff_stays_unopened"] = !cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 1
     cue.openConversationURL = { _ in true }
-    results["successful_handoff_marks_only_its_event"] = cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 1 && cue.recentHistory.records.first(where: { $0.event.id == "second" })?.isOpened == false
+    results["successful_handoff_marks_the_whole_conversation_opened"] = cue.open(event: event("first")) && cue.recentHistory.unopenedCount == 0 && cue.recentHistory.records.first(where: { $0.event.id == "second" })?.isOpened == true
     let inputRaw: [String: Any] = ["id":"mcp-input-fixture", "kind":"input", "thread_id":"fixture-chat", "title":"浏览器确认样例", "source":"codex client approval stream", "created_at":Date().timeIntervalSince1970]
     let inputEvent = CueEvent(try! JSONSerialization.data(withJSONObject: inputRaw))!
     cue.current = inputEvent; cue.pending = [inputEvent]; cue.recentHistory.append(inputEvent)

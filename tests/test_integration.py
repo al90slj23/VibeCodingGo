@@ -161,7 +161,7 @@ class BrandMigrationTests(unittest.TestCase):
             (self.home / name).write_bytes(content)
         record = self.install()
         self.assertEqual(record['app'], str(self.new))
-        self.assertEqual(record['version'], '0.28.0')
+        self.assertEqual(record['version'], '0.28.1')
         self.assertEqual(record['short_name'], 'VCGo')
         self.assertFalse(self.old.exists())
         backup = Path(record['legacy_app_backup'])

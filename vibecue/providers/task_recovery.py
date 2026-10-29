@@ -120,6 +120,10 @@ def codex_process_snapshot(now=None):
                 continue
             executable = parts[6]
             name = Path(executable).name
+            # This short-lived tool host does not own task execution. Its
+            # creation/exit must not look like a Codex owner replacement.
+            if name.lower() == 'codex-code-mode-host':
+                continue
             if not re.fullmatch(r'codex(?:-[A-Za-z0-9_-]+)?', name, re.I):
                 continue
             try:

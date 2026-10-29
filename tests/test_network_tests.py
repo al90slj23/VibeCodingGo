@@ -3,6 +3,9 @@ import gzip
 import io
 import json
 import subprocess
+import socketserver
+import threading
+import os
 import sys
 import time
 import unittest
@@ -305,17 +308,12 @@ class TransportBoundaryTests(unittest.TestCase):
         self.assertNotIn('PRIVATE',json.dumps(answer))
 
     def test_gzip_expansion_bomb_is_rejected_before_json_decoding(self):
-        class FakeResponse:
-            status=200
-            headers={'Content-Encoding':'gzip'}
-            def __enter__(self):return self
-            def __exit__(self,*args):pass
-            def read(self,n):return gzip.compress(b'x'*50000)
-        class Opener:
-            def open(self,*args,**kwargs):return FakeResponse()
-        with patch.object(network,'proxy_guard'), patch.object(network.urllib.request,'build_opener',return_value=Opener()):
-            result=network._http_worker({'url':'https://api.ipify.org','max_bytes':1000,'timeout':1})
-        self.assertEqual(result,{'error':'oversized'})
+        compressed=gzip.compress(b'x'*50000)
+        def runner(args,**kwargs):
+            return subprocess.CompletedProcess(args,0,stdout=b'HTTP/2 200\r\nContent-Encoding: gzip\r\n\r\n'+compressed+b'\nVCGO_META:200:0.1')
+        answer=network._curl_request({'url':'https://example.com/','method':'GET','max_bytes':1000,'timeout':1},
+                                    {'source':'direct','proxy':''},runner=runner)
+        self.assertEqual(answer,{'error':'oversized'})
 
     def test_redirects_do_not_visit_another_host(self):
         request=network.urllib.request.Request('https://example.com')
@@ -333,25 +331,28 @@ class ProxyRouteTests(unittest.TestCase):
             network.proxy_guard('https://api.ipify.org',proxies={'https':secret,'all':'socks5://127.0.0.1:7890'},
                                 runner=lambda *a,**k: self.fail('unused system route must not be read'))
 
-    def test_all_proxy_without_a_supported_https_route_cannot_fall_back_to_direct(self):
-        with patch.dict(network.os.environ,{},clear=True):
-            for proxies in ({'all':'socks5://user:PRIVATE_SECRET@127.0.0.1:7890'},
-                            {'https':'socks5://user:PRIVATE_SECRET@127.0.0.1:7890'}):
-                with self.subTest(proxies=list(proxies)):
-                    with self.assertRaises(network.TestError) as failure:
-                        network.proxy_guard('https://api.ipify.org',proxies=proxies)
-                    self.assertNotIn('PRIVATE_SECRET',str(failure.exception))
+    def test_socks_and_all_proxy_are_supported_without_direct_fallback(self):
+        for key in ('all','https'):
+            route=network.proxy_guard('https://example.com',proxies={key:'socks5h://user:PRIVATE_SECRET@127.0.0.1:7890'})
+            self.assertEqual(route['source'],'environment')
+            self.assertTrue(route['proxy'].startswith('socks5h://'))
+            self.assertNotIn('PRIVATE_SECRET',network.route_label(route))
+        for value in ('file:///tmp/proxy','gopher://127.0.0.1:70','http://proxy.test:0','http://proxy.test/path'):
+            with self.subTest(value=value), self.assertRaises(network.TestError):
+                network.proxy_guard('https://example.com',proxies={'https':value})
 
     def test_no_proxy_matching_a_host_is_an_explicit_user_bypass(self):
-        with patch.dict(network.os.environ,{'NO_PROXY':'api.ipify.org'},clear=True):
-            network.proxy_guard('https://api.ipify.org',proxies={'all':'socks5://127.0.0.1:7890'})
+        for host,exception in (('api.ipify.org','ipify.org'),('8.8.8.8','8.8.8.0/24')):
+            route=network.proxy_guard('https://'+host,proxies={'all':'socks5h://127.0.0.1:7890','no':exception})
+            self.assertEqual(route,{'proxy':'','source':'bypass'})
 
-    def test_pac_wpad_and_socks_only_modes_are_not_silently_ignored(self):
-        with patch.dict(network.os.environ,{},clear=True), patch.object(network.sys,'platform','darwin'):
-            for flag in ('ProxyAutoConfigEnable','ProxyAutoDiscoveryEnable','SOCKSEnable','HTTPSEnable'):
-                with self.subTest(flag=flag), self.assertRaises(network.TestError):
-                    network.proxy_guard('https://api.ipify.org',proxies={},runner=lambda *a,**k:self.state({flag:1}))
-            network.proxy_guard('https://api.ipify.org',proxies={},runner=lambda *a,**k:self.state({}))
+    def test_system_and_pac_policy_are_used_when_environment_has_no_proxy(self):
+        expected={'proxy':'socks5h://127.0.0.1:1080','source':'pac'}
+        with patch.dict(network.os.environ,{},clear=True), patch.object(network.sys,'platform','darwin'), patch.object(network,'_system_proxy',return_value=expected) as native:
+            self.assertEqual(network.proxy_guard('https://example.com/'),expected)
+            native.assert_called_once_with('https://example.com/')
+        with patch.dict(network.os.environ,{},clear=True), patch.object(network.sys,'platform','darwin'), patch.object(network,'_system_proxy',side_effect=network.TestError('PAC 未完成')):
+            with self.assertRaises(network.TestError):network.proxy_guard('https://example.com/')
 
     def test_failed_route_validation_prevents_dns_and_http_work(self):
         calls=[]
@@ -377,21 +378,158 @@ class ProxyRouteTests(unittest.TestCase):
 
     def test_speed_uses_identity_encoding_and_rejects_compressed_wire_results(self):
         captured=[]
-        class FakeResponse:
-            status=200
-            headers={'Content-Encoding':'gzip'}
-            def __enter__(self):return self
-            def __exit__(self,*args):pass
-            def read(self,n):return gzip.compress(b'x'*100)
-        class Opener:
-            def open(self,request,**kwargs):
-                captured.append(request.get_header('Accept-encoding'))
-                return FakeResponse()
-        with patch.object(network,'proxy_guard'), patch.object(network.urllib.request,'build_opener',return_value=Opener()):
-            answer=network._http_worker({'url':'https://speed.cloudflare.com/__down?bytes=100',
-                                         'max_bytes':1000,'timeout':1,'count_only':True})
-        self.assertEqual(captured,['identity'])
+        def runner(args,**kwargs):
+            captured.append(kwargs['input'])
+            return subprocess.CompletedProcess(args,0,stdout=b'HTTP/2 200\r\nContent-Encoding: gzip\r\n\r\n'+gzip.compress(b'x'*100)+b'\nVCGO_META:200:0.1')
+        answer=network._curl_request({'url':'https://example.com/','method':'GET','max_bytes':1000,'timeout':1,'count_only':True},
+                                    {'source':'direct','proxy':''},runner=runner)
+        self.assertIn(b'Accept-Encoding: identity',captured[0])
         self.assertEqual(answer,{'error':'encoded_speed_response'})
+
+    def test_curl_config_keeps_proxy_credentials_and_post_body_out_of_argv(self):
+        calls=[]
+        def runner(args,**kwargs):
+            calls.append((args,kwargs))
+            return subprocess.CompletedProcess(args,0,stdout=b'HTTP/2 202\r\nETag: "safe"\r\n\r\n{}\nVCGO_META:202:0.125')
+        route={'source':'environment','proxy':'socks5h://user:PRIVATE_SECRET@127.0.0.1:1080'}
+        answer=network._curl_request({'url':'https://example.com/','method':'POST','json_body':{'test':'POST_PRIVATE'},'max_bytes':1000,'timeout':2},route,runner=runner)
+        args,kwargs=calls[0];config=kwargs['input'].decode()
+        self.assertEqual(args,['/usr/bin/curl','--disable','--config','-'])
+        self.assertNotIn('PRIVATE',str(args));self.assertNotIn('PRIVATE',str(kwargs['env']))
+        self.assertIn('PRIVATE_SECRET',config);self.assertIn('POST_PRIVATE',config)
+        self.assertIn('retry = 0',config);self.assertNotIn('insecure',config);self.assertNotIn('location',config)
+        self.assertEqual(answer['status'],202);self.assertEqual(answer['elapsed'],.125)
+        self.assertNotIn('PRIVATE',json.dumps(answer))
+
+    def test_transport_errors_are_specific_without_exposing_stderr(self):
+        for code,expected in ((5,'proxy_dns'),(7,'proxy_connect'),(28,'timeout'),(35,'tls'),(60,'certificate'),(63,'oversized')):
+            with self.subTest(code=code):
+                answer=network._curl_request({'url':'https://example.com/','method':'GET','max_bytes':1000,'timeout':1},
+                    {'source':'environment','proxy':'http://127.0.0.1:8080'},runner=lambda *a,**k:subprocess.CompletedProcess(a,code,stdout=b'',stderr=b'PRIVATE_SECRET'))
+                self.assertEqual(answer,{'error':expected})
+
+    def test_streaming_capture_stops_oversized_output_before_accumulating_it(self):
+        answer=network._bounded_capture([sys.executable,'-c','import sys;sys.stdout.buffer.write(b"x"*10000000)'],
+                    input=b'',timeout=2,env=os.environ.copy(),limit=2048)
+        self.assertEqual(answer.returncode,-1000)
+        self.assertLessEqual(len(answer.stdout),2048)
+
+    def test_local_http_connect_proxy_is_actually_used_without_external_request(self):
+        received=[]
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(2);data=b''
+                while b'\r\n\r\n' not in data and len(data)<4096:data+=self.request.recv(1024)
+                received.append(data)
+                self.request.sendall(b'HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+        with socketserver.TCPServer(('127.0.0.1',0),Handler) as server:
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            try:
+                route={'source':'environment','proxy':'http://127.0.0.1:'+str(server.server_address[1])}
+                answer=network._curl_request({'url':'https://example.com/','method':'HEAD','max_bytes':1000,'timeout':2},route)
+            finally:server.shutdown();thread.join(timeout=2)
+        self.assertEqual(len(received),1)
+        self.assertTrue(received[0].startswith(b'CONNECT example.com:443 '))
+        self.assertEqual(answer,{'error':'proxy_auth'})
+
+    def test_local_socks5h_proxy_receives_hostname_for_remote_dns(self):
+        received=[]
+        class Handler(socketserver.BaseRequestHandler):
+            def read(self,n):
+                data=b''
+                while len(data)<n:
+                    part=self.request.recv(n-len(data))
+                    if not part:raise OSError()
+                    data+=part
+                return data
+            def handle(self):
+                self.request.settimeout(2)
+                greeting=self.read(2);self.read(greeting[1]);self.request.sendall(b'\x05\x00')
+                request=self.read(4)
+                if request[3]!=3:return
+                host=self.read(self.read(1)[0]);self.read(2);received.append(host)
+                self.request.sendall(b'\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00')
+        with socketserver.TCPServer(('127.0.0.1',0),Handler) as server:
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            try:
+                route={'source':'environment','proxy':'socks5h://127.0.0.1:'+str(server.server_address[1])}
+                answer=network._curl_request({'url':'https://example.com/','method':'GET','max_bytes':1000,'timeout':2},route)
+            finally:server.shutdown();thread.join(timeout=2)
+        self.assertEqual(received,[b'example.com'])
+        self.assertEqual(answer,{'error':'proxy_connect'})
+
+    def test_proxy_remote_dns_continues_https_when_local_dns_fails(self):
+        client=FakeClient(response_values=[response(status=200)])
+        client.ensure_route=lambda url:{'proxy':'socks5h://127.0.0.1:1080','source':'environment'}
+        with patch.object(network,'resolve',side_effect=network.TestError('本机 DNS 未确认')):
+            answer=network.run({'kind':'domain','target':'example.com'},client)
+        self.assertEqual(answer['status'],'partial')
+        self.assertEqual(values(answer)['HTTP 状态'],'200')
+        self.assertIn('代理路径',answer['summary'])
+
+    def test_proxy_remote_dns_uses_original_fqdn_even_when_local_dns_is_private(self):
+        for address in ('198.18.0.1','127.0.0.1','192.168.1.1','fd00::1'):
+            client=FakeClient(response_values=[response(status=200)])
+            client.ensure_route=lambda url:{'proxy':'socks5h://127.0.0.1:1080','source':'environment'}
+            with self.subTest(address=address),patch.object(network,'resolve',return_value=[address]):
+                answer=network.run({'kind':'domain','target':'example.com'},client)
+                self.assertEqual(answer['status'],'ok')
+                self.assertEqual(client.calls[0][1],'https://example.com/')
+                self.assertEqual(values(answer)['HTTP 状态'],'200')
+                self.assertIn('原域名',values(answer)['代理 DNS 路径'])
+        for target in ('127.0.0.1','192.168.1.1','::1','localhost','router.local'):
+            client=FakeClient();client.ensure_route=lambda url:{'proxy':'socks5h://127.0.0.1:1080','source':'environment'}
+            answer=network.run({'kind':'domain','target':target},client)
+            self.assertEqual(answer['status'],'error');self.assertEqual(client.calls,[])
+
+    def test_head_response_can_declare_large_or_encoded_body_without_downloading_it(self):
+        captured=[]
+        def runner(args,**kwargs):
+            captured.append(kwargs['input'].decode())
+            return subprocess.CompletedProcess(args,0,stdout=b'HTTP/2 200\r\nContent-Length: 9999999\r\nContent-Encoding: gzip\r\n\r\n\nVCGO_META:200:0.1')
+        answer=network._curl_request({'url':'https://example.com/','method':'HEAD','max_bytes':1000,'timeout':1},
+                                    {'source':'direct','proxy':''},runner=runner)
+        self.assertEqual(answer['status'],200);self.assertEqual(answer['bytes_received'],0)
+        self.assertIn('head',captured[0]);self.assertNotIn('max-filesize',captured[0])
+
+    def test_tun_fake_ip_works_without_explicit_proxy_but_non_tunnel_route_is_blocked(self):
+        for tunnel in (True,False):
+            client=FakeClient(response_values=[response(status=200)])
+            client.ensure_route=lambda url:{'proxy':'','source':'system'}
+            with self.subTest(tunnel=tunnel),patch.object(network,'resolve',return_value=['198.18.0.1']),patch.object(network,'tunnel_route',return_value=tunnel):
+                answer=network.run({'kind':'domain','target':'example.com'},client)
+                self.assertEqual(bool(client.calls),tunnel)
+                if tunnel:self.assertIn('TUN DNS 路径',values(answer))
+        self.assertIn('系统 / TUN',network.route_label({'proxy':'','source':'system'}))
+
+    def test_tunnel_recognition_is_bounded_and_only_accepts_tunnel_interfaces(self):
+        for interface,expected in (('utun4',True),('tun0',True),('en0',False),('lo0',False)):
+            calls=[]
+            def runner(args,**kwargs):
+                calls.append((args,kwargs))
+                return subprocess.CompletedProcess(args,0,stdout=(' interface: '+interface+'\n').encode())
+            with self.subTest(interface=interface),patch.object(network.sys,'platform','darwin'):
+                self.assertEqual(network.tunnel_route('198.18.0.1',runner),expected)
+                self.assertEqual(calls[0][1]['timeout'],2)
+                self.assertNotIn('shell',calls[0][1])
+
+    @unittest.skipUnless(sys.platform=='darwin','CFNetwork native PAC fixture requires macOS')
+    def test_native_pac_script_selects_socks_without_fetching_a_pac_or_external_url(self):
+        source="""import ctypes,ctypes.util,json
+from vibecue import network_tests as n
+cf=ctypes.CDLL(ctypes.util.find_library('CoreFoundation'))
+cf.CFStringCreateWithCString.argtypes=[ctypes.c_void_p,ctypes.c_char_p,ctypes.c_uint32];cf.CFStringCreateWithCString.restype=ctypes.c_void_p
+cf.CFRelease.argtypes=[ctypes.c_void_p]
+script=cf.CFStringCreateWithCString(None,b'function FindProxyForURL(url,host) { return "SOCKS 127.0.0.1:1080; DIRECT"; }',0x08000100)
+try:
+ route=n._system_proxy('https://example.com/',script=script)
+ print(json.dumps({'source':route['source'],'scheme':n.urllib.parse.urlsplit(route['proxy']).scheme}))
+finally:cf.CFRelease(script)
+"""
+        done=subprocess.run([sys.executable,'-c',source],capture_output=True,timeout=7,check=False)
+        self.assertEqual(done.returncode,0,done.stderr.decode(errors='replace')[-300:])
+        self.assertEqual(json.loads(done.stdout),{'source':'pac','scheme':'socks5h'})
+
 
 
 if __name__=='__main__':

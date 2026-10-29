@@ -56,24 +56,28 @@ enum CueWorkspacePage: Int, CaseIterable {
     }
     static func canonical(_ raw: Int) -> Self {
         let value = Self(rawValue: raw) ?? .workspace
-        return value == .networkTests ? .networkIP : value
+        switch value {
+        case .networkTests: return .networkIP
+        case .conversation: return .codingTasks // Retired embedded-chat route.
+        default: return value
+        }
     }
-    static func children(of module: String, hasConversation: Bool) -> [Self] {
+    static func children(of module: String) -> [Self] {
         switch module {
         case "任务提醒": return [.reminderOverview, .reminderRules, .reminderEffects]
-        case "编程助手": return [.codingTasks] + (hasConversation ? [.conversation] : []) + [.usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources, .codexSettings]
+        case "编程助手": return [.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources, .codexSettings]
         case "网络检测": return [.networkIP, .networkDomain, .networkTrace, .networkPing, .networkHTTP, .networkSpeed, .testSettings]
         default: return []
         }
     }
-    var isEmbedded: Bool { networkKind != nil || [.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources, .conversation].contains(self) }
+    var isEmbedded: Bool { networkKind != nil || [.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources].contains(self) }
     static func validationReport() -> [String: Bool] {
         ["workspace_legacy_page_routes_remain_stable": Self.reminderRules.rawValue == 1 && Self.reminderEffects.rawValue == 2 && Self.codexSettings.rawValue == 3 && Self.usage.rawValue == 4 && canonical(7) == .networkIP,
          "workspace_three_primary_names_are_intuitive_and_symmetric": moduleTitles.count == 3 && moduleTitles.allSatisfy { $0.count == 4 },
-         "workspace_reminder_settings_are_separate_from_coding": Set(children(of: "任务提醒", hasConversation: true)) == Set([.reminderOverview, .reminderRules, .reminderEffects]),
-         "workspace_coding_includes_all_main_functions_in_second_level": Set([Self.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources, .codexSettings, .conversation]).isSubset(of: Set(children(of: "编程助手", hasConversation: true))),
-         "workspace_network_kinds_each_have_one_secondary_tag": Set(children(of: "网络检测", hasConversation: false).compactMap(\.networkKind)).count == 6,
-         "workspace_network_settings_remain_in_the_network_module": Self.testSettings.module == "网络检测" && children(of: "网络检测", hasConversation: false).contains(.testSettings),
-         "workspace_conversation_tag_appears_only_when_a_chat_is_open": !children(of: "编程助手", hasConversation: false).contains(.conversation) && children(of: "编程助手", hasConversation: true).contains(.conversation)]
+         "workspace_reminder_settings_are_separate_from_coding": Set(children(of: "任务提醒")) == Set([.reminderOverview, .reminderRules, .reminderEffects]),
+         "workspace_coding_includes_all_main_functions_in_second_level": Set([Self.codingTasks, .usage, .accountQuota, .usagePreferences, .usageSchedule, .priceSources, .codexSettings]).isSubset(of: Set(children(of: "编程助手"))),
+         "workspace_network_kinds_each_have_one_secondary_tag": Set(children(of: "网络检测").compactMap(\.networkKind)).count == 6,
+         "workspace_network_settings_remain_in_the_network_module": Self.testSettings.module == "网络检测" && children(of: "网络检测").contains(.testSettings),
+         "workspace_individual_chats_are_not_module_tabs": !children(of: "编程助手").contains(.conversation) && !Self.conversation.isEmbedded && canonical(Self.conversation.rawValue) == .codingTasks]
     }
 }

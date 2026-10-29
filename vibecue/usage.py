@@ -712,6 +712,28 @@ def upgrade_codex_import(conn, home):
     return result
 
 
+def track_native_mutations(conn):
+    """Transaction-aware, connection-local dirty bit for CC enrichment reuse.
+
+    Import counters omit pure deletes and fallback merges. TEMP triggers cover
+    every native request mutation without adding persistent per-row revisions.
+    """
+    conn.executescript("""
+      CREATE TEMP TABLE IF NOT EXISTS usage_native_mutations (changed INTEGER NOT NULL);
+      DELETE FROM usage_native_mutations;
+      INSERT INTO usage_native_mutations VALUES (0);
+      CREATE TEMP TRIGGER IF NOT EXISTS usage_native_insert AFTER INSERT ON main.usage_requests
+        WHEN NEW.app IN ('codex','claude','opencode')
+        BEGIN UPDATE usage_native_mutations SET changed=1 WHERE changed=0; END;
+      CREATE TEMP TRIGGER IF NOT EXISTS usage_native_delete AFTER DELETE ON main.usage_requests
+        WHEN OLD.app IN ('codex','claude','opencode')
+        BEGIN UPDATE usage_native_mutations SET changed=1 WHERE changed=0; END;
+      CREATE TEMP TRIGGER IF NOT EXISTS usage_native_update AFTER UPDATE ON main.usage_requests
+        WHEN OLD.app IN ('codex','claude','opencode') OR NEW.app IN ('codex','claude','opencode')
+        BEGIN UPDATE usage_native_mutations SET changed=1 WHERE changed=0; END;
+    """)
+
+
 def sync(home=None):
     home = vibecue_directory(home)
     home.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -721,8 +743,9 @@ def sync(home=None):
         try:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
-            return query(home)
+            return sync_status(home)
         with closing(connect(home)) as conn:
+            track_native_mutations(conn)
             prior = get_meta(conn,'sync',{})
             report = {'running':True,'started_at':time.time(),'last_synced_at':prior.get('last_synced_at'),
                       'files_scanned':0,'files_total':0,'imported':0,'updated':0,'duplicates':0,'skipped':0,
@@ -822,7 +845,7 @@ def sync(home=None):
                     report['files_scanned'] += 1
                     if time.monotonic()-last_progress>.5:
                         set_meta(conn,'sync',report);conn.commit();last_progress=time.monotonic()
-                report['ccswitch'] = usage_ccswitch.sync(conn)
+                report['ccswitch'] = usage_ccswitch.sync(conn, native_unchanged=not (report.get('rebuild') or conn.execute('SELECT changed FROM usage_native_mutations').fetchone()[0]))
                 conn.commit()
                 for app in APPS:
                     count = sum(1 for a,p in files if a==app)
@@ -1267,9 +1290,51 @@ def today_summary(home=None, now=None, cc_path=None):
     return result
 
 
+def sync_status(home=None):
+    """Read only numeric progress metadata; never aggregate or scan sources."""
+    home = vibecue_directory(home)
+    metadata = {'running': False, 'last_synced_at': None, 'errors': [], 'warnings': []}
+    result = {'schema_version': SCHEMA_VERSION, 'sync': metadata, 'available': False}
+    path = home / 'usage.sqlite3'
+    if not path.is_file():
+        return result
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.15)) as conn:
+            conn.execute('PRAGMA query_only=ON')
+            raw = get_meta(conn, 'sync', {})
+        if not isinstance(raw, dict):
+            raise ValueError('invalid sync metadata')
+        metadata['running'] = raw.get('running') is True
+        for key in ('last_synced_at', 'started_at', 'finished_at', 'files_scanned', 'files_total', 'headers_scanned', 'imported', 'updated', 'duplicates', 'bytes_read'):
+            value = raw.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                metadata[key] = value
+        for key in ('errors', 'warnings'):
+            metadata[key] = [label(item, 300) for item in raw.get(key, [])[:20]] if isinstance(raw.get(key), list) else []
+        if raw.get('phase') in ('discovering', 'preparing', 'importing', 'finished'):
+            metadata['phase'] = raw['phase']
+        metadata['rebuild'] = raw.get('rebuild') is True
+        if metadata['running']:
+            try:
+                with (home / 'usage-sync.lock').open('rb') as check:
+                    try:
+                        fcntl.flock(check, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        metadata['running'] = False
+                        metadata['warnings'].append('上次同步被中断；可从已提交进度继续')
+                    except BlockingIOError:
+                        pass
+            except OSError:
+                metadata['running'] = False
+                metadata['warnings'].append('无法确认同步进程；已有统计可能未更新')
+        result['available'] = True
+    except (OSError, sqlite3.Error, ValueError, TypeError, OverflowError):
+        metadata['errors'] = ['同步进度暂不可读；稍后会自动重试']
+    return result
+
+
 def main(argv=None):
     parser=argparse.ArgumentParser(description='VibeCoding Go 本机历史 Token 用量')
-    parser.add_argument('command',choices=('sync','query','today-summary'))
+    parser.add_argument('command',choices=('sync','query','today-summary','sync-status'))
     parser.add_argument('--range',dest='period',choices=('today','yesterday','1d','7d','30d','month','90d','year','custom','all'),default='all')
     parser.add_argument('--app',default='all')
     parser.add_argument('--model',default='all')
@@ -1287,6 +1352,8 @@ def main(argv=None):
     try:
         if args.command=='sync':
             result=sync()
+        elif args.command=='sync-status':
+            result=sync_status()
         elif args.command=='today-summary':
             result=today_summary()
         else:
