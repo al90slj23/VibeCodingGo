@@ -19,6 +19,7 @@ from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable
 from .codex_runtime import RuntimeProjection
 from .current_model_settings import ModelSettingsProjection, unavailable_settings
 from .model_presentation import ModelPresentation
+from .side_chats import SideChatService
 from .events import emit_event, emit_resolution, event_identifier, input_event_id
 from .providers.approval_bridge import APPROVAL_METHODS, INPUT_METHODS, SETTLE_SECONDS
 
@@ -304,6 +305,7 @@ class DesktopAttentionService:
                         'capabilities': {'reply': False, 'control': False, 'attention': False}}
         self.monitor = DesktopAttentionMonitor(home)
         self.model_presentation = ModelPresentation(codex_home)
+        self.side_chat_service = SideChatService(codex_home, home=home, channel_factory=_AttentionChannel)
         self.channel = None
         self.projections = {}
         self.next_discovery = {}
@@ -329,11 +331,13 @@ class DesktopAttentionService:
     def start(self):
         if self._thread is not None:
             return
+        self.side_chat_service.start()
         self._thread = threading.Thread(target=self._run, name='vibecue-desktop-attention', daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        self.side_chat_service.stop()
         with self._lock:
             channel = self.channel
             connection = channel.socket if channel else None
@@ -392,6 +396,10 @@ class DesktopAttentionService:
                     state = dict(state, state='waiting')
                 result[thread] = state
             return result
+
+    def side_chats(self):
+        """Verified native side-chat relations from the independent read stream."""
+        return self.side_chat_service.snapshot()
 
     def _on_message(self, message):
         if message.get('type') == 'vibecue-observation-gap':

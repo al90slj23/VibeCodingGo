@@ -683,6 +683,9 @@ class Watcher:
         current_settings = self.desktop.current_settings()
         if not isinstance(current_settings, dict):
             current_settings = {}
+        side_chats = self.desktop.side_chats()
+        if not isinstance(side_chats, dict):
+            side_chats = {'state': 'unavailable', 'message': '侧边聊天尚未取得可靠关联', 'by_parent': {}}
         if not approvals['connected'] and desktop['connected'] and desktop['capabilities']['attention']:
             approvals = {'connected': True, 'status': 'connected', 'source': 'codex-desktop-owner-stream',
                          'live_sources': 1, 'pending_count': desktop['pending_count'],
@@ -760,6 +763,7 @@ class Watcher:
             'task_recovery_error': self.recovery.error,
             'task_details': bounded_details(detail_rows),
             'current_model_settings': current_settings,
+            'side_chats': side_chats,
             'current_task_states': task_states,
             'source': 'local-transcripts', 'provider': 'codex',
             'supports': ['turn-completion', 'structured-question', 'final-text-input-heuristic', 'running-task-lifecycle', 'durable-interrupted-task-recovery', 'per-turn-usage', 'visible-conversation-preview', 'auto-desktop-connection', 'desktop-attention-stream', 'current-model-settings'],

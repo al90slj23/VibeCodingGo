@@ -287,6 +287,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var runningTasks: [CueRunningTask] = []
     var interruptedTasks: [CueRunningTask] = []
     var taskDetails: [String: CueTaskDetail] = [:]
+    var sideChats: [String: [CueSideChat]] = [:]
     private var modelSettingsTargets = Data()
     var batchController: CueCodexBatchController?
     private var runningTaskSnapshot = Data()
@@ -929,6 +930,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         var nextRunningTasks: [CueRunningTask] = []
         var nextInterruptedTasks: [CueRunningTask] = []
         var nextTaskDetails: [String: CueTaskDetail] = [:]
+        var nextSideChats: [String: [CueSideChat]] = [:]
         var nextRunningSnapshot = Data()
         manualApprovalConnected = false
         codexConnectionState = "reconnecting"
@@ -989,6 +991,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 return value
             }
         }
+        var sideChatState = state["side_chats"] as? [String: Any] ?? [:]
+        if !live { sideChatState["state"] = "disconnected" }
+        nextSideChats = CueSideChat.grouped(raw: sideChatState)
+        if let data = try? JSONSerialization.data(withJSONObject: sideChatState, options: [.sortedKeys]) { nextRunningSnapshot.append(data) }
         let recovery = CueTaskRecoverySnapshot.read(home: home, state: state, live: live)
         if let recoveryError = state["task_recovery_error"] as? String, !recoveryError.isEmpty { message += " · 中断记录保存异常" }
         nextInterruptedTasks = recovery.tasks.filter { task in !nextRunningTasks.contains { $0.threadID == task.threadID } }
@@ -996,7 +1002,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let recoveryRows = nextInterruptedTasks.map { ["thread_id": $0.threadID, "title": $0.title, "status": $0.recoveryStatus, "reason": $0.recoveryReason, "interrupted_at": $0.interruptedAt?.timeIntervalSince1970 ?? 0, "last_activity": $0.updatedDate.timeIntervalSince1970] as [String: Any] }
         if let recoveryData = try? JSONSerialization.data(withJSONObject: recoveryRows, options: [.sortedKeys]) { nextRunningSnapshot.append(recoveryData) }
         let runningChanged = runningTaskSnapshot != nextRunningSnapshot
-        runningTasks = nextRunningTasks; interruptedTasks = nextInterruptedTasks; taskDetails = nextTaskDetails; runningTaskSnapshot = nextRunningSnapshot
+        runningTasks = nextRunningTasks; interruptedTasks = nextInterruptedTasks; taskDetails = nextTaskDetails; sideChats = nextSideChats; runningTaskSnapshot = nextRunningSnapshot
         if watcherHealthText != message || runningChanged || previousConnection != codexConnectionState + codexConnectionSummary {
             watcherHealthText = message
             if statusItem != nil { refreshMenu() }
@@ -1416,6 +1422,12 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                     if self.open(event: event) { self.recentHistory.beginReview(event: event); self.statusPopover?.performClose(nil); self.refreshConversationHistory() }
                 }, threadAction: { [weak self] id, command in
                     self?.performThreadAction(threadID: id, command: command)
+                }, openSideChat: { [weak self] chat in
+                    guard let self, chat.canOpen else { return }
+                    var url = URLComponents()
+                    url.scheme = "codex"; url.host = "threads"; url.path = "/" + chat.threadID
+                    guard let destination = url.url, self.openConversationURL(destination) else { return }
+                    self.statusPopover?.performClose(nil)
                 })
             statusPopoverController = CueStatusPopoverController(history: recentHistory, actions: actions)
             let popover = NSPopover(); popover.behavior = .transient
@@ -1432,7 +1444,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         let height = min(1100, (screen?.visibleFrame.height ?? 900) - 52)
         statusPopoverController?.update(status: watcherHealthText, enabled: settings.enabled,
                                        soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks, interruptedTasks: interruptedTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected,
-                                       connectionSummary: codexConnectionSummary, connectionState: codexConnectionState, showConnectionAction: codexConnectionState == "unsupported")
+                                       connectionSummary: codexConnectionSummary, connectionState: codexConnectionState, showConnectionAction: codexConnectionState == "unsupported", sideChats: sideChats)
         if let controller = statusPopoverController, controller.isViewLoaded { statusPopover?.contentSize = controller.preferredContentSize }
     }
 
@@ -2420,6 +2432,10 @@ if CommandLine.arguments.contains("--conversation-renderer-self-test") {
 if let index = CommandLine.arguments.firstIndex(of: "--capture-recent"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared
     exit(CueStatusPopoverController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")) ? 0 : 1)
+}
+if let index = CommandLine.arguments.firstIndex(of: "--capture-side-chats"), CommandLine.arguments.indices.contains(index + 1) {
+    _ = NSApplication.shared
+    exit(CueSideChatsPopoverController.captureFixture(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), dark: !CommandLine.arguments.contains("--light")) ? 0 : 1)
 }
 if let index = CommandLine.arguments.firstIndex(of: "--capture-account-quota"), CommandLine.arguments.indices.contains(index + 1) {
     _ = NSApplication.shared

@@ -382,6 +382,7 @@ struct CueStatusPopoverActions {
     var dismissInterrupted: (CueRunningTask) -> Void = { _ in }
     var openInCodex: (CueEvent) -> Void = { _ in }
     var threadAction: (String, String) -> Void = { _, _ in }
+    var openSideChat: (CueSideChat) -> Void = { _ in }
 }
 
 /// An independent native control inside a navigation row. Its hit target is
@@ -492,7 +493,7 @@ private final class CueRecentRowButton: NSButton {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var isFlipped: Bool { true }
     override func accessibilityChildren() -> [Any]? {
-        subviews.compactMap { $0 as? CueRowQuickButton }.filter { !$0.isHidden }
+        subviews.filter { ($0 is CueRowQuickButton || $0 is CueSideChatButton) && !$0.isHidden }
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         // The labels and symbol are part of one row action, so clicking text
@@ -500,7 +501,7 @@ private final class CueRecentRowButton: NSButton {
         guard let hit = super.hitTest(point) else { return nil }
         var target: NSView? = hit
         while let candidate = target, candidate !== self {
-            if candidate is CueRowQuickButton { return candidate }
+            if candidate is CueRowQuickButton || candidate is CueSideChatButton { return candidate }
             target = candidate.superview
         }
         return self
@@ -628,13 +629,13 @@ private final class CueRunningRowButton: NSButton {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var isFlipped: Bool { true }
     override func accessibilityChildren() -> [Any]? {
-        subviews.compactMap { $0 as? CueRowQuickButton }.filter { !$0.isHidden }
+        subviews.filter { ($0 is CueRowQuickButton || $0 is CueSideChatButton) && !$0.isHidden }
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let hit = super.hitTest(point) else { return nil }
         var target: NSView? = hit
         while let candidate = target, candidate !== self {
-            if candidate is CueRowQuickButton { return candidate }
+            if candidate is CueRowQuickButton || candidate is CueSideChatButton { return candidate }
             target = candidate.superview
         }
         return self
@@ -676,6 +677,8 @@ final class CueStatusPopoverController: NSViewController {
     private var runningTasks: [CueRunningTask] = []
     private var interruptedTasks: [CueRunningTask] = []
     private var taskDetails: [String: CueTaskDetail] = [:]
+    private var sideChats: [String: [CueSideChat]] = [:]
+    private let sideChatsController = CueSideChatsPopoverController()
     private var attentionConnected = false
     private var connectionSummary: String?
     private var connectionState = "legacy"
@@ -705,7 +708,7 @@ final class CueStatusPopoverController: NSViewController {
         root.backgroundColor = .windowBackgroundColor; view = root
         rebuild()
     }
-    func update(status: String, enabled: Bool, soundEnabled: Bool, paused: Bool, maximumHeight: CGFloat = 900, runningTasks: [CueRunningTask] = [], interruptedTasks: [CueRunningTask] = [], taskDetails: [String: CueTaskDetail] = [:], attentionConnected: Bool = false, connectionSummary: String? = nil, connectionState: String = "legacy", showConnectionAction: Bool? = nil) {
+    func update(status: String, enabled: Bool, soundEnabled: Bool, paused: Bool, maximumHeight: CGFloat = 900, runningTasks: [CueRunningTask] = [], interruptedTasks: [CueRunningTask] = [], taskDetails: [String: CueTaskDetail] = [:], attentionConnected: Bool = false, connectionSummary: String? = nil, connectionState: String = "legacy", showConnectionAction: Bool? = nil, sideChats: [String: [CueSideChat]] = [:]) {
         self.status = status; self.enabled = enabled; self.soundEnabled = soundEnabled
         self.paused = paused; self.maximumHeight = maximumHeight; self.runningTasks = runningTasks; self.taskDetails = taskDetails
         self.interruptedTasks = interruptedTasks
@@ -713,9 +716,11 @@ final class CueStatusPopoverController: NSViewController {
         self.connectionSummary = connectionSummary
         self.connectionState = ["legacy", "connected", "reconnecting", "disconnected", "unsupported"].contains(connectionState) ? connectionState : "disconnected"
         self.showConnectionAction = showConnectionAction
+        self.sideChats = sideChats
+        sideChatsController.refresh(groups: sideChats)
         hoverController.refresh()
         if isViewLoaded {
-            if batchMode || hoverController.isEngaged { refreshInPlace() }
+            if batchMode || hoverController.isEngaged || sideChatsController.isShown { refreshInPlace() }
             else { rebuild() }
         }
     }
@@ -731,14 +736,14 @@ final class CueStatusPopoverController: NSViewController {
         refreshElapsedLabels(now: Date())
         DispatchQueue.main.async { [weak self] in self?.reconcilePointerHover() }
     }
-    override func viewDidDisappear() { super.viewDidDisappear(); pointerTimer?.invalidate(); pointerTimer = nil; elapsedTimer?.invalidate(); elapsedTimer = nil; pointerAnchor = nil; hoverController.hide() }
+    override func viewDidDisappear() { super.viewDidDisappear(); pointerTimer?.invalidate(); pointerTimer = nil; elapsedTimer?.invalidate(); elapsedTimer = nil; pointerAnchor = nil; hoverController.hide(); sideChatsController.close() }
     deinit { pointerTimer?.invalidate(); elapsedTimer?.invalidate() }
 
     /// Status-item popovers can be visible while Codex remains the active app.
     /// Tracking is activeAlways, and this geometry check also handles a pointer
     /// already inside a row when a non-key popover first appears or scrolls.
     private func reconcilePointerHover() {
-        guard !batchMode, isViewLoaded, let window = view.window, window.isVisible, let document = recentDocument,
+        guard !batchMode, !sideChatsController.isShown, isViewLoaded, let window = view.window, window.isVisible, let document = recentDocument,
               let screenPoint = pointerLocation() else { return }
         let point = window.convertPoint(fromScreen: screenPoint)
         let clipPoint = scroll.contentView.convert(point, from: nil)
@@ -775,6 +780,7 @@ final class CueStatusPopoverController: NSViewController {
         return attentionConnected ? .tertiaryLabelColor : .systemOrange
     }
     private func rebuild() {
+        sideChatsController.close()
         let origin = scroll.contentView.bounds.origin
         let snapshot = batchMode ? (frozenBatchSnapshot ?? CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records)) : CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records)
         view.subviews.forEach { $0.removeFromSuperview() }
@@ -1314,6 +1320,65 @@ final class CueStatusPopoverController: NSViewController {
         let callsBeforeBatch = quickExternal.count
         quickButton(quickReminder, "open-codex")?.invoke?()
         results["stale_quick_actions_do_nothing_in_batch_mode"] = quickExternal.count == callsBeforeBatch && quickLocal == 0
+        results.merge(CueSideChat.validationReport()) { _, next in next }
+        results.merge(CueSideChatsPopoverController.validationReport()) { _, next in next }
+        let sideHistory = CueRecentHistory(home: home.appendingPathComponent("side-chats"))
+        for (id, opened, pinned) in [("side-unread", false, false), ("side-pinned", true, true), ("side-history", true, false)] {
+            let raw: [String: Any] = ["id": id, "kind": "complete", "title": "父对话 " + id, "thread_id": id, "created_at": 1000.0]
+            sideHistory.append(CueEvent(try! JSONSerialization.data(withJSONObject: raw))!)
+            if opened { sideHistory.markOpened(id: id, didOpen: true) }
+            if pinned { sideHistory.setPinned(id: id, pinned: true) }
+        }
+        sideHistory.followups.retain(threadID: "side-followup", title: "待续父对话")
+        sideHistory.followups.retain(threadID: "side-pinned-followup", title: "置顶待续父对话")
+        sideHistory.followups.setPinned(threadID: "side-pinned-followup", pinned: true)
+        let sideParents = ["side-unread", "side-pinned", "side-history", "side-followup", "side-pinned-followup", "side-running", "side-interrupted"]
+        let sideNow = Date()
+        let sideGroups = CueSideChat.grouped(raw: ["state": "connected", "by_parent": Dictionary(uniqueKeysWithValues: sideParents.map { parent in
+            (parent, [CueSideChat.fixtureRaw(parent: parent, child: "child-" + parent, title: "核对侧边聊天", status: "running", now: sideNow)])
+        })])
+        var sideOpened: [String] = [], sideLocalOpens = 0, sideOrdinaryOpens = 0
+        var sideActions = CueStatusPopoverActions(openSettings: {}, openUsage: {}, toggleEnabled: {}, toggleSound: {}, pause: {}, demo: {}, quit: {}, openEvent: { _ in sideLocalOpens += 1 })
+        sideActions.openInCodex = { _ in sideOrdinaryOpens += 1 }; sideActions.openSideChat = { sideOpened.append($0.threadID) }
+        let sidePanel = CueStatusPopoverController(history: sideHistory, actions: sideActions)
+        sidePanel.update(status: "侧边聊天验收", enabled: true, soundEnabled: true, paused: false, runningTasks: [running("side-running")], interruptedTasks: [lost("side-interrupted")], sideChats: sideGroups)
+        _ = sidePanel.view
+        let sideLedger = try? Data(contentsOf: sideHistory.file), sideFollowups = try? Data(contentsOf: sideHistory.followups.file)
+        let sideRows = sidePanel.recentDocument!.subviews.filter { $0 is CueRecentRowButton || $0 is CueRunningRowButton }
+        let sideButtons = sideRows.compactMap { $0.subviews.compactMap { $0 as? CueSideChatButton }.first }
+        results["side_chat_disclosure_exists_for_all_parent_row_kinds"] = sideRows.count == 7 && sideButtons.count == 7 && sideButtons.allSatisfy { !$0.isHidden && $0.title == "侧边聊天 1 ›" }
+        results["side_chat_disclosure_keeps_parent_row_height_and_accounting_geometry"] = sideRows.allSatisfy { row in
+            guard let button = row.subviews.compactMap({ $0 as? CueSideChatButton }).first,
+                  let model = row.subviews.first(where: { $0.identifier?.rawValue.hasPrefix("task-metrics:") == true }),
+                  let elapsed = row.subviews.first(where: { $0.identifier?.rawValue.hasPrefix("task-elapsed:") == true }),
+                  let metadata = row.subviews.first(where: { $0.identifier?.rawValue == "row-metadata" }) else { return false }
+            return row.frame.height == CueTaskRowLayout.height && button.frame.maxY < model.frame.minY && button.frame.maxX < elapsed.frame.minX && metadata.frame.maxX < button.frame.minX
+        }
+        results["side_chat_disclosure_has_independent_hit_and_accessibility_target"] = sideButtons.allSatisfy { button in
+            guard let row = button.superview else { return false }
+            let point = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: row.superview)
+            return row.hitTest(point) === button && row.accessibilityChildren()?.contains { ($0 as? NSView) === button } == true
+        }
+        sidePanel.select(id: "side-history")
+        let sideMenu = sidePanel.navigationContextMenu(sideHistory.records.first { $0.event.threadID == "side-unread" }!.event)
+        let sideMenuItems = sideMenu.items.first { $0.title == "侧边聊天 1" }?.submenu?.items ?? []
+        if let item = sideMenuItems.first { sidePanel.openSideChatFromMenu(item) }
+        results["side_chat_open_uses_child_callback_without_marking_parent_read_or_retaining_child"] = sideOpened == ["child-side-unread"] && sideLocalOpens == 0 && sideOrdinaryOpens == 0 && sidePanel.selectedID == "side-history" && sideHistory.records.first { $0.event.threadID == "side-unread" }?.isOpened == false && (try? Data(contentsOf: sideHistory.file)) == sideLedger && (try? Data(contentsOf: sideHistory.followups.file)) == sideFollowups
+        let sideWindow = NSWindow(contentRect: sidePanel.view.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        sideWindow.isReleasedWhenClosed = false; sideWindow.contentView = sidePanel.view
+        sideWindow.setFrameOrigin(NSPoint(x: -10000, y: -10000)); sideWindow.orderFrontRegardless()
+        if let disclosure = sideButtons.first { disclosure.invoke?() }
+        let originalSideRow = sideRows.first
+        let wasSidePopoverShown = sidePanel.sideChatsController.isShown
+        sidePanel.update(status: "侧边聊天后台刷新", enabled: true, soundEnabled: true, paused: false, runningTasks: [running("side-running")], interruptedTasks: [lost("side-interrupted")], sideChats: sideGroups)
+        results["side_chat_live_refresh_preserves_open_popover_and_parent_anchor"] = wasSidePopoverShown && sidePanel.sideChatsController.isShown && sidePanel.recentDocument?.subviews.first(where: { $0 is CueRecentRowButton || $0 is CueRunningRowButton }) === originalSideRow
+        sidePanel.toggleBatchMode()
+        results["side_chat_batch_mode_closes_popover_and_hides_child_actions"] = !sidePanel.sideChatsController.isShown && sidePanel.recentDocument!.subviews.filter { $0 is CueRecentRowButton || $0 is CueRunningRowButton }.allSatisfy { $0.subviews.compactMap { $0 as? CueSideChatButton }.allSatisfy(\.isHidden) }
+        let sideOpenCount = sideOpened.count
+        sideButtons.first?.invoke?()
+        if let child = sideGroups["side-unread"]?.first { sidePanel.openSideChat(child) }
+        results["side_chat_stale_controls_do_not_open_or_toggle_selection_in_batch"] = sideOpened.count == sideOpenCount && sidePanel.selectedThreads.isEmpty
+        sidePanel.sideChatsController.close(); sideWindow.orderOut(nil)
         return results
     }
 
@@ -1353,7 +1418,11 @@ final class CueStatusPopoverController: NSViewController {
         for id in ["fixture-followup", "fixture-interrupted", "pinned-read", "history-0", "history-1"] {
             details[id] = CueTaskDetail(raw: ["status": id == "fixture-interrupted" ? "interrupted" : "complete", "started_at": now.addingTimeInterval(-760).timeIntervalSince1970, "finished_at": now.addingTimeInterval(-300).timeIntervalSince1970, "elapsed_status": "complete", "turn_usage":captureUsage(154820), "history_usage":captureUsage(234567890, historical:true), "total_tokens": 154820, "input_tokens": 7820, "output_tokens": 12000, "cache_read_tokens": 135000, "tokens_status": "complete", "model": "gpt-6.1-sol", "reasoning_effort": "ultra", "service_tier": "standard"])
         }
-        panel.update(status: "界面样例 · 3 个运行 · 1 个中断待续", enabled: true, soundEnabled: true, paused: false, maximumHeight: 1100, runningTasks: tasks, interruptedTasks: [lost], taskDetails: details, attentionConnected: true)
+        let sideChats = CueSideChat.grouped(raw: ["state": "connected", "by_parent": ["pinned-running": [
+            CueSideChat.fixtureRaw(parent: "pinned-running", child: "fixture-side-running", title: "核对侧边聊天入口与状态", status: "running", now: now),
+            CueSideChat.fixtureRaw(parent: "pinned-running", child: "fixture-side-completed", title: "确认原生按钮与列表布局", status: "completed", now: now),
+        ]]])
+        panel.update(status: "界面样例 · 3 个运行 · 1 个中断待续", enabled: true, soundEnabled: true, paused: false, maximumHeight: 1100, runningTasks: tasks, interruptedTasks: [lost], taskDetails: details, attentionConnected: true, sideChats: sideChats)
         if batchMode { panel.toggleBatchMode(); panel.selectPinned(); panel.selectRunning() }
         let view = panel.view
         let window = NSWindow(contentRect: view.bounds, styleMask: .borderless, backing: .buffered, defer: false)
@@ -1445,6 +1514,7 @@ final class CueStatusPopoverController: NSViewController {
         }
         item("查看对话", #selector(reviewFromMenu(_:)))
         item("在 Codex 中打开", #selector(openCodexFromMenu(_:)))
+        if event.provider == "codex" { addSideChatsMenu(to: menu, parentID: event.threadID) }
         menu.addItem(.separator())
         item("复制标题", #selector(copyThreadValue(_:)), value: ["kind": "title", "event": event])
         item("复制对话 ID", #selector(copyThreadValue(_:)), value: ["kind": "id", "event": event])
@@ -1473,6 +1543,25 @@ final class CueStatusPopoverController: NSViewController {
     }
     @objc private func reviewFromMenu(_ sender: NSMenuItem) { if let event = sender.representedObject as? CueEvent { hoverController.hide(); actions.openEvent(event) } }
     @objc private func openCodexFromMenu(_ sender: NSMenuItem) { if let event = sender.representedObject as? CueEvent { hoverController.hide(); actions.openInCodex(event) } }
+    private func addSideChatsMenu(to menu: NSMenu, parentID: String) {
+        let children = sideChats[parentID]?.filter { $0.parentThreadID == parentID } ?? []
+        guard !children.isEmpty else { return }
+        let submenu = NSMenu(); submenu.autoenablesItems = false
+        for child in children {
+            let item = NSMenuItem(title: "\(child.title) · \(child.statusLabel)", action: #selector(openSideChatFromMenu(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = child; item.isEnabled = child.canOpen
+            item.toolTip = "在 Codex 打开 · " + child.threadID; submenu.addItem(item)
+        }
+        let item = NSMenuItem(title: "侧边聊天 \(children.count)", action: nil, keyEquivalent: "")
+        item.submenu = submenu; menu.addItem(item)
+    }
+    @objc private func openSideChatFromMenu(_ sender: NSMenuItem) {
+        if let child = sender.representedObject as? CueSideChat { openSideChat(child) }
+    }
+    private func openSideChat(_ child: CueSideChat) {
+        guard !batchMode, let latest = sideChats[child.parentThreadID]?.first(where: { $0.threadID == child.threadID && $0.parentThreadID == child.parentThreadID }), latest.canOpen else { return }
+        hoverController.hide(); sideChatsController.close(); actions.openSideChat(latest)
+    }
     @objc private func copyThreadValue(_ sender: NSMenuItem) {
         guard let payload = sender.representedObject as? [String: Any], let event = payload["event"] as? CueEvent else { return }
         let kind = payload["kind"] as? String
@@ -1587,6 +1676,31 @@ final class CueStatusPopoverController: NSViewController {
         }
         row.setAccessibilityHelp(line + "，" + detail.speedSelectionLine + "，" + elapsed + "。本轮 " + turn.tokenLine + "，" + turn.costLine + "。历史累计 " + detail.historyUsage.tokenLine + "，" + detail.historyUsage.costLine + "。悬停查看详情；点击打开对应对话。")
         configureQuickActions(in: row)
+        configureSideChats(in: row, threadID: threadID, title: (row as? CueRecentRowButton)?.record.event.title ?? (row as? CueRunningRowButton)?.followup?.title ?? (row as? CueRunningRowButton)?.task.title ?? "Codex 对话")
+    }
+    private func configureSideChats(in row: NSButton, threadID: String, title: String) {
+        let children = (sideChats[threadID] ?? []).filter { $0.parentThreadID == threadID }
+        let existing = row.subviews.compactMap { $0 as? CueSideChatButton }.first
+        guard !children.isEmpty, ((row as? CueRecentRowButton)?.record.event.provider ?? "codex") == "codex" else {
+            existing?.isHidden = true; return
+        }
+        let button = existing ?? CueSideChatButton()
+        if button.superview == nil { row.addSubview(button) }
+        let metadata = CueTaskRowLayout(width: row.bounds.width).metadata
+        let width: CGFloat = min(106, metadata.width)
+        button.frame = NSRect(x: metadata.maxX - width, y: metadata.minY - 3, width: width, height: 21)
+        button.title = "侧边聊天 \(children.count) ›"; button.isHidden = batchMode
+        button.setAccessibilityLabel("侧边聊天 \(children.count)：" + title)
+        button.toolTip = "查看此对话的临时侧边聊天"
+        if let field = row.subviews.first(where: { $0.identifier?.rawValue == "row-metadata" }) as? NSTextField, !batchMode {
+            field.frame.size.width = max(0, button.frame.minX - field.frame.minX - 6)
+        }
+        button.invoke = { [weak self, weak button] in
+            guard let self, !self.batchMode, let button, !button.isHidden,
+                  let latest = self.sideChats[threadID]?.filter({ $0.parentThreadID == threadID }), !latest.isEmpty else { return }
+            self.hoverController.hide(); self.pointerAnchor = nil
+            self.sideChatsController.show(parentID: threadID, parentTitle: title, children: latest, anchor: button) { [weak self] child in self?.openSideChat(child) }
+        }
     }
     private func rowInformation(threadID: String, eventDate: Date?) -> String {
         taskDetails[threadID]?.modelSelectionLine ?? "当前设置不可读"
@@ -1672,6 +1786,7 @@ final class CueStatusPopoverController: NSViewController {
         }
     }
     private func hover(_ inside: Bool, threadID: String, title: String, row: NSView) {
+        guard !sideChatsController.isShown else { hoverController.hide(); return }
         if inside {
             pointerAnchor = row
             hoverController.hover(threadID: threadID, title: title, anchor: row, provider: { [weak self] in self?.taskDetails[threadID] })
