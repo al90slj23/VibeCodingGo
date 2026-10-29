@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import select
 import socket
 import stat
 import struct
@@ -28,6 +29,8 @@ MAX_FRAME = 8 * 1024 * 1024
 # Ordinary RPC responses keep MAX_FRAME; no outbound request limit is raised.
 MAX_STREAM_FRAME = 32 * 1024 * 1024
 MAX_SEND = 32 * 1024
+SNAPSHOT_SETTLE_SECONDS = .2
+SNAPSHOT_SETTLE_FRAMES = 32
 DESKTOP_BUILDS = {('26.1021.31345', '21828')}
 VERSIONS = {'initialize': 0, 'thread-owner-discovery': 1,
             'thread-follower-read-model-settings': 1,
@@ -322,27 +325,69 @@ class DesktopChannel:
             self._stream_requested = True
 
     def runtime_snapshot(self):
+        # Import only after channel/module initialization: the long-lived
+        # attention adapter imports DesktopChannel. Reuse its bounded, body-free
+        # projection here without introducing an initialization-time cycle.
+        from .desktop_attention import AttentionProjection
+
         if not self.owner:
             self.discover()
         self._following(True)
         try:
             deadline = self._read_deadline()
+            settle_deadline = None
+            projection = None
+            received = 0
             while True:
-                message = self._receive(deadline)
+                if projection is not None:
+                    left = min(deadline, settle_deadline) - time.monotonic()
+                    readable, _, _ = select.select([self.socket], [], [], max(0, left))
+                    if not readable:
+                        # This state contains only projected runtime/request and
+                        # model metadata; no transient conversation body escapes.
+                        state = dict(projection.runtime.data, id=self.thread_id,
+                                     requests=projection.requests,
+                                     latestThreadSettings=projection.settings.settings)
+                        state.update({key: value for key, value in projection.settings.values.items()
+                                      if key in ('latestModel', 'latestReasoningEffort')})
+                        return _snapshot_metadata(state, self.thread_id, self.owner, projection.revision)
+                    if left <= 0:
+                        raise DesktopConnectionInterrupted('Codex 对话状态仍在同步，正在重新读取')
+                if received >= SNAPSHOT_SETTLE_FRAMES:
+                    raise DesktopConnectionInterrupted('Codex 对话状态更新过多，正在重新读取')
+                message = self._receive(min(deadline, settle_deadline) if settle_deadline is not None else deadline)
+                received += 1
+                if message.get('type') == 'broadcast' and message.get('method') == 'ipc-connection-reset':
+                    raise DesktopConnectionInterrupted('Codex 连接已重建，正在重新读取对话状态')
+                if message.get('type') == 'broadcast' and message.get('method') == 'client-status-changed':
+                    params = message.get('params')
+                    if isinstance(params, dict) and params.get('clientId') == self.owner and params.get('status') == 'disconnected':
+                        raise DesktopConnectionInterrupted('Codex 对话窗口已变化，正在重新读取状态')
                 if (message.get('type') != 'broadcast' or message.get('method') != 'thread-stream-state-changed' or
                         message.get('version') != 11 or message.get('sourceClientId') != self.owner or
-                        not isinstance(message.get('targetClientIds'), list) or self.client_id not in message['targetClientIds']):
+                        not isinstance(message.get('targetClientIds'), list) or
+                        not all(isinstance(target, str) for target in message['targetClientIds']) or
+                        self.client_id not in message['targetClientIds']):
                     continue
                 params = message.get('params')
                 if not isinstance(params, dict) or params.get('hostId') != 'local' or params.get('conversationId') != self.thread_id:
                     continue
                 change = params.get('change')
-                if not isinstance(change, dict) or change.get('type') != 'snapshot':
+                if not isinstance(change, dict):
+                    raise DesktopConnectionInterrupted('Codex 对话状态更新无效，正在重新读取')
+                if projection is None and change.get('type') != 'snapshot':
                     continue
-                revision = change.get('revision')
-                if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-                    raise ControlError('Codex 对话快照版本无效')
-                return _snapshot_metadata(change.get('conversationState'), self.thread_id, self.owner, revision)
+                try:
+                    if change.get('type') == 'snapshot':
+                        fresh = AttentionProjection(self.thread_id, self.owner)
+                        fresh.apply(change)
+                        projection = fresh
+                        if settle_deadline is None:
+                            settle_deadline = min(deadline, time.monotonic() + SNAPSHOT_SETTLE_SECONDS)
+                    else:
+                        projection.apply(change)
+                except ControlError:
+                    raise DesktopConnectionInterrupted('Codex 对话状态出现观察缺口，正在重新读取') from None
         except (OSError, TimeoutError, ConnectionError):
             raise DesktopConnectionInterrupted('Codex 对话状态读取尚未完成') from None
         finally:

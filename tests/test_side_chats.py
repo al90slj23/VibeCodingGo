@@ -245,30 +245,60 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn(CHILD, self.service.projections)
         self.assertEqual(len(self.service.known), 1)
 
-    def test_lower_revision_requires_fresh_follow_then_recovers_without_candidate_cooldown(self):
+    def test_lower_complete_snapshot_resets_baseline_then_patch_stays_on_single_follow(self):
         self.service._discover()
-        self.service._on_message(self.message(titled_state('Verified own title'), revision=90))
+        initial = titled_state('Verified own title')
+        initial['latestThreadSettings'] = {'model': 'old-model', 'effort': 'low', 'serviceTier': 'fast'}
+        initial['requests'] = [{'id': 'old-approval', 'method': 'item/commandExecution/requestApproval'}]
+        self.service._on_message(self.message(initial, revision=7805))
         original = self.service.projections[CHILD]
-        self.service._on_message(self.message(state('completed', 'idle'), revision=1))
-        self.service._on_message(self.message(state('completed', 'idle'), revision=91))  # Queued old stream.
-        self.assertEqual(original.revision, 90)
-        row = self.service.snapshot()['by_parent'][PARENT][0]
-        self.assertEqual(row['status'], 'disconnected')
-        self.assertFalse(row['can_open'])
-        self.assertEqual(row['title'], 'Verified own title')
-        self.service._discover()
-        self.assertNotIn(CHILD, self.service.projections)
-        self.assertFalse(self.service.channel.sent[-1]['params']['following'])
-        self.now += 2
-        self.service._discover()
-        self.assertIsNot(self.service.projections[CHILD], original)
-        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_interact'])
-        self.service._on_message(self.message(revision=1))
+        old_attention = original.attention
+        live = state()
+        live['turns'][0]['turnId'] = 'live-turn'
+        live['latestThreadSettings'] = {'model': 'new-model', 'effort': 'high'}
+        self.service._on_message(self.message(live, revision=322, sourceClientId='old-owner'))
+        self.service._on_message(self.message(live, revision=322, targetClientIds=['old-client']))
+        self.assertEqual(original.revision, 7805)
+        self.service._on_message(self.message(live, revision=322))
+        self.assertIs(self.service.projections[CHILD], original)
+        self.assertIsNot(original.attention, old_attention)
+        self.assertEqual(original.revision, 322)
+        self.assertEqual(original.attention.requests, [])
+        self.assertEqual(original.attention.settings.settings, {'model': 'new-model', 'effort': 'high'})
+        self.assertNotIn('turnHistory', original.attention.runtime.data)
         row = self.service.snapshot()['by_parent'][PARENT][0]
         self.assertEqual(row['status'], 'running')
+        self.assertEqual(row['turn_id'], 'live-turn')
+        self.assertTrue(row['can_open'])
         self.assertEqual(row['title'], 'Verified own title')
+        packet = self.message()
+        packet['params']['change'] = {'type': 'patches', 'baseRevision': 322, 'revision': 323,
+            'patches': [{'op': 'replace', 'path': ['turns', 0, 'status'], 'value': 'completed'},
+                        {'op': 'replace', 'path': ['threadRuntimeStatus'], 'value': {'type': 'idle', 'activeFlags': []}}]}
+        self.service._on_message(packet)
+        self.service._discover()
+        row = self.service.snapshot()['by_parent'][PARENT][0]
+        self.assertEqual(original.revision, 323)
+        self.assertEqual(row['status'], 'completed')
         self.assertTrue(row['can_interact'])
-        self.assertEqual(len(self.service.channel.calls), 2)
+        self.assertEqual(len(self.service.channel.calls), 1)
+        self.assertEqual([frame['params']['following'] for frame in self.service.channel.sent], [True])
+
+    def test_invalid_lower_snapshot_cannot_partially_replace_verified_metadata(self):
+        self.service._discover()
+        self.service._on_message(self.message(titled_state('Verified own title'), revision=7805))
+        projection = self.service.projections[CHILD]
+        old_attention = projection.attention
+        invalid = titled_state('Unvalidated title')
+        invalid['requests'] = None
+        self.service._on_message(self.message(invalid, revision=322))
+        self.assertIs(projection.attention, old_attention)
+        self.assertEqual(projection.revision, 7805)
+        self.assertEqual(projection.relation['title'], 'Verified own title')
+        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_open'])
+        self.service._on_message(self.message(revision=323))  # A retired subscription cannot repair itself.
+        self.assertEqual(projection.revision, 7805)
+        self.assertFalse(self.service.snapshot()['by_parent'][PARENT][0]['can_interact'])
 
     def test_patch_gap_loses_permissions_and_known_owner_replacement_revalidates(self):
         self.service._discover(); self.service._on_message(self.message(revision=90))

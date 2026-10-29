@@ -224,7 +224,18 @@ class SideChatProjection:
                                            'sideConversationParentNavigationPath', 'parentThreadId', 'source', 'threadSource', 'hostId'):
                     self.invalidated = True
                     raise ControlError('侧聊身份已变化，需要重新核对')
-        self.attention.apply(change)
+        attention = self.attention
+        revision = change.get('revision')
+        if (relation is not None and self.revision is not None and type(revision) is int
+                and 0 <= revision < self.revision):
+            # The native stream treats a complete snapshot as a new baseline.
+            # Validate every projected field before replacing the old epoch;
+            # following again can replay the same high cached initial snapshot.
+            from .desktop_attention import AttentionProjection
+            attention = AttentionProjection(self.thread, self.owner)
+            attention.runtime.clock = self.clock
+        attention.apply(change)
+        self.attention = attention
         if relation is not None:
             self.relation = relation
             if self.observed_at is None:
@@ -404,8 +415,8 @@ class SideChatService:
                 self.rejected.add(projection.thread)
                 return
             except ControlError:
-                # Revisions belong to this owner subscription. A restarted
-                # stream may begin lower, but must first be followed afresh.
+                # Patch gaps and invalid projected state require a fresh
+                # subscription; complete snapshots reset their baseline above.
                 projection.invalidated = True
                 self.next_attempt[projection.thread] = self.clock() + RECONNECT_SECONDS
                 return

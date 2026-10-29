@@ -444,7 +444,21 @@ class DesktopAttentionService:
             return
         with self._lock:
             try:
-                projection.apply(params.get('change'))
+                update = params.get('change')
+                revision = update.get('revision') if isinstance(update, dict) else None
+                if (isinstance(update, dict) and update.get('type') == 'snapshot' and
+                        type(revision) is int and projection.revision is not None and revision < projection.revision):
+                    # The native follower treats each full snapshot as a new
+                    # authoritative baseline, even when its in-memory revision
+                    # is lower than an initial cached snapshot. Refollowing can
+                    # replay that cached high revision forever. Validate all
+                    # projections first, then atomically retire the old epoch.
+                    fresh = AttentionProjection(projection.thread, projection.owner)
+                    fresh.apply(update)
+                    self.monitor.gap(projection.thread)
+                    self.projections[projection.thread] = projection = fresh
+                else:
+                    projection.apply(update)
             except ControlError:
                 # Revisions belong to the owner's in-memory conversation cache.
                 # Logout/reload can restart that cache at zero on the same

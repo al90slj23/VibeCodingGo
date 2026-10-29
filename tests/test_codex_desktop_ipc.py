@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import struct
 from types import SimpleNamespace
@@ -85,7 +86,9 @@ class DesktopIPCTests(unittest.TestCase):
         patches = [patch.object(ipc, '_private_socket'),
                    patch.object(ipc, '_peer_uid', return_value=os.getuid()),
                    patch.object(ipc, '_peer_bundle', return_value=Path('/Applications/ChatGPT.app')),
-                   patch.object(ipc.socket, 'socket', return_value=fake)]
+                   patch.object(ipc.socket, 'socket', return_value=fake),
+                   patch.object(ipc.select, 'select', side_effect=lambda read, write, error, timeout:
+                                ([fake] if fake.pending else [], [], []))]
         for p in patches:
             p.start(); self.addCleanup(p.stop)
         return fake, ipc.DesktopChannel(THREAD, codex_home=Path('/private/tmp/ipc-fixture'))
@@ -118,6 +121,92 @@ class DesktopIPCTests(unittest.TestCase):
         fake, channel = self.connect(FakeSocket(handler))
         with channel:
             self.assertEqual(channel.runtime_snapshot()['resume_state'], 'resumed')
+
+    def test_snapshot_settle_uses_low_full_baseline_and_contiguous_live_delta(self):
+        def handler(sock, value):
+            if value['type'] == 'broadcast' and value['params']['following']:
+                high = sock.snapshot()
+                high['params']['change']['revision'] = 7805
+                sock.pending.extend(frame(high))
+                low = sock.snapshot()
+                low['params']['change']['revision'] = 322
+                low['params']['change']['conversationState'] = {
+                    'id': THREAD, 'resumeState': 'resumed', 'requests': [],
+                    'threadRuntimeStatus': {'type': 'active', 'activeFlags': []},
+                    'latestThreadSettings': {'model': 'live-model', 'effort': 'ultra'},
+                    'turns': [{'turnId': 'live-turn', 'status': 'inProgress', 'items': [{'text': 'PRIVATE LIVE BODY'}]}]}
+                sock.pending.extend(frame(low))
+                delta = sock.snapshot()
+                delta['params']['change'] = {'type': 'patches', 'baseRevision': 322, 'revision': 323,
+                    'patches': [{'op': 'replace', 'path': ['threadRuntimeStatus'], 'value': {'type': 'idle'}},
+                                {'op': 'replace', 'path': ['turns', 0, 'status'], 'value': 'completed'},
+                                {'op': 'replace', 'path': ['latestThreadSettings', 'serviceTier'], 'value': 'priority'}]}
+                sock.pending.extend(frame(delta))
+                return True
+        fake, channel = self.connect(FakeSocket(handler))
+        with channel:
+            metadata = channel.runtime_snapshot()
+        self.assertEqual(metadata['revision'], 323)
+        self.assertEqual(metadata['thread_runtime_status'], {'type': 'idle'})
+        self.assertEqual(metadata['last_turn'], {'turnId': 'live-turn', 'status': 'completed'})
+        self.assertEqual(metadata['thread_settings'], {'model': 'live-model', 'effort': 'ultra', 'serviceTier': 'priority'})
+        self.assertFalse(metadata['requests_pending'])
+        self.assertNotIn('PRIVATE', json.dumps(metadata))
+        self.assertEqual([row['method'] for row in fake.sent],
+                         ['initialize', 'thread-owner-discovery', 'thread-stream-following-changed', 'thread-stream-following-changed'])
+
+    def test_wrong_identity_snapshots_after_initial_do_not_replace_verified_metadata(self):
+        def handler(sock, value):
+            if value['type'] == 'broadcast' and value['params']['following']:
+                sock.pending.extend(frame(sock.snapshot()))
+                for field, replacement in [('sourceClientId', OTHER), ('targetClientIds', [OTHER]),
+                                           ('targetClientIds', [CLIENT, None]), ('version', 12)]:
+                    wrong = sock.snapshot()
+                    wrong[field] = replacement
+                    wrong['params']['change']['revision'] = 999
+                    sock.pending.extend(frame(wrong))
+                for field, replacement in [('conversationId', 'wrong-thread'), ('hostId', 'other-host')]:
+                    wrong = sock.snapshot()
+                    wrong['params'][field] = replacement
+                    wrong['params']['change']['revision'] = 999
+                    sock.pending.extend(frame(wrong))
+                return True
+        _, channel = self.connect(FakeSocket(handler))
+        with channel:
+            self.assertEqual(channel.runtime_snapshot()['revision'], 7)
+
+    def test_gap_or_frame_budget_exhaustion_never_returns_cached_snapshot(self):
+        for invalid in ('gap', 'too-many-frames'):
+            with self.subTest(invalid=invalid):
+                def handler(sock, value):
+                    if value['type'] == 'broadcast' and value['params']['following']:
+                        sock.pending.extend(frame(sock.snapshot()))
+                        for index in range(1 if invalid == 'gap' else ipc.SNAPSHOT_SETTLE_FRAMES):
+                            delta = sock.snapshot()
+                            delta['params']['change'] = {'type': 'patches', 'baseRevision': 0 if invalid == 'gap' else 7 + index,
+                                                       'revision': 8 + index, 'patches': []}
+                            sock.pending.extend(frame(delta))
+                        return True
+                fake, channel = self.connect(FakeSocket(handler))
+                with channel:
+                    with self.assertRaises(ipc.DesktopConnectionInterrupted):
+                        channel.runtime_snapshot()
+                self.assertFalse(any(row['method'] == 'thread-follower-start-turn' for row in fake.sent))
+
+    def test_real_socket_partial_frame_after_snapshot_rejects_old_metadata(self):
+        # This uses real sockets/select/read deadlines independently of the
+        # in-memory fixture's deterministic readiness adapter.
+        for partial in (b'\x20\x00', struct.pack('<I', 32) + b'{'):
+            with self.subTest(partial_header=len(partial) < 4):
+                connection, server = socket.socketpair()
+                channel = ipc.DesktopChannel(THREAD, timeout=1)
+                channel.socket, channel.client_id, channel.owner = connection, CLIENT, OWNER
+                try:
+                    server.sendall(frame(FakeSocket().snapshot()) + partial)
+                    with self.assertRaises(ipc.DesktopConnectionInterrupted):
+                        channel.runtime_snapshot()
+                finally:
+                    channel.close(); server.close()
 
     def test_pending_or_malformed_requests_never_look_clear(self):
         for requests in [[{'completed': False}], [None], None]:

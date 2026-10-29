@@ -257,7 +257,7 @@ class ServiceTests(unittest.TestCase):
         self.wait_until(lambda: service.snapshot()['subscribed_threads'] == 2)
         return service, channels, events, resolutions
 
-    def test_same_owner_epoch_rollback_resubscribes_only_drifted_chat_and_settles_alert(self):
+    def test_same_owner_full_snapshot_replaces_only_its_epoch_and_settles_alert(self):
         with tempfile.TemporaryDirectory() as directory:
             service, channels, events, resolutions = self.create_epochs(Path(directory))
             channel = channels[0]
@@ -265,18 +265,17 @@ class ServiceTests(unittest.TestCase):
             channel.revisions[THREAD] = 101
             channel.queue(channel.snapshot(THREAD, requests=[request()]))
             self.wait_until(lambda: len(events) == 1)
+            old = service.projections[THREAD]
             channel.revisions[THREAD] = 0
             channel.queue(channel.snapshot(THREAD))
-            self.wait_until(lambda: THREAD not in service.projections)
+            self.wait_until(lambda: service.projections[THREAD].revision == 0)
             self.assertEqual(service.snapshot()['status'], 'connected')
-            self.assertEqual(service.snapshot()['reason_code'], 'stream_resync')
-            self.assertEqual(service.current_settings()[THREAD]['status'], 'unavailable')
-            self.assertNotIn(THREAD, service.current_runtime())
+            self.assertEqual(service.snapshot()['reason_code'], 'connected')
+            self.assertIsNot(service.projections[THREAD], old)
             self.assertEqual(service.monitor.pending, {})
             self.assertEqual(len(resolutions), 1)
             self.assertIs(service.projections['healthy-thread'], healthy)
             self.assertEqual(service.current_settings()['healthy-thread']['model'], 'model-8')
-            self.wait_until(lambda: THREAD in service.projections and service.projections[THREAD].revision == 0)
             self.assertEqual(len(channels), 1)
             self.assertEqual(service.current_settings()[THREAD]['model'], 'model-0')
             self.assertEqual(service.current_runtime()[THREAD]['turn_id'], 'new-epoch')
@@ -284,10 +283,52 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(service.snapshot()['reason_code'], 'connected')
             self.assertNotIn(THREAD, service.quarantine_until)
             follows = [(row['params']['conversationId'], row['params']['following']) for row in channel.sent]
-            self.assertEqual(follows.count((THREAD, False)), 1)
-            self.assertEqual(follows.count((THREAD, True)), 2)
+            self.assertEqual(follows.count((THREAD, False)), 0)
+            self.assertEqual(follows.count((THREAD, True)), 1)
             self.assertEqual(follows.count(('healthy-thread', True)), 1)
             self.assertTrue(all(row['method'] == 'thread-stream-following-changed' for row in channel.sent))
+
+    def test_cached_high_snapshot_then_low_live_snapshot_and_delta_keep_one_subscription(self):
+        channels = []
+        class CachedInitialChannel(self.EpochChannel):
+            def _send(self, value):
+                thread = value.get('params', {}).get('conversationId')
+                live_follow = thread == THREAD and value.get('params', {}).get('following') is True
+                if live_follow:
+                    self.revisions[THREAD] = 7805
+                super()._send(value)
+                if live_follow:
+                    self.revisions[THREAD] = 322
+                    live = self.snapshot(THREAD)
+                    live['params']['change']['conversationState'].update(
+                        latestThreadSettings={'model': 'live-model'},
+                        turns=[{'turnId': 'live-turn', 'status': 'inProgress'}])
+                    self.queue(live)
+                    delta = self.snapshot(THREAD)
+                    delta['params']['change'] = {'type': 'patches', 'baseRevision': 322, 'revision': 323,
+                        'patches': [{'op': 'replace', 'path': ['latestThreadSettings', 'effort'], 'value': 'ultra'}]}
+                    self.queue(delta)
+        def factory(*args, on_message, **kwargs): return CachedInitialChannel(on_message, channels)
+        with tempfile.TemporaryDirectory() as directory:
+            service = DesktopAttentionService(Path(directory), channel_factory=factory)
+            service.monitor.emit = lambda **value: self.fail('fixture cannot produce a real alert')
+            service.set_threads([THREAD, 'healthy-thread']); service.start()
+            try:
+                self.wait_until(lambda: service.snapshot()['subscribed_threads'] == 2 and
+                                service.projections[THREAD].revision == 323)
+                self.assertEqual(len(channels), 1)
+                settings = service.current_settings()[THREAD]
+                self.assertEqual((settings['model'], settings['reasoning_effort']), ('live-model', 'ultra'))
+                self.assertEqual(service.current_runtime()[THREAD]['turn_id'], 'live-turn')
+                self.assertEqual(service.current_settings()['healthy-thread']['model'], 'model-8')
+                self.assertEqual(service.snapshot()['reason_code'], 'connected')
+                self.assertEqual(service.resync_attempts, {})
+                follows = [(row['params']['conversationId'], row['params']['following']) for row in channels[0].sent]
+                self.assertEqual(follows.count((THREAD, True)), 1)
+                self.assertEqual(follows.count((THREAD, False)), 0)
+                self.assertEqual(follows.count(('healthy-thread', True)), 1)
+            finally:
+                service.stop()
 
     def test_patch_gap_discards_unsettled_pending_and_restarts_full_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
