@@ -383,6 +383,9 @@ struct CueStatusPopoverActions {
     var openInCodex: (CueEvent) -> Void = { _ in }
     var threadAction: (String, String) -> Void = { _, _ in }
     var openSideChat: (CueSideChat) -> Void = { _ in }
+    var openReminderSettings: () -> Void = {}
+    var openCodingTools: () -> Void = {}
+    var openTestTools: () -> Void = {}
 }
 
 /// An independent native control inside a navigation row. Its hit target is
@@ -794,18 +797,19 @@ final class CueStatusPopoverController: NSViewController {
         preferredContentSize = view.frame.size
         label("VibeCoding Go", NSRect(x: 22, y: 16, width: 260, height: 27), size: 18, weight: .semibold)
         label(status, NSRect(x: 22, y: 47, width: 535, height: 19), size: 11, color: .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("monitor-status")
-        let toolbarWidth = (panelWidth - 60) / 4
-        for (index, item) in [("打开面板", #selector(openSettings)), ("用量统计", #selector(openUsage)), ("测试提醒", #selector(demo)), ("结束", #selector(quit))].enumerated() {
+        let toolbarWidth = (panelWidth - 68) / 5
+        for (index, item) in [("工作台", #selector(openSettings)), ("提醒", #selector(openReminderSettings)), ("辅助 Coding", #selector(openCodingTools)), ("用量统计", #selector(openUsage)), ("Test", #selector(openTestTools))].enumerated() {
             button(item.0, NSRect(x: 18 + CGFloat(index) * (toolbarWidth + 8), y: 76, width: toolbarWidth, height: 30), item.1)
         }
+        label("提醒", NSRect(x: 22, y: 122, width: 52, height: 20), size: 11, color: .secondaryLabelColor, weight: .semibold).identifier = NSUserInterfaceItemIdentifier("module-reminders")
         let enable = NSButton(checkboxWithTitle: "启用提醒", target: self, action: #selector(toggleEnabled))
-        enable.frame = NSRect(x: 22, y: 119, width: 123, height: 25); enable.state = enabled ? .on : .off; view.addSubview(enable)
+        enable.frame = NSRect(x: 80, y: 119, width: 123, height: 25); enable.state = enabled ? .on : .off; view.addSubview(enable)
         enable.identifier = NSUserInterfaceItemIdentifier("setting-enabled")
         let sound = NSButton(checkboxWithTitle: "播放提示音", target: self, action: #selector(toggleSound))
-        sound.frame = NSRect(x: 158, y: 119, width: 143, height: 25); sound.state = soundEnabled ? .on : .off; view.addSubview(sound)
+        sound.frame = NSRect(x: 216, y: 119, width: 143, height: 25); sound.state = soundEnabled ? .on : .off; view.addSubview(sound)
         sound.identifier = NSUserInterfaceItemIdentifier("setting-sound")
         button(paused ? "恢复提醒" : "暂停 30 分钟", NSRect(x: panelWidth - 229, y: 116, width: 204, height: 30), #selector(pause)).identifier = NSUserInterfaceItemIdentifier("pause-button")
-        label("任务与提醒", NSRect(x: 22, y: 163, width: 130, height: 23), size: 13, weight: .semibold)
+        label("Coding · 对话", NSRect(x: 22, y: 163, width: 130, height: 23), size: 13, weight: .semibold)
         label(batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(snapshot.activeCount) 运行 · \(snapshot.recoveryByThread.count) 中断 · \(snapshot.deferredCount) 待续 · 历史 \(history.ordinaryCount)/50", NSRect(x: 155, y: 165, width: panelWidth - 290, height: 20), size: 11, color: history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("task-counts")
         button(batchMode ? "退出批量" : "批量模式", NSRect(x: panelWidth - 122, y: 157, width: 98, height: 29), #selector(toggleBatchMode))
         if batchMode {
@@ -1866,6 +1870,9 @@ final class CueStatusPopoverController: NSViewController {
     }
     @objc private func openSettings() { actions.openSettings() }
     @objc private func openUsage() { actions.openUsage() }
+    @objc private func openReminderSettings() { actions.openReminderSettings() }
+    @objc private func openCodingTools() { actions.openCodingTools() }
+    @objc private func openTestTools() { actions.openTestTools() }
     @objc private func toggleEnabled() { actions.toggleEnabled() }
     @objc private func toggleSound() { actions.toggleSound() }
     @objc private func pause() { actions.pause() }

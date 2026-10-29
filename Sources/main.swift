@@ -296,6 +296,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var statusPopover: NSPopover?
     var statusPopoverController: CueStatusPopoverController?
     var usageDashboard: CueUsageDashboardController?
+    var networkTests: CueNetworkTestsController?
     var accountQuotaMonitor: CueAccountQuotaMonitor?
     private var menuUsage: CueMenuBarUsageMonitor?
     private var recoveryClient: CueUsageClient?
@@ -1239,42 +1240,48 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     func refreshMenu() {
         guard statusItem != nil else { return }
         writeModelSettingsTargets()
-        let menu = NSMenu()
-        let panel = NSMenuItem(title: "打开 VibeCoding Go 面板…", action: #selector(openSettings), keyEquivalent: ",")
+        let menu = NSMenu(), remindersMenu = NSMenu(), codingMenu = NSMenu(), testMenu = NSMenu()
+        func command(_ title: String, _ action: Selector, in parent: NSMenu) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self; parent.addItem(item)
+        }
+        command("提醒概览与设置…", #selector(openReminderModule), in: remindersMenu)
+        command("Codex · 任务与对话…", #selector(openCodingModule), in: codingMenu)
+        command("Codex · 连接设置…", #selector(openCodingSettings), in: codingMenu)
+        command("网络检测工具…", #selector(openTestModule), in: testMenu)
+        command("检测来源与范围…", #selector(openTestSettings), in: testMenu)
+        let panel = NSMenuItem(title: "打开工作台…", action: #selector(openWorkbench), keyEquivalent: ",")
         panel.target = self; menu.addItem(panel)
         let usage = NSMenuItem(title: "用量统计与请求日志…", action: #selector(openUsage), keyEquivalent: "u")
-        usage.target = self; menu.addItem(usage)
+        usage.target = self; codingMenu.addItem(usage)
         let quota = NSMenuItem(title: "Codex 账号额度…", action: #selector(openAccountQuota), keyEquivalent: "")
-        quota.target = self; menu.addItem(quota)
-        let subtitle = NSMenuItem(title: "AI Coding Companion · AI 编程助手", action: nil, keyEquivalent: "")
-        subtitle.isEnabled = false; menu.addItem(subtitle)
-        menu.addItem(.separator())
+        quota.target = self; codingMenu.addItem(quota)
         let status = NSMenuItem(title: pausedUntil == nil ? "VibeCoding Go · \(watcherHealthText)" : "已暂停提醒 30 分钟", action: nil, keyEquivalent: "")
-        status.isEnabled = false; menu.addItem(status)
-        menu.addItem(.separator())
+        status.isEnabled = false; codingMenu.addItem(.separator()); codingMenu.addItem(status)
+        remindersMenu.addItem(.separator())
         let enabled = NSMenuItem(title: "启用提醒", action: #selector(toggleEnabled), keyEquivalent: "")
-        enabled.target = self; enabled.state = settings.enabled ? .on : .off; menu.addItem(enabled)
+        enabled.target = self; enabled.state = settings.enabled ? .on : .off; remindersMenu.addItem(enabled)
         let mute = NSMenuItem(title: "播放提示音", action: #selector(toggleMute), keyEquivalent: "")
-        mute.target = self; mute.state = muted ? .off : .on; menu.addItem(mute)
+        mute.target = self; mute.state = muted ? .off : .on; remindersMenu.addItem(mute)
         let pause = NSMenuItem(title: pausedUntil == nil ? "暂停提醒 30 分钟" : "恢复提醒", action: #selector(togglePause), keyEquivalent: "")
-        pause.target = self; menu.addItem(pause)
+        pause.target = self; remindersMenu.addItem(pause)
         let demoMenu = NSMenu()
         for (name, kind) in [("完成", "complete"), ("需要回答", "input"), ("人工批准测试", "permission")] {
             let item = NSMenuItem(title: "\(name) · \(settings.soundName(for: kind))", action: #selector(demo(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = kind; demoMenu.addItem(item)
         }
-        let tests = NSMenuItem(title: "测试提醒效果", action: nil, keyEquivalent: ""); tests.submenu = demoMenu; menu.addItem(tests)
+        let tests = NSMenuItem(title: "测试提醒效果", action: nil, keyEquivalent: ""); tests.submenu = demoMenu; remindersMenu.addItem(tests)
         let audioMenu = NSMenu()
         for (name, kind) in [("完成", "complete"), ("需要回答", "input"), ("人工批准测试音", "permission")] {
             let item = NSMenuItem(title: "\(name) · \(settings.soundName(for: kind))", action: #selector(testSound(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = kind; item.isEnabled = !muted; audioMenu.addItem(item)
         }
-        let audioTests = NSMenuItem(title: "只测试提示音", action: nil, keyEquivalent: ""); audioTests.submenu = audioMenu; menu.addItem(audioTests)
+        let audioTests = NSMenuItem(title: "只测试提示音", action: nil, keyEquivalent: ""); audioTests.submenu = audioMenu; remindersMenu.addItem(audioTests)
         if !recent.isEmpty || !runningTasks.isEmpty || !interruptedTasks.isEmpty || !recentHistory.followups.records.isEmpty {
-            menu.addItem(.separator())
+            codingMenu.addItem(.separator())
             func heading(_ title: String) {
                 let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-                item.isEnabled = false; menu.addItem(item)
+                item.isEnabled = false; codingMenu.addItem(item)
             }
             func reminder(_ record: CueRecentRecord) {
                 let event = record.event
@@ -1283,7 +1290,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 let item = NSMenuItem(title: title, action: #selector(openRecent(_:)), keyEquivalent: "")
                 item.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: record.isOpened ? NSColor.secondaryLabelColor : NSColor.systemBlue, .font: NSFont.systemFont(ofSize: 13, weight: record.isOpened ? .regular : .semibold)])
                 item.target = self; item.representedObject = event.id; item.isEnabled = record.canOpen
-                item.toolTip = "\(event.label) · \(event.title)"; menu.addItem(item)
+                item.toolTip = "\(event.label) · \(event.title)"; codingMenu.addItem(item)
             }
             let pinned = recentHistory.records.filter(\.isPinned)
             if !pinned.isEmpty { heading("置顶提醒 · \(pinned.count) 条"); pinned.forEach(reminder) }
@@ -1293,7 +1300,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 heading("置顶任务 · \(pinnedFollowups.count) 项")
                 for task in pinnedFollowups {
                     let item = NSMenuItem(title: "\(task.unread ? "● " : "📌 ")\(task.title.prefix(52))", action: #selector(openFollowupRecent(_:)), keyEquivalent: "")
-                    item.target = self; item.representedObject = task.threadID; menu.addItem(item)
+                    item.target = self; item.representedObject = task.threadID; codingMenu.addItem(item)
                 }
             }
             let pinnedThreads = alertPinnedThreads.union(pinnedFollowups.map(\.threadID))
@@ -1302,7 +1309,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 heading("正在运行 · \(active.count) 项")
                 for task in active {
                     let item = NSMenuItem(title: "◉ \(task.title.prefix(52))", action: #selector(openRunningRecent(_:)), keyEquivalent: "")
-                    item.target = self; item.representedObject = task.threadID; menu.addItem(item)
+                    item.target = self; item.representedObject = task.threadID; codingMenu.addItem(item)
                 }
             }
             let interrupted = interruptedTasks.filter { !pinnedThreads.contains($0.threadID) }
@@ -1310,7 +1317,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 heading("中断待续 · \(interrupted.count) 项")
                 for task in interrupted {
                     let item = NSMenuItem(title: "⚠ \(task.title.prefix(52)) · \(task.recoveryLabel)", action: #selector(openRunningRecent(_:)), keyEquivalent: "")
-                    item.target = self; item.representedObject = task.threadID; item.toolTip = task.recoveryReason; menu.addItem(item)
+                    item.target = self; item.representedObject = task.threadID; item.toolTip = task.recoveryReason; codingMenu.addItem(item)
                 }
             }
             let activeIDs = Set((runningTasks + interruptedTasks).map(\.threadID))
@@ -1319,13 +1326,17 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 heading("待续 · \(pending.count) 项")
                 for task in pending {
                     let item = NSMenuItem(title: "🔖 \(task.title.prefix(52))", action: #selector(openFollowupRecent(_:)), keyEquivalent: "")
-                    item.target = self; item.representedObject = task.threadID; menu.addItem(item)
+                    item.target = self; item.representedObject = task.threadID; codingMenu.addItem(item)
                 }
             }
             let pendingIDs = Set(recentHistory.followups.records.map(\.threadID))
             let ordinary = recentHistory.records.filter { !$0.isPinned && !($0.event.provider == "codex" && (activeIDs.contains($0.event.threadID) || pendingIDs.contains($0.event.threadID))) }
             if !ordinary.isEmpty { heading("历史提醒 · \(ordinary.count) 条"); ordinary.forEach(reminder) }
         }
+        for (title, submenu) in [("提醒", remindersMenu), ("辅助 Coding · Codex", codingMenu), ("Test", testMenu)] {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: ""); item.submenu = submenu; menu.addItem(item)
+        }
+        command("通用设置…", #selector(openGeneralSettings), in: menu)
         menu.addItem(.separator())
         let exit = NSMenuItem(title: "结束 VibeCoding Go", action: #selector(quit), keyEquivalent: "q")
         exit.target = self; menu.addItem(exit)
@@ -1369,6 +1380,26 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         usageDashboard?.showAccounts()
         NSApp.activate(ignoringOtherApps: true)
     }
+    func openWorkspacePage(_ page: CueWorkspacePage) {
+        statusPopover?.performClose(nil)
+        openSettings(); settingsPanel?.selectPage(page.rawValue)
+    }
+    @objc func openWorkbench() { openWorkspacePage(.workspace) }
+    @objc func openReminderModule() { openWorkspacePage(.reminderOverview) }
+    @objc func openCodingModule() { openWorkspacePage(.codingTasks) }
+    @objc func openTestModule() { openWorkspacePage(.networkTests) }
+    @objc func openCodingSettings() { openWorkspacePage(.codexSettings) }
+    @objc func openTestSettings() { openWorkspacePage(.testSettings) }
+    @objc func openGeneralSettings() { openWorkspacePage(.general) }
+    @objc func openNetworkTests() { showNetworkTests(kind: "ip_reputation") }
+    func showNetworkTests(kind: String) {
+        statusPopover?.performClose(nil)
+        if networkTests == nil { networkTests = CueNetworkTestsController(home: home) }
+        networkTests?.selectKind(kind)
+        networkTests?.showWindow(nil); networkTests?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     @objc func openUsage() {
         statusPopover?.performClose(nil)
         if usageDashboard == nil { usageDashboard = CueUsageDashboardController(home: home) }
@@ -1386,8 +1417,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         }
         if statusPopover?.isShown == true { statusPopover?.performClose(nil); writeStatus(); return }
         if statusPopoverController == nil {
-            let actions = CueStatusPopoverActions(
-                openSettings: { [weak self] in self?.statusPopover?.performClose(nil); self?.openSettings() },
+            var actions = CueStatusPopoverActions(
+                openSettings: { [weak self] in self?.openWorkbench() },
                 openUsage: { [weak self] in self?.openUsage() },
                 toggleEnabled: { [weak self] in self?.toggleEnabled() },
                 toggleSound: { [weak self] in self?.toggleMute() },
@@ -1429,6 +1460,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                     guard let destination = url.url, self.openConversationURL(destination) else { return }
                     self.statusPopover?.performClose(nil)
                 })
+            actions.openReminderSettings = { [weak self] in self?.openReminderModule() }
+            actions.openCodingTools = { [weak self] in self?.openCodingModule() }
+            actions.openTestTools = { [weak self] in self?.openTestModule() }
             statusPopoverController = CueStatusPopoverController(history: recentHistory, actions: actions)
             let popover = NSPopover(); popover.behavior = .transient
             popover.contentViewController = statusPopoverController
@@ -1552,6 +1586,8 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     var threadLabel: NSTextField?
     var latestLabel: NSTextField?
     var hookLabel: NSTextField?
+    var codingConnectionLabel: NSTextField?
+    var codingCountsLabel: NSTextField?
     var sliderLabels: [String: NSTextField] = [:]
     var selectedKind = "complete"
     var appearanceTab = 0
@@ -1602,43 +1638,55 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         sidebar.addSubview(mark)
         label("VCGo", in: sidebar, frame: NSRect(x: 60, y: 29, width: 116, height: 30), size: 19, weight: .semibold)
         label("AI 编程助手", in: sidebar, frame: NSRect(x: 20, y: 73, width: 156, height: 18), size: 11, color: .secondaryLabelColor)
-        for (index, pair) in [("总览", "square.grid.2x2"), ("提醒规则", "bell"), ("泛光与声音", "waveform"), ("集成与文件", "puzzlepiece.extension"), ("用量统计", "chart.bar.xaxis")].enumerated() {
-            let button = NSButton(title: pair.0, target: self, action: #selector(navigate(_:)))
-            button.image = NSImage(systemSymbolName: pair.1, accessibilityDescription: nil)
-            button.imagePosition = .imageLeading; button.imageScaling = .scaleProportionallyDown
-            button.alignment = .left; button.isBordered = false
-            button.font = .systemFont(ofSize: 13, weight: .medium)
-            button.frame = NSRect(x: 13, y: 147 + index * 46, width: 156, height: 37)
-            button.tag = index; button.identifier = NSUserInterfaceItemIdentifier("settings.page.\(index)")
-            button.wantsLayer = true; button.layer?.cornerRadius = 8
-            sidebar.addSubview(button); navigation.append(button)
+        func section(_ title: String, y: CGFloat) {
+            let text = label(title, in: sidebar, frame: NSRect(x: 20, y: y, width: 150, height: 16), size: 10, weight: .semibold, color: .tertiaryLabelColor)
+            text.identifier = NSUserInterfaceItemIdentifier("module." + title)
         }
-        let line = NSView(frame: NSRect(x: 20, y: 517, width: 142, height: 1))
+        section("提醒", y: 151); section("辅助 Coding · Codex", y: 277); section("Test", y: 403)
+        let positions: [CueWorkspacePage: CGFloat] = [.workspace: 108, .reminderOverview: 169, .reminderRules: 201, .reminderEffects: 233, .codingTasks: 295, .usage: 327, .codexSettings: 359, .networkTests: 421, .testSettings: 453, .general: 497]
+        for item in CueWorkspacePage.ordered {
+            let control = NSButton(title: item.title, target: self, action: #selector(navigate(_:)))
+            control.image = NSImage(systemSymbolName: item.symbol, accessibilityDescription: nil)
+            control.imagePosition = .imageLeading; control.imageScaling = .scaleProportionallyDown
+            control.alignment = .left; control.isBordered = false
+            control.font = .systemFont(ofSize: 12, weight: .medium)
+            control.frame = NSRect(x: 10, y: positions[item] ?? 108, width: 166, height: 30)
+            control.tag = item.rawValue; control.identifier = NSUserInterfaceItemIdentifier("settings.page.\(item.rawValue)")
+            control.toolTip = item.module + " / " + item.title
+            control.wantsLayer = true; control.layer?.cornerRadius = 7
+            sidebar.addSubview(control); navigation.append(control)
+        }
+        let line = NSView(frame: NSRect(x: 20, y: 537, width: 142, height: 1))
         line.wantsLayer = true; line.layer?.backgroundColor = NSColor.separatorColor.cgColor; sidebar.addSubview(line)
-        label("本机运行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 533, width: 154, height: 19), size: 10.5, color: .secondaryLabelColor)
-        label("VCGo \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.5.0")", in: sidebar, frame: NSRect(x: 20, y: 555, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
+        label("本机运行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 544, width: 154, height: 17), size: 10.5, color: .secondaryLabelColor)
+        label("VCGo \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.5.0")", in: sidebar, frame: NSRect(x: 20, y: 565, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
     }
 
     @objc func navigate(_ sender: NSButton) {
-        if sender.tag == 4 { cue.openUsage(); return }
         selectPage(sender.tag)
     }
-    func selectPage(_ value: Int) { page = min(3, max(0, value)); rebuild() }
+    func selectPage(_ value: Int) { page = (CueWorkspacePage(rawValue: value) ?? .workspace).rawValue; rebuild() }
 
     func rebuild() {
         content.subviews.forEach { $0.removeFromSuperview() }
-        healthLabel = nil; threadLabel = nil; latestLabel = nil; hookLabel = nil; sliderLabels = [:]; previewStatusLabel = nil
-        for (index, button) in navigation.enumerated() {
-            button.layer?.backgroundColor = (index == page ? NSColor.controlAccentColor.withAlphaComponent(0.1) : .clear).cgColor
-            button.contentTintColor = index == page ? .labelColor : .secondaryLabelColor
+        healthLabel = nil; threadLabel = nil; latestLabel = nil; hookLabel = nil; codingConnectionLabel = nil; codingCountsLabel = nil; sliderLabels = [:]; previewStatusLabel = nil
+        for button in navigation {
+            button.layer?.backgroundColor = (button.tag == page ? NSColor.controlAccentColor.withAlphaComponent(0.1) : .clear).cgColor
+            button.contentTintColor = button.tag == page ? .labelColor : .secondaryLabelColor
         }
-        switch page {
-        case 0: overview()
-        case 1: notifications()
-        case 2: glowAndSound()
-        default: providers()
+        switch CueWorkspacePage(rawValue: page) ?? .workspace {
+        case .workspace: overview()
+        case .reminderOverview: reminderOverview()
+        case .reminderRules: notifications()
+        case .reminderEffects: glowAndSound()
+        case .codexSettings: providers()
+        case .codingTasks: codingOverview()
+        case .usage: codingUsage()
+        case .networkTests: testOverview()
+        case .testSettings: testPreferences()
+        case .general: generalPreferences()
         }
-        if page != 1 { label(cue.appearanceMigrationError.isEmpty ? "变更会立即保存到本机。" : cue.appearanceMigrationError, in: content, frame: NSRect(x: 26, y: 558, width: 525, height: 18), size: 11, color: cue.appearanceMigrationError.isEmpty ? .tertiaryLabelColor : .systemOrange) }
+        if [2, 5, 9].contains(page) { label(cue.appearanceMigrationError.isEmpty ? "变更会立即保存到本机。" : cue.appearanceMigrationError, in: content, frame: NSRect(x: 26, y: 558, width: 525, height: 18), size: 11, color: cue.appearanceMigrationError.isEmpty ? .tertiaryLabelColor : .systemOrange) }
         updateHealth()
     }
 
@@ -1703,7 +1751,94 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func overview() {
-        heading("AI 编程助手", "集中查看对话、协作任务与用量，掌握每一步进展。")
+        heading("工作台", "提醒、辅助 Coding 与 Test，按板块进入，分别设置。")
+        for (y, title, detail, target) in [(CGFloat(106), "提醒", "完成、等待输入、人工批准 · 规则、光影、提示框与声音", 5), (CGFloat(246), "辅助 Coding · Codex", "任务与对话、运行状态、用量统计、账号额度和连接设置", 6), (CGFloat(386), "Test · 网络检测", "IP 信誉、域名可达性、出口痕迹、全球 Ping 与下载测速", 7)] {
+            let box = card(y, 124)
+            label(title, in: box, frame: NSRect(x: 20, y: 17, width: 480, height: 25), size: 16, weight: .semibold)
+            label(detail, in: box, frame: NSRect(x: 20, y: 51, width: 480, height: 33), size: 11.5, color: .secondaryLabelColor, lines: 2)
+            let enter = button("进入板块", in: box, frame: NSRect(x: 370, y: 83, width: 136, height: 29), action: #selector(goPage(_:)))
+            enter.tag = target
+        }
+    }
+    @objc func goPage(_ sender: NSButton) { selectPage(sender.tag) }
+    @objc func goCoding() { selectPage(CueWorkspacePage.codingTasks.rawValue) }
+    @objc func goUsage() { selectPage(CueWorkspacePage.usage.rawValue) }
+    @objc func goReminder() { selectPage(CueWorkspacePage.reminderOverview.rawValue) }
+    @objc func showTasks() { cue.toggleStatusPopover() }
+    @objc func showUsage() { cue.openUsage() }
+    @objc func showAccounts() { cue.openAccountQuota() }
+    @objc func runNetworkTool(_ sender: NSButton) { cue.showNetworkTests(kind: sender.identifier?.rawValue ?? "ip_reputation") }
+
+    func codingOverview() {
+        heading("辅助 Coding · Codex", "当前支持 Codex；对话、任务状态和设置集中管理。")
+        let live = card(106, 181)
+        label("任务与对话", in: live, frame: NSRect(x: 20, y: 17, width: 486, height: 26), size: 17, weight: .semibold)
+        codingCountsLabel = label("", in: live, frame: NSRect(x: 20, y: 54, width: 486, height: 24), size: 13)
+        codingConnectionLabel = label("", in: live, frame: NSRect(x: 20, y: 86, width: 486, height: 38), size: 11, color: .secondaryLabelColor, lines: 2)
+        _ = button("打开任务与对话列表", in: live, frame: NSRect(x: 16, y: 133, width: 490, height: 31), action: #selector(showTasks))
+        let tools = card(306, 124)
+        label("用量与账号额度", in: tools, frame: NSRect(x: 20, y: 15, width: 486, height: 23), size: 14, weight: .semibold)
+        label("Token 与 API 参考费用、请求日志、模型价格和账号重置时间。", in: tools, frame: NSRect(x: 20, y: 45, width: 486, height: 22), size: 11, color: .secondaryLabelColor)
+        _ = button("用量统计", in: tools, frame: NSRect(x: 16, y: 79, width: 240, height: 31), action: #selector(showUsage))
+        _ = button("Codex 账号额度", in: tools, frame: NSRect(x: 269, y: 79, width: 238, height: 31), action: #selector(showAccounts))
+        label("提醒的触发条件和外观在「提醒」板块设置；网络检测在「Test」板块。", in: content, frame: NSRect(x: 27, y: 457, width: 520, height: 45), size: 11.5, color: .secondaryLabelColor, lines: 2)
+    }
+    func codingUsage() {
+        heading("辅助 Coding · 用量与额度", "用量账本与订阅额度分别展示，跟随现有币种和汇率设置。")
+        let usage = card(106, 167)
+        label("用量统计与请求日志", in: usage, frame: NSRect(x: 20, y: 17, width: 486, height: 25), size: 16, weight: .semibold)
+        label("Codex、Claude Code 与 OpenCode 的本机历史用量。统计设置管理同步频率、币种、汇率和模型价格来源。", in: usage, frame: NSRect(x: 20, y: 53, width: 486, height: 44), size: 12, color: .secondaryLabelColor, lines: 3)
+        _ = button("打开用量统计与统计设置", in: usage, frame: NSRect(x: 16, y: 116, width: 490, height: 31), action: #selector(showUsage))
+        let quota = card(291, 167)
+        label("Codex 账号额度", in: quota, frame: NSRect(x: 20, y: 17, width: 486, height: 25), size: 16, weight: .semibold)
+        label("同时查看已接入账号的本周剩余、短窗口额度与重置时间，沿用现有 CC Switch 共享。", in: quota, frame: NSRect(x: 20, y: 53, width: 486, height: 44), size: 12, color: .secondaryLabelColor, lines: 3)
+        _ = button("查看账号额度", in: quota, frame: NSRect(x: 16, y: 116, width: 490, height: 31), action: #selector(showAccounts))
+    }
+    func testOverview() {
+        heading("Test · 网络检测", "手动发起检测，运行前显示第三方来源与检测范围。")
+        for (index, item) in [("IP 纯净度与信誉", "归属、网络类型与公开风险信号，缺少的信号明确标注。", "ip_reputation"), ("域名可达性与封禁线索", "检查 DNS、TLS 与 HTTP，也可比较全球节点结果。", "domain"), ("出口 IP 与痕迹", "查看出口与系统代理信号，按需进入浏览器泄露检测。", "ip_trace"), ("全球 Ping 与测速", "全球节点的 Ping / HTTP 表现，以及本机下载速度。", "global_ping")].enumerated() {
+            let box = card(106 + CGFloat(index) * 108, 95)
+            label(item.0, in: box, frame: NSRect(x: 20, y: 13, width: 330, height: 23), size: 14, weight: .semibold)
+            label(item.1, in: box, frame: NSRect(x: 20, y: 44, width: 350, height: 34), size: 11, color: .secondaryLabelColor, lines: 2)
+            _ = button("打开工具", in: box, frame: NSRect(x: 382, y: 33, width: 124, height: 31), action: #selector(runNetworkTool(_:)), represented: item.2)
+        }
+    }
+    func testPreferences() {
+        heading("Test · 检测来源与范围", "检测由你手动发起，公网 IP 或目标会发送给相应检测服务。")
+        let limits = card(106, 173)
+        label("检测范围", in: limits, frame: NSRect(x: 20, y: 15, width: 486, height: 24), size: 14, weight: .semibold)
+        label("全球检测节点数", in: limits, frame: NSRect(x: 20, y: 57, width: 260, height: 23), size: 12)
+        let probes = NSPopUpButton(frame: NSRect(x: 343, y: 52, width: 160, height: 28), pullsDown: false)
+        for value in [3, 5, 6] { probes.addItem(withTitle: "\(value) 个节点"); probes.lastItem?.tag = value; if value == CueNetworkTestPreferences.probeLimit { probes.select(probes.lastItem) } }
+        probes.target = self; probes.action = #selector(changeTestProbe(_:)); probes.setAccessibilityLabel("全球检测节点数"); limits.addSubview(probes)
+        label("单次下载上限", in: limits, frame: NSRect(x: 20, y: 105, width: 260, height: 23), size: 12)
+        let download = NSPopUpButton(frame: NSRect(x: 343, y: 100, width: 160, height: 28), pullsDown: false)
+        for value in [1, 3, 5] { download.addItem(withTitle: "\(value) MiB"); download.lastItem?.tag = value; if value == CueNetworkTestPreferences.downloadMiB { download.select(download.lastItem) } }
+        download.target = self; download.action = #selector(changeTestDownload(_:)); download.setAccessibilityLabel("单次下载上限"); limits.addSubview(download)
+        label("范围设置会在下次运行时生效。", in: limits, frame: NSRect(x: 20, y: 144, width: 486, height: 17), size: 10.5, color: .tertiaryLabelColor)
+        let sources = card(297, 231)
+        label("来源与结果边界", in: sources, frame: NSRect(x: 20, y: 16, width: 486, height: 24), size: 14, weight: .semibold)
+        label("Globalping：多地区 Ping 与 HTTP 测量，目标测量可能公开留存。\nipify / ipapi.is / proxycheck.io：出口、归属与信誉，逐项展示覆盖。\nCloudflare：受限下载测速，结果反映本机当前出口。\n浏览器检测：在实际使用的浏览器中打开专用检测页面。", in: sources, frame: NSRect(x: 20, y: 55, width: 486, height: 117), size: 11.5, color: .secondaryLabelColor, lines: 7)
+        label("检测结果表示当时、该来源和该路径的观察；地区差异与超时需要结合原因判断。", in: sources, frame: NSRect(x: 20, y: 177, width: 486, height: 40), size: 10.5, color: .tertiaryLabelColor, lines: 3)
+    }
+    @objc func changeTestProbe(_ sender: NSPopUpButton) { if let value = sender.selectedItem?.tag { CueNetworkTestPreferences.probeLimit = value } }
+    @objc func changeTestDownload(_ sender: NSPopUpButton) { if let value = sender.selectedItem?.tag { CueNetworkTestPreferences.downloadMiB = value } }
+    func generalPreferences() {
+        heading("通用 · 应用与本机数据", "管理应用信息、源码位置与本机数据。")
+        let about = card(106, 132)
+        label("VibeCoding Go · VCGo", in: about, frame: NSRect(x: 20, y: 17, width: 486, height: 26), size: 17, weight: .semibold)
+        label("版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—") · 原生 macOS AI 编程助手", in: about, frame: NSRect(x: 20, y: 56, width: 486, height: 22), size: 12, color: .secondaryLabelColor)
+        label("登录启动沿用当前已安装的本机启动项。", in: about, frame: NSRect(x: 20, y: 91, width: 486, height: 22), size: 11, color: .tertiaryLabelColor)
+        let files = card(256, 191)
+        label("本机文件", in: files, frame: NSRect(x: 20, y: 16, width: 486, height: 24), size: 14, weight: .semibold)
+        label(cue.home.path, in: files, frame: NSRect(x: 20, y: 55, width: 486, height: 43), size: 11, color: .secondaryLabelColor, lines: 3)
+        _ = button("源码文件夹", in: files, frame: NSRect(x: 16, y: 119, width: 157, height: 31), action: #selector(openSource))
+        _ = button("设置与数据", in: files, frame: NSRect(x: 180, y: 119, width: 157, height: 31), action: #selector(openConfig))
+        _ = button("诊断日志", in: files, frame: NSRect(x: 344, y: 119, width: 162, height: 31), action: #selector(openLogs))
+    }
+
+    func reminderOverview() {
+        heading("提醒 · 概览", "管理需要你注意的时刻：完成、提问和人工批准。")
         let status = card(106, 199)
         label("CODEX · 本机监控", in: status, frame: NSRect(x: 20, y: 17, width: 480, height: 21), size: 11, weight: .semibold, color: .secondaryLabelColor)
         healthLabel = label("", in: status, frame: NSRect(x: 20, y: 50, width: 480, height: 26), size: 18, weight: .semibold)
@@ -1721,7 +1856,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     @objc func openRecentInbox(_ sender: NSButton) { cue.toggleStatusPopover(sender) }
 
     func notifications() {
-        heading("提醒外观", "克制的光线，清楚的对话。按分类选择，点选即预览。")
+        heading("提醒 · 规则与样式", "按提醒类型配置屏幕特效、提示框与声音，点选即预览。")
         let selector = NSPopUpButton(frame: NSRect(x: 26, y: 106, width: 526, height: 31), pullsDown: false)
         for (name, kind) in [("本轮已完成", "complete"), ("需要回答或判断", "input"), ("人工批准", "permission")] {
             selector.addItem(withTitle: name); selector.lastItem?.representedObject = kind
@@ -1974,7 +2109,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func glowAndSound() {
-        heading("泛光与声音", "调整提醒的存在感，保留你的工作节奏。")
+        heading("提醒 · 全局效果与音量", "这些设置仅影响提醒，不影响 Coding 工具和 Test 检测。")
         let glow = card(106, 204)
         toggle("屏幕边缘泛光", "提示卡仍会显示对话名称。", in: glow, y: 16, key: "glow_enabled", on: cue.settings.glowEnabled)
         toggle("在所有屏幕显示泛光", "关闭后只使用鼠标所在的屏幕。", in: glow, y: 78, key: "all_displays", on: cue.settings.allDisplays)
@@ -1989,7 +2124,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func providers() {
-        heading("集成与文件", "AI Coding Companion · 目前已接入 Codex。")
+        heading("辅助 Coding · Codex 连接", "管理 Codex 的本机连接和记录读取来源。")
         let provider = card(106, 294)
         label("Codex", in: provider, frame: NSRect(x: 20, y: 17, width: 486, height: 27), size: 18, weight: .semibold)
         healthLabel = label("", in: provider, frame: NSRect(x: 20, y: 53, width: 486, height: 21), size: 12, weight: .semibold)
@@ -1998,15 +2133,18 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         _ = button(cue.codexConnectionState == "connected" ? "刷新 Codex 连接" : "立即重试自动连接", in: provider, frame: NSRect(x: 16, y: 194, width: 244, height: 31), action: #selector(connectManualApproval))
         _ = button("授权读取本机记录…", in: provider, frame: NSRect(x: 269, y: 194, width: 238, height: 31), action: #selector(authorizeHistoryRead))
         label("自动复用当前 Codex 连接；Codex 退出、重开或连接中断后会自动恢复，无需重启任务或重新授权。", in: provider, frame: NSRect(x: 20, y: 239, width: 486, height: 42), size: 10.5, color: .tertiaryLabelColor, lines: 3)
-        let files = card(418, 126)
-        label("本机文件", in: files, frame: NSRect(x: 20, y: 15, width: 480, height: 22), size: 13, weight: .semibold)
-        label(cue.home.path, in: files, frame: NSRect(x: 20, y: 43, width: 486, height: 27), size: 10.5, color: .secondaryLabelColor, lines: 2)
-        _ = button("源码文件夹", in: files, frame: NSRect(x: 16, y: 81, width: 160, height: 31), action: #selector(openSource))
-        _ = button("设置文件夹", in: files, frame: NSRect(x: 181, y: 81, width: 160, height: 31), action: #selector(openConfig))
-        _ = button("诊断日志", in: files, frame: NSRect(x: 346, y: 81, width: 160, height: 31), action: #selector(openLogs))
+        let details = card(418, 126)
+        label("对话设置与本机记录", in: details, frame: NSRect(x: 20, y: 15, width: 480, height: 22), size: 13, weight: .semibold)
+        label("模型、强度和速度跟随各对话；用量统计与账号额度在 Coding 板块单独管理。", in: details, frame: NSRect(x: 20, y: 43, width: 486, height: 30), size: 11, color: .secondaryLabelColor, lines: 2)
+        _ = button("任务与对话", in: details, frame: NSRect(x: 16, y: 81, width: 240, height: 31), action: #selector(goCoding))
+        _ = button("用量与额度", in: details, frame: NSRect(x: 269, y: 81, width: 238, height: 31), action: #selector(goUsage))
     }
 
     func updateHealth() {
+        codingConnectionLabel?.stringValue = cue.codexConnectionSummary
+        codingConnectionLabel?.textColor = cue.codexConnectionState == "connected" ? .secondaryLabelColor : .systemOrange
+        let work = CueMenuBarWork(records: cue.recentHistory.records, running: cue.runningTasks, interrupted: cue.interruptedTasks, followups: cue.recentHistory.followups.records)
+        codingCountsLabel?.stringValue = "\(work.running) 个运行中 · \(work.pending) 个待处理 · \(work.interrupted) 个中断待续"
         healthLabel?.stringValue = cue.watcherHealthText
         healthLabel?.textColor = cue.watcherHealthText.hasPrefix("本机监控中") ? NSColor(srgbRed: 0.5, green: 0.94, blue: 0.76, alpha: 1) : .systemOrange
         let pause = cue.pausedUntil == nil ? (cue.settings.enabled ? "提醒已启用" : "提醒已关闭") : "提醒已暂停"
@@ -2158,6 +2296,9 @@ if CommandLine.arguments.contains("--recent-self-test") {
     defer { try? FileManager.default.removeItem(at: home) }
     let cue = CueController(); cue.presentsWindows = false; cue.settings.enabled = false
     var results = CueRecentHistory.validationReport()
+    results.merge(CueWorkspacePage.validationReport()) { _, new in new }
+    results.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
+    results.merge(CueNetworkTestsController.validationReport()) { _, new in new }
     results.merge(CueStatusPopoverController.validationReport()) { _, new in new }
     results.merge(CueCodexBatchController.validationReport()) { _, new in new }
     results.merge(CueTaskHoverController.validationReport()) { _, new in new }

@@ -27,18 +27,7 @@ final class CueUsageClient {
                 process.arguments = ["-m", module] + arguments
                 process.currentDirectoryURL = runtime
                 let inherited = ProcessInfo.processInfo.environment
-                // Keep path/locale settings needed to find logs, but do not
-                // propagate unrelated API keys or authorization variables.
-                var environment: [String: String] = [:]
-                for key in ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "OPENCODE_DB", "VIBECUE_CC_SWITCH_QUOTA_FILE"] {
-                    if let value = inherited[key] { environment[key] = value }
-                }
-                environment["VIBECUE_HOME"] = home.path
-                environment["PYTHONPATH"] = runtime.path
-                environment["PYTHONUNBUFFERED"] = "1"
-                environment["PYTHONDONTWRITEBYTECODE"] = "1"
-                environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
-                process.environment = environment
+                process.environment = Self.childEnvironment(inherited: inherited, module: module, home: home, runtime: runtime)
                 process.standardOutput = output; process.standardError = errors
                 let inputPipe = Pipe()
                 process.standardInput = input == nil ? FileHandle.nullDevice : inputPipe
@@ -79,6 +68,29 @@ final class CueUsageClient {
                 DispatchQueue.main.async { completion(.success(object)) }
             } catch { DispatchQueue.main.async { completion(.failure(error)) } }
         }
+    }
+
+    /// Network tests inherit only configured proxy routing, never unrelated API credentials.
+    static func childEnvironment(inherited: [String: String], module: String, home: URL, runtime: URL) -> [String: String] {
+        var environment: [String: String] = [:]
+        var allowed = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "OPENCODE_DB", "VIBECUE_CC_SWITCH_QUOTA_FILE"]
+        if module == "vibecue.network_tests" {
+            allowed += ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]
+        }
+        for key in allowed { if let value = inherited[key] { environment[key] = value } }
+        environment["VIBECUE_HOME"] = home.path; environment["PYTHONPATH"] = runtime.path
+        environment["PYTHONUNBUFFERED"] = "1"; environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        return environment
+    }
+    static func networkEnvironmentValidationReport() -> [String: Bool] {
+        let fixture = ["HTTPS_PROXY": "http://proxy.example:8080", "all_proxy": "socks5h://proxy.example:1080", "NO_PROXY": "localhost", "OPENAI_API_KEY": "fixture-only", "AUTHORIZATION": "fixture-only"]
+        let home = URL(fileURLWithPath: "/tmp/vcgo-env-fixture"), runtime = URL(fileURLWithPath: "/tmp/vcgo-env-fixture/runtime")
+        let network = childEnvironment(inherited: fixture, module: "vibecue.network_tests", home: home, runtime: runtime)
+        let usage = childEnvironment(inherited: fixture, module: "vibecue.usage", home: home, runtime: runtime)
+        return ["network_transport_inherits_existing_proxy_and_bypass_configuration": network["HTTPS_PROXY"] == fixture["HTTPS_PROXY"] && network["all_proxy"] == fixture["all_proxy"] && network["NO_PROXY"] == "localhost",
+                "network_transport_never_inherits_unrelated_api_credentials": network["OPENAI_API_KEY"] == nil && network["AUTHORIZATION"] == nil,
+                "network_proxy_forwarding_does_not_expand_other_collectors_environment": usage["HTTPS_PROXY"] == nil && usage["all_proxy"] == nil && usage["NO_PROXY"] == nil]
     }
 
     private static func runtime(home: URL) throws -> URL {
