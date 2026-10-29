@@ -113,6 +113,15 @@ final class CueCodexBatchController: NSWindowController, NSWindowDelegate {
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender); startReconnectTimer()
     }
+    func presentSheet(on parent: NSWindow) {
+        guard let window, parent.attachedSheet == nil else { return }
+        parent.beginSheet(window); startReconnectTimer()
+    }
+    override func close() {
+        if let window, let parent = window.sheetParent { parent.endSheet(window); window.orderOut(nil) }
+        reconnectTimer?.invalidate(); reconnectTimer = nil
+        super.close()
+    }
     private func startReconnectTimer() {
         reconnectTimer?.invalidate()
         let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in

@@ -100,6 +100,7 @@ final class CueNetworkTestsController: NSWindowController, NSWindowDelegate, NST
     private var drafts: [String: String] = [:]
     private var generation = 0
     private var busy = false
+    private var embedded = false
 
     // Documentation and manually opened browser tests only. Never trust a URL
     // supplied by a diagnostic response unless it exactly matches this list.
@@ -181,6 +182,34 @@ final class CueNetworkTestsController: NSWindowController, NSWindowDelegate, NST
         generation += 1; client?.stop(); client = nil; busy = false
         selected = next; applySelection(); layout()
     }
+    /// Main-shell navigation supplies the module and category tags. Detach
+    /// this native view from the hidden compatibility window without showing it.
+    func embeddedContentView() -> NSView {
+        if !embedded {
+            embedded = true
+            window?.orderOut(nil)
+            if window?.contentView === root { window?.contentView = NSView(frame: .zero) }
+            sidebar.isHidden = true
+            root.autoresizingMask = [.width, .height]
+            titleField.isHidden = true
+            disclosure.font = .systemFont(ofSize: 10.5)
+            layout()
+        }
+        return root
+    }
+
+    /// Call on leaving this module or closing the main panel, not on redraw.
+    func stopEmbeddedWork() {
+        drafts[selected.rawValue] = target.stringValue
+        let wasBusy = busy
+        generation += 1; client?.stop(); client = nil; setBusy(false)
+        if wasBusy {
+            stateField.stringValue = "已停止本机等待 · 再次运行可获取新结果"
+            stateField.textColor = .secondaryLabelColor
+            showPlain("本次检测尚未完成。已提交的公共测量可能继续；这里不会自动重新发送。")
+        }
+    }
+
     @objc private func changeKind(_ sender: NSButton) {
         guard CueNetworkTestKind.allCases.indices.contains(sender.tag) else { return }
         selectKind(CueNetworkTestKind.allCases[sender.tag].rawValue)
@@ -202,25 +231,34 @@ final class CueNetworkTestsController: NSWindowController, NSWindowDelegate, NST
     }
     private func layout() {
         let width = root.bounds.width, height = root.bounds.height
-        sidebar.frame = NSRect(x: 0, y: 0, width: 174, height: height)
-        let x: CGFloat = 199, available = max(520, width - 225)
+        sidebar.frame = embedded ? .zero : NSRect(x: 0, y: 0, width: 174, height: height)
+        let x: CGFloat = embedded ? 22 : 199
+        let available = max(260, width - x - 26)
+        let noInput = embedded && !selected.acceptsTarget
+        titleField.isHidden = embedded
+        targetLabel.isHidden = noInput; target.isHidden = noInput
+        let detailY: CGFloat = embedded ? 12 : 65
+        let targetY: CGFloat = embedded ? 79 : 148
+        let stateY: CGFloat = embedded ? (noInput ? 96 : 119) : 189
+        let disclosureY: CGFloat = embedded ? (noInput ? 128 : 151) : 220
+        let resultY: CGFloat = embedded ? (noInput ? 196 : 219) : 294
         titleField.frame = NSRect(x: x, y: 24, width: available, height: 29)
-        detailField.frame = NSRect(x: x + 1, y: 65, width: available - 2, height: 43)
-        targetLabel.frame = NSRect(x: x + 1, y: 121, width: available, height: 19)
-        target.frame = NSRect(x: x, y: 148, width: max(280, available - 140), height: 29)
-        runButton.frame = NSRect(x: x + available - 125, y: 146, width: 125, height: 33)
-        spinner.frame = NSRect(x: x, y: 191, width: 16, height: 16)
-        stateField.frame = NSRect(x: x + (busy ? 23 : 1), y: 189, width: available - 24, height: 20)
-        disclosure.frame = NSRect(x: x + 1, y: 220, width: available - 2, height: 64)
-        let bottom: CGFloat = selected == .ipTrace ? 93 : 53
-        resultScroll.frame = NSRect(x: x, y: 294, width: available, height: max(180, height - 294 - bottom))
+        detailField.frame = NSRect(x: x + 1, y: detailY, width: available - 2, height: embedded ? 35 : 43)
+        targetLabel.frame = NSRect(x: x + 1, y: embedded ? 56 : 121, width: available, height: 19)
+        target.frame = NSRect(x: x, y: targetY, width: max(120, available - 140), height: 29)
+        runButton.frame = NSRect(x: x + available - 125, y: noInput ? 57 : targetY - 2, width: 125, height: 33)
+        spinner.frame = NSRect(x: x, y: stateY + 2, width: 16, height: 16)
+        stateField.frame = NSRect(x: x + (busy ? 23 : 1), y: stateY, width: available - 24, height: 20)
+        disclosure.frame = NSRect(x: x + 1, y: disclosureY, width: available - 2, height: embedded ? 54 : 64)
+        let bottom: CGFloat = selected == .ipTrace ? (embedded ? 73 : 93) : (embedded ? 35 : 53)
+        resultScroll.frame = NSRect(x: x, y: resultY, width: available, height: max(60, height - resultY - bottom))
         let textWidth = max(100, resultScroll.contentSize.width)
         results.frame.size = NSSize(width: textWidth, height: max(results.frame.height, resultScroll.contentSize.height))
         results.minSize = NSSize(width: 0, height: resultScroll.contentSize.height)
         results.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        browserWebRTC.frame = NSRect(x: x - 3, y: height - 78, width: 218, height: 30)
-        browserDNS.frame = NSRect(x: x + 226, y: height - 78, width: 211, height: 30)
-        footer.frame = NSRect(x: x + 1, y: height - 32, width: available - 2, height: 18)
+        browserWebRTC.frame = NSRect(x: x - 3, y: height - (embedded ? 69 : 78), width: 218, height: 30)
+        browserDNS.frame = NSRect(x: x + 226, y: height - (embedded ? 69 : 78), width: 211, height: 30)
+        footer.frame = NSRect(x: x + 1, y: height - (embedded ? 27 : 32), width: available - 2, height: 18)
     }
     private func setBusy(_ value: Bool) {
         busy = value; runButton.isEnabled = !value; runButton.title = value ? "运行中…" : "运行检测"
@@ -328,8 +366,7 @@ final class CueNetworkTestsController: NSWindowController, NSWindowDelegate, NST
     @objc private func openWebRTC() { if let url = Self.trustedSource("https://browserleaks.com/webrtc") { NSWorkspace.shared.open(url) } }
     @objc private func openDNS() { if let url = Self.trustedSource("https://www.dnsleaktest.com/") { NSWorkspace.shared.open(url) } }
     func windowWillClose(_ notification: Notification) {
-        drafts[selected.rawValue] = target.stringValue
-        generation += 1; client?.stop(); client = nil; setBusy(false)
+        stopEmbeddedWork()
         stateField.stringValue = "等待运行 · 不会自动连接检测服务"; stateField.textColor = .secondaryLabelColor
         showPlain("本窗口未保留上次检测结果。点击“运行检测”获取本次结果。")
     }
@@ -350,16 +387,28 @@ final class CueNetworkTestsController: NSWindowController, NSWindowDelegate, NST
         let unknown = controller.stateField.stringValue == "返回状态未确认"
         let priorGeneration = controller.generation
         controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        let closeInvalidates = controller.generation == priorGeneration + 1 && !controller.results.string.contains("尚未核对")
+        let embeddedView = controller.embeddedContentView()
+        embeddedView.frame.size = NSSize(width: 760, height: 430)
+        controller.selectKind("ip_trace"); controller.layout()
+        let embeddedFit = controller.sidebar.isHidden && controller.titleField.isHidden && controller.target.isHidden
+            && controller.resultScroll.frame.minX == 22 && controller.resultScroll.frame.height >= 100
+            && controller.resultScroll.frame.maxY <= controller.browserWebRTC.frame.minY
+            && controller.browserDNS.frame.maxX <= embeddedView.bounds.maxX
+        let stoppedGeneration = controller.generation
+        controller.stopEmbeddedWork()
         return [
             "network_window_initialization_and_category_changes_never_start_requests": initial && controller.client == nil,
             "network_public_measurements_require_an_explicit_target": emptyPublicTarget,
             "network_browser_checks_are_manual_and_scoped_to_browser": browserScope,
             "network_switch_preserves_only_in_memory_target_drafts": retainedInput,
             "network_results_preserve_partial_and_unknown_outcomes": rendered && unknown,
-            "network_close_invalidates_pending_callbacks_and_clears_results": controller.generation == priorGeneration + 1 && !controller.results.string.contains("尚未核对"),
+            "network_close_invalidates_pending_callbacks_and_clears_results": closeInvalidates,
             "network_source_links_require_exact_trusted_https_urls": trustedSource("https://globalping.io/docs/api.globalping.io") != nil && trustedSource("https://globalping.io.evil.example/docs/api.globalping.io") == nil && trustedSource("http://globalping.io/docs/api.globalping.io") == nil && trustedSource("https://globalping.io/docs/api.globalping.io?target=private") == nil,
             "network_request_limits_are_bounded_without_mutating_preferences": validRequestLimits(),
-            "network_readonly_result_document_has_positive_viewport_height": controller.resultScroll.contentSize.height > 0 && controller.results.frame.height >= controller.resultScroll.contentSize.height
+            "network_readonly_result_document_has_positive_viewport_height": controller.resultScroll.contentSize.height > 0 && controller.results.frame.height >= controller.resultScroll.contentSize.height,
+            "network_embedded_view_uses_shell_tags_and_compact_layout": embeddedFit && controller.window?.contentView !== embeddedView,
+            "network_leaving_embedded_module_stops_only_its_current_worker": controller.generation == stoppedGeneration + 1 && controller.client == nil && !controller.busy
         ]
     }
     private static func validRequestLimits() -> Bool {

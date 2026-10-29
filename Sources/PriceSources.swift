@@ -4,6 +4,9 @@ import Foundation
 /// Anonymous public price catalogs. Order is the fallback policy, independent
 /// of usage history and any account authorization.
 final class CuePriceSourcesController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    private let surface = CuePriceSourcesSurface()
+    private var isEmbedded = false
+    private var presentationWindow: NSWindow? { surface.window ?? (isEmbedded ? nil : window) }
     private let client: CueUsageClient
     private let onChange: () -> Void
     private let table = NSTableView(), scroll = NSScrollView()
@@ -35,7 +38,7 @@ final class CuePriceSourcesController: NSWindowController, NSTableViewDataSource
         window.title = "模型价格来源"; window.minSize = NSSize(width: 800, height: 620)
         window.isReleasedWhenClosed = false; window.center()
         super.init(window: window)
-        let surface = CuePriceSourcesSurface(frame: window.contentLayoutRect); window.contentView = surface
+        window.contentView = surface
         heading.font = .systemFont(ofSize: 21, weight: .semibold)
         subtitle.font = .systemFont(ofSize: 12); subtitle.textColor = .secondaryLabelColor
         detail.font = .systemFont(ofSize: 11); detail.textColor = .secondaryLabelColor
@@ -66,9 +69,18 @@ final class CuePriceSourcesController: NSWindowController, NSTableViewDataSource
         surface.onLayout = { [weak self] in self?.layout() }; layout(); updateControls()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override func showWindow(_ sender: Any?) { super.showWindow(sender); window?.makeKeyAndOrderFront(nil); load() }
+    func embeddedContentView() -> NSView {
+        if !isEmbedded { isEmbedded = true; window?.orderOut(nil); window?.contentView = nil }
+        return surface
+    }
+    func activateEmbedded() { if !loaded && !busy { load() } }
+    func deactivateEmbedded() { /* Preserve unsaved order, sources, and interval. */ }
+    override func showWindow(_ sender: Any?) {
+        if isEmbedded { activateEmbedded(); presentationWindow?.makeKeyAndOrderFront(nil); return }
+        super.showWindow(sender); window?.makeKeyAndOrderFront(nil); load()
+    }
     private func layout() {
-        guard let root = window?.contentView else { return }; let width = root.bounds.width, height = root.bounds.height
+        let width = surface.bounds.width, height = surface.bounds.height
         heading.frame = NSRect(x: 24, y: 22, width: width - 230, height: 29)
         formatButton.frame = NSRect(x: width - 143, y: 23, width: 119, height: 29)
         subtitle.frame = NSRect(x: 25, y: 61, width: width - 50, height: 36)
@@ -184,7 +196,7 @@ final class CuePriceSourcesController: NSWindowController, NSTableViewDataSource
     @objc private func addSource() { presentEditor(nil) }
     @objc private func editSelected() { guard sources.indices.contains(table.selectedRow) else { return }; presentEditor(table.selectedRow) }
     private func presentEditor(_ index: Int?) {
-        guard !busy, let window else { return }
+        guard !busy, let window = presentationWindow, window.attachedSheet == nil else { return }
         let original = index.map { sources[$0] }
         let editor = CuePriceSourceEditor(source: original) { [weak self] newSource in
             guard let self else { return }
@@ -239,7 +251,7 @@ final class CuePriceSourcesController: NSWindowController, NSTableViewDataSource
         let alert = NSAlert(); alert.messageText = "模型价格来源格式"
         alert.informativeText = "BaseLLM、LiteLLM、Models.dev、OpenRouter、Vercel 使用各自公开接口格式，程序会换算为 USD / 百万 Tokens。\n\n自定义 JSON 示例：\n{\"models\":{\"example-model\":{\"input\":2,\"output\":10,\"cache_read\":0.2,\"cache_creation\":2.5}}}\n\n模型标识需精确一致。未提供的缓存单价保持未知，不能代替免费。只读取公开 HTTPS JSON，不发送用量、账号或认证资料。"
         alert.addButton(withTitle: "知道了"); alert.addButton(withTitle: "复制 JSON 示例")
-        if let window { alert.beginSheetModal(for: window) { response in
+        if let window = presentationWindow { alert.beginSheetModal(for: window) { response in
             if response == .alertSecondButtonReturn { NSPasteboard.general.clearContents(); NSPasteboard.general.setString("{\"models\":{\"example-model\":{\"input\":2,\"output\":10,\"cache_read\":0.2,\"cache_creation\":2.5}}}", forType: .string) }
         } }
     }
@@ -269,7 +281,17 @@ final class CuePriceSourcesController: NSWindowController, NSTableViewDataSource
         controller.removeSelected()
         let removed = !controller.sources.contains { $0["id"] as? String == "example" }
         controller.restoreDefaults()
-        return ["pricing_queue_reorder_preserves_selected_source": moved,
+        let host = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 720), styleMask: [.titled], backing: .buffered, defer: false)
+        let view = controller.embeddedContentView(); host.contentView = view
+        view.setFrameSize(NSSize(width: 940, height: 720)); controller.layout()
+        controller.deactivateEmbedded(); controller.activateEmbedded()
+        let embeddedDraft = controller.dirty && controller.sources.count == 3 && !controller.busy
+        let embeddedLayout = abs(controller.refreshButton.frame.maxX - (view.bounds.width - 24)) < 0.1 && abs(controller.refreshButton.frame.maxY - (view.bounds.height - 19)) < 0.1
+        let embeddedHost = controller.presentationWindow === host && controller.embeddedContentView() === view && controller.window?.contentView !== view
+        host.contentView = nil
+        return ["pricing_embedded_canvas_uses_host_bounds_and_sheet_parent": embeddedHost && embeddedLayout,
+                "pricing_tag_switch_keeps_unsaved_source_priority": embeddedDraft,
+"pricing_queue_reorder_preserves_selected_source": moved,
                 "pricing_queue_toggle_does_not_delete_config": disabled,
                 "pricing_queue_delete_removes_only_selected_source": removed && controller.sources.count == 3,
                 "pricing_queue_restore_defaults_is_unsaved_until_commit": controller.dirty && controller.sources.first?["id"] as? String == "custom",

@@ -674,7 +674,12 @@ final class CueStatusPopoverController: NSViewController {
     private var enabled = true, soundEnabled = true, paused = false
     private var status = "本机监控中"
     private var maximumHeight: CGFloat = 900
-    private let panelWidth: CGFloat = min(960, max(680, (NSScreen.main?.visibleFrame.width ?? 1000) - 40))
+    let embedded: Bool
+    private let popoverWidth: CGFloat = min(960, max(680, (NSScreen.main?.visibleFrame.width ?? 1000) - 40))
+    private var embeddedSize = NSSize(width: 960, height: 600)
+    private var rebuilding = false
+    private var embeddedActive = false
+    private var panelWidth: CGFloat { embedded ? embeddedSize.width : popoverWidth }
     private var recentDocument: CueFlippedView?
     private var selectedID: String?
     private var runningTasks: [CueRunningTask] = []
@@ -701,13 +706,14 @@ final class CueStatusPopoverController: NSViewController {
     // reads the global pointer, even when another application remains active.
     private var pointerLocation: () -> NSPoint? = { NSEvent.mouseLocation }
 
-    init(history: CueRecentHistory, actions: CueStatusPopoverActions) {
-        self.history = history; self.actions = actions
+    init(history: CueRecentHistory, actions: CueStatusPopoverActions, embedded: Bool = false) {
+        self.history = history; self.actions = actions; self.embedded = embedded
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func loadView() {
-        let root = CueFlippedView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 660))
+        let root = CueFlippedView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: embedded ? embeddedSize.height : 660))
+        if embedded { root.autoresizingMask = [.width, .height] }
         root.backgroundColor = .windowBackgroundColor; view = root
         rebuild()
     }
@@ -727,8 +733,33 @@ final class CueStatusPopoverController: NSViewController {
             else { rebuild() }
         }
     }
+    /// A host embeds a distinct controller instance; the shared history store
+    /// remains authoritative while selection, scrolling and batch state stay local.
+    func resizeEmbedded(to size: NSSize) {
+        guard embedded, size.width.isFinite, size.height.isFinite else { return }
+        let next = NSSize(width: max(1, size.width), height: max(1, size.height))
+        guard embeddedSize != next || !isViewLoaded else { return }
+        embeddedSize = next
+        if isViewLoaded { rebuild() }
+    }
+    /// Call when switching the main panel's task tag in or out. Plain view
+    /// hosting does not always deliver NSViewController appearance callbacks.
+    func setEmbeddedVisible(_ visible: Bool) {
+        guard embedded else { return }
+        embeddedActive = visible
+        if visible { _ = view; startObservation() }
+        else { stopObservation() }
+    }
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        guard embedded, !rebuilding, view.bounds.size != embeddedSize else { return }
+        resizeEmbedded(to: view.bounds.size)
+    }
     override func viewDidAppear() {
-        super.viewDidAppear(); pointerTimer?.invalidate(); elapsedTimer?.invalidate()
+        super.viewDidAppear(); if embedded { embeddedActive = true }; startObservation()
+    }
+    private func startObservation() {
+        pointerTimer?.invalidate(); elapsedTimer?.invalidate()
         let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in self?.reconcilePointerHover() }
         RunLoop.main.add(timer, forMode: .common); pointerTimer = timer
         let elapsed = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
@@ -739,14 +770,18 @@ final class CueStatusPopoverController: NSViewController {
         refreshElapsedLabels(now: Date())
         DispatchQueue.main.async { [weak self] in self?.reconcilePointerHover() }
     }
-    override func viewDidDisappear() { super.viewDidDisappear(); pointerTimer?.invalidate(); pointerTimer = nil; elapsedTimer?.invalidate(); elapsedTimer = nil; pointerAnchor = nil; hoverController.hide(); sideChatsController.close() }
+    private func stopObservation() {
+        pointerTimer?.invalidate(); pointerTimer = nil; elapsedTimer?.invalidate(); elapsedTimer = nil
+        pointerAnchor = nil; hoverController.hide(); sideChatsController.close()
+    }
+    override func viewDidDisappear() { super.viewDidDisappear(); if embedded { embeddedActive = false }; stopObservation() }
     deinit { pointerTimer?.invalidate(); elapsedTimer?.invalidate() }
 
     /// Status-item popovers can be visible while Codex remains the active app.
     /// Tracking is activeAlways, and this geometry check also handles a pointer
     /// already inside a row when a non-key popover first appears or scrolls.
     private func reconcilePointerHover() {
-        guard !batchMode, !sideChatsController.isShown, isViewLoaded, let window = view.window, window.isVisible, let document = recentDocument,
+        guard (!embedded || embeddedActive), !batchMode, !sideChatsController.isShown, isViewLoaded, let window = view.window, window.isVisible, let document = recentDocument,
               let screenPoint = pointerLocation() else { return }
         let point = window.convertPoint(fromScreen: screenPoint)
         let clipPoint = scroll.contentView.convert(point, from: nil)
@@ -783,56 +818,64 @@ final class CueStatusPopoverController: NSViewController {
         return attentionConnected ? .tertiaryLabelColor : .systemOrange
     }
     private func rebuild() {
+        guard !rebuilding else { return }
+        rebuilding = true; defer { rebuilding = false }
         sideChatsController.close()
         let origin = scroll.contentView.bounds.origin
         let snapshot = batchMode ? (frozenBatchSnapshot ?? CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records)) : CueStatusListSnapshot(records: history.records, runningTasks: runningTasks, interruptedTasks: interruptedTasks, followups: history.followups.records)
         view.subviews.forEach { $0.removeFromSuperview() }
-        let fixedHeight: CGFloat = batchMode ? 255 : 219
+        let compactBatch = embedded && panelWidth < 680
+        let batchExtra: CGFloat = compactBatch && batchMode ? 36 : 0
+        let fixedHeight: CGFloat = embedded ? (batchMode ? 110 : 74) + batchExtra : (batchMode ? 255 : 219)
         let maxHeight = max(390, min(1100, maximumHeight))
         let capacity = max(3, min(12, Int((maxHeight - fixedHeight) / CueTaskRowLayout.pitch)))
         let contentHeight = CGFloat(snapshot.rowCount) * CueTaskRowLayout.pitch + CGFloat(snapshot.sectionCount) * 28
-        let viewport = min(CGFloat(capacity) * CueTaskRowLayout.pitch, max(180, contentHeight))
-        let height = fixedHeight + viewport
+        let viewport = embedded ? max(0, embeddedSize.height - fixedHeight) : min(CGFloat(capacity) * CueTaskRowLayout.pitch, max(180, contentHeight))
+        let height = embedded ? embeddedSize.height : fixedHeight + viewport
+        let batchY: CGFloat = embedded ? 48 : 192
+        let listY: CGFloat = embedded ? (batchMode ? 84 : 48) + batchExtra : (batchMode ? 229 : 193)
         view.frame.size = NSSize(width: panelWidth, height: height)
         preferredContentSize = view.frame.size
-        label("VibeCoding Go", NSRect(x: 22, y: 16, width: 260, height: 27), size: 18, weight: .semibold)
-        label(status, NSRect(x: 22, y: 47, width: 535, height: 19), size: 11, color: .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("monitor-status")
-        let toolbarWidth = (panelWidth - 68) / 5
-        for (index, item) in [("工作台", #selector(openSettings)), ("提醒", #selector(openReminderSettings)), ("辅助 Coding", #selector(openCodingTools)), ("用量统计", #selector(openUsage)), ("Test", #selector(openTestTools))].enumerated() {
-            button(item.0, NSRect(x: 18 + CGFloat(index) * (toolbarWidth + 8), y: 76, width: toolbarWidth, height: 30), item.1)
+        if !embedded {
+            label("VibeCoding Go", NSRect(x: 22, y: 16, width: 260, height: 27), size: 18, weight: .semibold)
+            label(status, NSRect(x: 22, y: 47, width: 535, height: 19), size: 11, color: .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("monitor-status")
+            let toolbarWidth = (panelWidth - 68) / 5
+            for (index, item) in [("工作台", #selector(openSettings)), ("任务提醒", #selector(openReminderSettings)), ("编程助手", #selector(openCodingTools)), ("用量统计", #selector(openUsage)), ("网络检测", #selector(openTestTools))].enumerated() {
+                button(item.0, NSRect(x: 18 + CGFloat(index) * (toolbarWidth + 8), y: 76, width: toolbarWidth, height: 30), item.1)
+            }
+            label("任务提醒", NSRect(x: 22, y: 122, width: 70, height: 20), size: 11, color: .secondaryLabelColor, weight: .semibold).identifier = NSUserInterfaceItemIdentifier("module-reminders")
+            let enable = NSButton(checkboxWithTitle: "启用提醒", target: self, action: #selector(toggleEnabled))
+            enable.frame = NSRect(x: 80, y: 119, width: 123, height: 25); enable.state = enabled ? .on : .off; view.addSubview(enable)
+            enable.identifier = NSUserInterfaceItemIdentifier("setting-enabled")
+            let sound = NSButton(checkboxWithTitle: "播放提示音", target: self, action: #selector(toggleSound))
+            sound.frame = NSRect(x: 216, y: 119, width: 143, height: 25); sound.state = soundEnabled ? .on : .off; view.addSubview(sound)
+            sound.identifier = NSUserInterfaceItemIdentifier("setting-sound")
+            button(paused ? "恢复提醒" : "暂停 30 分钟", NSRect(x: panelWidth - 229, y: 116, width: 204, height: 30), #selector(pause)).identifier = NSUserInterfaceItemIdentifier("pause-button")
         }
-        label("提醒", NSRect(x: 22, y: 122, width: 52, height: 20), size: 11, color: .secondaryLabelColor, weight: .semibold).identifier = NSUserInterfaceItemIdentifier("module-reminders")
-        let enable = NSButton(checkboxWithTitle: "启用提醒", target: self, action: #selector(toggleEnabled))
-        enable.frame = NSRect(x: 80, y: 119, width: 123, height: 25); enable.state = enabled ? .on : .off; view.addSubview(enable)
-        enable.identifier = NSUserInterfaceItemIdentifier("setting-enabled")
-        let sound = NSButton(checkboxWithTitle: "播放提示音", target: self, action: #selector(toggleSound))
-        sound.frame = NSRect(x: 216, y: 119, width: 143, height: 25); sound.state = soundEnabled ? .on : .off; view.addSubview(sound)
-        sound.identifier = NSUserInterfaceItemIdentifier("setting-sound")
-        button(paused ? "恢复提醒" : "暂停 30 分钟", NSRect(x: panelWidth - 229, y: 116, width: 204, height: 30), #selector(pause)).identifier = NSUserInterfaceItemIdentifier("pause-button")
-        label("Coding · 对话", NSRect(x: 22, y: 163, width: 130, height: 23), size: 13, weight: .semibold)
-        label(batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(snapshot.activeCount) 运行 · \(snapshot.recoveryByThread.count) 中断 · \(snapshot.deferredCount) 待续 · 历史 \(history.ordinaryCount)/50", NSRect(x: 155, y: 165, width: panelWidth - 290, height: 20), size: 11, color: history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("task-counts")
-        button(batchMode ? "退出批量" : "批量模式", NSRect(x: panelWidth - 122, y: 157, width: 98, height: 29), #selector(toggleBatchMode))
+        label(embedded ? "任务对话" : "Coding · 对话", NSRect(x: 22, y: embedded ? 13 : 163, width: 130, height: 23), size: 13, weight: .semibold)
+        label(batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(snapshot.activeCount) 运行 · \(snapshot.recoveryByThread.count) 中断 · \(snapshot.deferredCount) 待续 · 历史 \(history.ordinaryCount)/50", NSRect(x: 155, y: embedded ? 15 : 165, width: max(1, panelWidth - 290), height: 20), size: 11, color: history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("task-counts")
+        button(batchMode ? "退出批量" : "批量模式", NSRect(x: panelWidth - 122, y: embedded ? 7 : 157, width: 98, height: 29), #selector(toggleBatchMode))
         if batchMode {
             let pinnedIDs = Set(frozenPinnedTargets.map(\.threadID))
             let activeIDs = Set(frozenRunningTargets.map(\.threadID))
             for (title, ids, x, selector) in [("置顶", pinnedIDs, CGFloat(22), #selector(selectPinned)), ("运行中", activeIDs, 116, #selector(selectRunning))] {
                 let checkbox = NSButton(checkboxWithTitle: title, target: self, action: selector)
-                checkbox.frame = NSRect(x: x, y: 192, width: 94, height: 25); checkbox.allowsMixedState = true
+                checkbox.frame = NSRect(x: x, y: batchY, width: 94, height: 25); checkbox.allowsMixedState = true
                 checkbox.state = ids.isEmpty || selectedThreads.isDisjoint(with: ids) ? .off : ids.isSubset(of: selectedThreads) ? .on : .mixed
                 checkbox.identifier = NSUserInterfaceItemIdentifier(title == "置顶" ? "batch-scope-pinned" : "batch-scope-running")
                 checkbox.isEnabled = !ids.isEmpty; view.addSubview(checkbox)
             }
-            button("全选", NSRect(x: 213, y: 190, width: 66, height: 28), #selector(selectAllBatchThreads))
-            button("清空", NSRect(x: 283, y: 190, width: 66, height: 28), #selector(clearBatchSelection))
+            button("全选", NSRect(x: 213, y: batchY - 2, width: 66, height: 28), #selector(selectAllBatchThreads))
+            button("清空", NSRect(x: 283, y: batchY - 2, width: 66, height: 28), #selector(clearBatchSelection))
             let apply = NSButton(title: "批量操作 (\(selectedThreads.count))", target: self, action: #selector(configureSelected))
-            apply.frame = NSRect(x: panelWidth - 211, y: 190, width: 187, height: 28); apply.isEnabled = !selectedThreads.isEmpty
+            apply.frame = NSRect(x: panelWidth - 211, y: batchY - 2 + batchExtra, width: 187, height: 28); apply.isEnabled = !selectedThreads.isEmpty
             apply.identifier = NSUserInterfaceItemIdentifier("batch-apply")
             view.addSubview(apply)
         }
-        scroll.frame = NSRect(x: 10, y: batchMode ? 229 : 193, width: panelWidth - 20, height: viewport)
-        scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.scrollerStyle = .legacy
+        scroll.frame = NSRect(x: 10, y: listY, width: max(1, panelWidth - 20), height: viewport)
+        scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = embedded && panelWidth < 680; scroll.scrollerStyle = .legacy
         scroll.borderType = .noBorder; scroll.autohidesScrollers = false
-        let document = CueFlippedView(frame: NSRect(x: 0, y: 0, width: panelWidth - 35, height: max(viewport, contentHeight)))
+        let document = CueFlippedView(frame: NSRect(x: 0, y: 0, width: embedded ? max(645, panelWidth - 35) : panelWidth - 35, height: max(viewport, contentHeight)))
         var position: CGFloat = 0
         func section(_ title: String, id: String, count: Int, hint: String, color: NSColor = .secondaryLabelColor) {
             let heading = NSTextField(labelWithString: "\(title) · \(count)")
@@ -932,7 +975,7 @@ final class CueStatusPopoverController: NSViewController {
         recentDocument = document; scroll.documentView = document; view.addSubview(scroll)
         scroll.contentView.scroll(to: scroll.contentView.constrainBoundsRect(NSRect(origin: origin, size: scroll.contentView.bounds.size)).origin)
         scroll.reflectScrolledClipView(scroll.contentView)
-        let footer = label(footerText, NSRect(x: 22, y: height - 20, width: showsConnectionAction ? panelWidth - 168 : panelWidth - 44, height: 16), size: 10, color: footerColor)
+        let footer = label(footerText, NSRect(x: 22, y: height - 20, width: max(1, showsConnectionAction ? panelWidth - 168 : panelWidth - 44), height: 16), size: 10, color: footerColor)
         footer.identifier = NSUserInterfaceItemIdentifier("panel-footer"); footer.toolTip = footerText
         // Keep this control available for an in-place health transition while
         // a person is selecting or hovering, but hide it during auto recovery.
@@ -961,7 +1004,7 @@ final class CueStatusPopoverController: NSViewController {
                     field.textColor = history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor
                 case "panel-footer":
                     field.stringValue = footerText; field.textColor = footerColor
-                    field.frame.size.width = showsConnectionAction ? panelWidth - 168 : panelWidth - 44
+                    field.frame.size.width = max(1, showsConnectionAction ? panelWidth - 168 : panelWidth - 44)
                     field.toolTip = field.stringValue
                 default: break
                 }
@@ -1072,6 +1115,27 @@ final class CueStatusPopoverController: NSViewController {
         liveController.scroll.contentView.scroll(to: NSPoint(x: 0, y: 200))
         liveController.update(status: "多任务测试", enabled: true, soundEnabled: true, paused: false, maximumHeight: 900, runningTasks: manyTasks)
         results["running_tasks_scroll_without_consuming_history_capacity"] = liveController.view.bounds.height <= 900 && liveController.scroll.frame.height <= 12 * 56 && liveController.recentDocument!.frame.height > liveController.scroll.frame.height && liveController.scroll.contentView.bounds.origin.y == 200 && liveHistory.records.count == 4 && liveHistory.ordinaryCount == 2
+        let embeddedTasks = CueStatusPopoverController(history: liveHistory, actions: liveActions, embedded: true)
+        embeddedTasks.resizeEmbedded(to: NSSize(width: 1040, height: 640))
+        embeddedTasks.update(status: "主面板任务", enabled: true, soundEnabled: true, paused: false, runningTasks: manyTasks, attentionConnected: true)
+        _ = embeddedTasks.view
+        let embeddedButtons = embeddedTasks.view.subviews.compactMap { $0 as? NSButton }
+        let embeddedFields = embeddedTasks.view.subviews.compactMap { $0 as? NSTextField }
+        results["embedded_tasks_share_history_without_reusing_the_popover_view"] = embeddedTasks.history === liveController.history && embeddedTasks.view !== liveController.view
+        results["embedded_tasks_hide_global_navigation_and_reminder_controls"] = !embeddedButtons.contains(where: { ["工作台", "任务提醒", "编程助手", "网络检测", "启用提醒", "播放提示音"].contains($0.title) }) && !embeddedFields.contains(where: { $0.stringValue == "VibeCoding Go" })
+        results["embedded_tasks_fill_the_host_instead_of_popover_row_capacity"] = embeddedTasks.view.frame.size == NSSize(width: 1040, height: 640) && embeddedTasks.scroll.frame.height == 566 && embeddedTasks.scroll.frame.maxY <= 618 && embeddedTasks.recentDocument!.frame.height > embeddedTasks.scroll.frame.height
+        embeddedTasks.select(id: "running:many-0")
+        embeddedTasks.scroll.contentView.scroll(to: NSPoint(x: 0, y: 200))
+        embeddedTasks.resizeEmbedded(to: NSSize(width: 900, height: 700))
+        results["embedded_resize_preserves_task_selection_and_scroll"] = embeddedTasks.selectedID == "running:many-0" && embeddedTasks.scroll.contentView.bounds.origin.y == 200 && embeddedTasks.view.frame.size == NSSize(width: 900, height: 700)
+        embeddedTasks.toggleBatchMode(); embeddedTasks.selectRunning()
+        let selectedEmbedded = embeddedTasks.selectedThreads
+        embeddedTasks.resizeEmbedded(to: NSSize(width: 610, height: 520))
+        results["embedded_batch_resize_preserves_frozen_scope_and_narrow_row_access"] = embeddedTasks.batchMode && embeddedTasks.selectedThreads == selectedEmbedded && !selectedEmbedded.isEmpty && embeddedTasks.scroll.hasHorizontalScroller && embeddedTasks.recentDocument!.frame.width >= 645 && embeddedTasks.scroll.frame.maxY <= 498
+        embeddedTasks.setEmbeddedVisible(true)
+        let observing = embeddedTasks.pointerTimer != nil && embeddedTasks.elapsedTimer != nil
+        embeddedTasks.setEmbeddedVisible(false)
+        results["embedded_hidden_page_stops_timers_and_transient_hover"] = observing && !embeddedTasks.embeddedActive && embeddedTasks.pointerTimer == nil && embeddedTasks.elapsedTimer == nil && embeddedTasks.pointerAnchor == nil
         var batchCalls: [[CueBatchTarget]] = []
         var batchActions = liveActions; batchActions.batchConfigure = { batchCalls.append($0) }
         let batchController = CueStatusPopoverController(history: liveHistory, actions: batchActions)

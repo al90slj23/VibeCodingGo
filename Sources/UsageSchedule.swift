@@ -64,6 +64,9 @@ private final class CueUsageScheduleSurface: NSView {
 }
 
 final class CueUsageScheduleController: NSWindowController {
+    private let root = CueUsageScheduleSurface(frame: NSRect(x: 0, y: 0, width: 620, height: 385))
+    private var isEmbedded = false
+    private var loaded = false
     private let home: URL
     private let client: CueUsageClient
     private let onChange: () -> Void
@@ -80,7 +83,7 @@ final class CueUsageScheduleController: NSWindowController {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 385), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "用量统计频率"; window.isReleasedWhenClosed = false; window.center()
         super.init(window: window)
-        let root = CueUsageScheduleSurface(frame: window.contentLayoutRect); window.contentView = root
+        window.contentView = root
         func label(_ value: String, x: CGFloat = 26, y: CGFloat, width: CGFloat = 568, height: CGFloat = 22, size: CGFloat = 12, weight: NSFont.Weight = .regular, secondary: Bool = false) {
             let field = NSTextField(wrappingLabelWithString: value); field.font = .systemFont(ofSize: size, weight: weight)
             field.textColor = secondary ? .secondaryLabelColor : .labelColor
@@ -110,13 +113,26 @@ final class CueUsageScheduleController: NSWindowController {
         apply(CueUsageSchedulePreferences(home: home)); updateControls()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    func embeddedContentView() -> NSView {
+        if !isEmbedded {
+            isEmbedded = true; window?.orderOut(nil); window?.contentView = nil
+            cancelButton.title = "撤销更改"
+        }
+        return root
+    }
+    func activateEmbedded() { if !loaded && !busy { load() } }
+    func deactivateEmbedded() { /* Keep unsubmitted frequency choices. */ }
     override func showWindow(_ sender: Any?) {
+        if isEmbedded { activateEmbedded(); root.window?.makeKeyAndOrderFront(nil); return }
         super.showWindow(sender); window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        load()
+    }
+    private func load() {
         guard !busy else { return }; setBusy(true)
         client.run(["settings"], module: "vibecue.usage_schedule") { [weak self] result in
             guard let self else { return }; self.setBusy(false)
             switch result {
-            case .success(let data): self.apply(CueUsageSchedulePreferences(raw: data["prefs"] as? [String: Any] ?? [:])); self.feedback.stringValue = data["settings_warning"] as? String ?? "设置在保存后立即生效。"
+            case .success(let data): self.loaded = true; self.apply(CueUsageSchedulePreferences(raw: data["prefs"] as? [String: Any] ?? [:])); self.feedback.stringValue = data["settings_warning"] as? String ?? "设置在保存后立即生效。"
             case .failure(let error): self.feedback.stringValue = error.localizedDescription
             }
         }
@@ -127,12 +143,19 @@ final class CueUsageScheduleController: NSWindowController {
     }
     private func setBusy(_ value: Bool) { busy = value; updateControls() }
     private func updateControls() {
+        cancelButton.isEnabled = !busy
         autoSync.isEnabled = !busy; syncSeconds.isEnabled = !busy && autoSync.state == .on
         displaySeconds.isEnabled = !busy; saveButton.isEnabled = !busy; defaultsButton.isEnabled = !busy
     }
     @objc private func toggleAutomatic() { updateControls() }
     @objc private func defaults() { apply(CueUsageSchedulePreferences()); feedback.stringValue = "已填入默认值，点击保存后生效。" }
-    @objc private func cancel() { window?.close() }
+    @objc private func cancel() {
+        guard !busy else { return }
+        if isEmbedded {
+            apply(CueUsageSchedulePreferences(home: home))
+            feedback.stringValue = "已撤销未保存的频率更改。"; feedback.textColor = .secondaryLabelColor
+        } else { window?.close() }
+    }
     @objc private func save() {
         guard !busy else { return }
         func integer(_ field: NSTextField, range: ClosedRange<Int>) -> Int? {
@@ -150,6 +173,7 @@ final class CueUsageScheduleController: NSWindowController {
             guard let self else { return }; self.setBusy(false)
             switch result {
             case .success(let data):
+                self.loaded = true
                 self.apply(CueUsageSchedulePreferences(raw: data["prefs"] as? [String: Any] ?? [:]))
                 self.feedback.stringValue = "频率设置已保存并立即生效。"; self.feedback.textColor = .secondaryLabelColor
                 NotificationCenter.default.post(name: .cueUsageScheduleDidChange, object: nil, userInfo: ["home": self.home.path])
@@ -174,11 +198,24 @@ final class CueUsageScheduleController: NSWindowController {
         controller.apply(CueUsageSchedulePreferences(autoSync: false, syncInterval: 1234, displayInterval: 17))
         let manualDisabled = !controller.syncSeconds.isEnabled && controller.displaySeconds.isEnabled
         controller.autoSync.state = .on; controller.toggleAutomatic()
+        let automaticEnabled = controller.syncSeconds.isEnabled
         let custom = CueUsageSchedulePreferences(raw: ["auto_sync": false, "sync_interval_seconds": 1234, "display_interval_seconds": 17])
         let invalid = CueUsageSchedulePreferences(raw: ["auto_sync": 1, "sync_interval_seconds": true, "display_interval_seconds": 0])
         let now = Date(timeIntervalSince1970: 10000)
         let prefs = CueUsageSchedulePreferences(syncInterval: 100)
-        return ["usage_schedule_manual_disables_sync_field_only": manualDisabled && controller.syncSeconds.isEnabled,
+        let host = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 385), styleMask: [.titled], backing: .buffered, defer: false)
+        let view = controller.embeddedContentView(); host.contentView = view
+        controller.loaded = true; controller.syncSeconds.stringValue = "1234"
+        controller.deactivateEmbedded(); controller.activateEmbedded()
+        let draftRetained = controller.syncSeconds.stringValue == "1234" && !controller.busy
+        controller.cancel()
+        let cancelledInPanel = controller.feedback.stringValue.contains("已撤销") && view.window === host && controller.cancelButton.title == "撤销更改"
+        let stableCanvas = controller.embeddedContentView() === view && controller.window?.contentView !== view
+        host.contentView = nil
+        return ["usage_schedule_embedded_canvas_is_reusable": stableCanvas,
+                "usage_schedule_tag_switch_preserves_unsaved_frequency": draftRetained,
+                "usage_schedule_embedded_cancel_never_closes_main_panel": cancelledInPanel,
+"usage_schedule_manual_disables_sync_field_only": manualDisabled && automaticEnabled,
                 "usage_schedule_custom_intervals_are_preserved": !custom.autoSync && custom.syncInterval == 1234 && custom.displayInterval == 17,
                 "usage_schedule_invalid_numeric_boolean_defaults": invalid.autoSync && invalid.syncInterval == 600 && invalid.displayInterval == 30,
                 "usage_schedule_manual_never_has_automatic_due_date": custom.nextSync(now: now, lastSync: nil, lastAttempt: nil) == nil,

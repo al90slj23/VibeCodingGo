@@ -765,12 +765,17 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 // many chats must not retain hidden web processes indefinitely.
                 DispatchQueue.main.async {
                     guard let self, let controller = self.conversationWindows[event.threadID],
-                          controller.window?.isVisible != true, !controller.hasInFlightOperation else { return }
+                          controller.window?.isVisible != true, !controller.isEmbeddedActive, !controller.hasInFlightOperation else { return }
                     self.conversationWindows.removeValue(forKey: event.threadID)?.stop()
                 }
             }
         }
-        conversationWindows[event.threadID]?.showWindow(nil)
+        guard let controller = conversationWindows[event.threadID] else { return }
+        openSettings()
+        guard settingsPanel?.presentConversation(controller) == true else { return }
+        for (id, old) in conversationWindows where id != event.threadID && !old.isEmbeddedActive && !old.hasInFlightOperation {
+            conversationWindows.removeValue(forKey: id)?.stop()
+        }
         recentHistory.beginReview(event: event)
         refreshConversationHistory()
     }
@@ -790,7 +795,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
     private func showThreadActionError(_ message: String, threadID: String) {
         let alert = NSAlert(); alert.messageText = "暂时无法完成此操作"; alert.informativeText = message; alert.addButton(withTitle: "知道了")
-        if let parent = conversationWindows[threadID]?.window, parent.isVisible { alert.beginSheetModal(for: parent) }
+        if let parent = conversationWindows[threadID]?.presentationWindow ?? settingsPanel?.window, parent.isVisible { alert.beginSheetModal(for: parent) }
         else { alert.runModal() }
     }
     private func performThreadAction(threadID: String, command: String) {
@@ -1333,7 +1338,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             let ordinary = recentHistory.records.filter { !$0.isPinned && !($0.event.provider == "codex" && (activeIDs.contains($0.event.threadID) || pendingIDs.contains($0.event.threadID))) }
             if !ordinary.isEmpty { heading("历史提醒 · \(ordinary.count) 条"); ordinary.forEach(reminder) }
         }
-        for (title, submenu) in [("提醒", remindersMenu), ("辅助 Coding · Codex", codingMenu), ("Test", testMenu)] {
+        for (title, submenu) in [("任务提醒", remindersMenu), ("编程助手", codingMenu), ("网络检测", testMenu)] {
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: ""); item.submenu = submenu; menu.addItem(item)
         }
         command("通用设置…", #selector(openGeneralSettings), in: menu)
@@ -1374,12 +1379,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         button.setAccessibilityLabel("VibeCoding Go" + usage.title(work: work))
     }
 
-    @objc func openAccountQuota() {
-        statusPopover?.performClose(nil)
-        if usageDashboard == nil { usageDashboard = CueUsageDashboardController(home: home) }
-        usageDashboard?.showAccounts()
-        NSApp.activate(ignoringOtherApps: true)
-    }
+    @objc func openAccountQuota() { openWorkspacePage(.accountQuota) }
     func openWorkspacePage(_ page: CueWorkspacePage) {
         statusPopover?.performClose(nil)
         openSettings(); settingsPanel?.selectPage(page.rawValue)
@@ -1387,25 +1387,70 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     @objc func openWorkbench() { openWorkspacePage(.workspace) }
     @objc func openReminderModule() { openWorkspacePage(.reminderOverview) }
     @objc func openCodingModule() { openWorkspacePage(.codingTasks) }
-    @objc func openTestModule() { openWorkspacePage(.networkTests) }
+    @objc func openTestModule() { openWorkspacePage(.networkIP) }
     @objc func openCodingSettings() { openWorkspacePage(.codexSettings) }
     @objc func openTestSettings() { openWorkspacePage(.testSettings) }
     @objc func openGeneralSettings() { openWorkspacePage(.general) }
     @objc func openNetworkTests() { showNetworkTests(kind: "ip_reputation") }
-    func showNetworkTests(kind: String) {
-        statusPopover?.performClose(nil)
-        if networkTests == nil { networkTests = CueNetworkTestsController(home: home) }
-        networkTests?.selectKind(kind)
-        networkTests?.showWindow(nil); networkTests?.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    func showNetworkTests(kind: String) { openWorkspacePage(CueWorkspacePage.networkPage(kind)) }
+    func getUsageController() -> CueUsageDashboardController {
+        if usageDashboard == nil {
+            usageDashboard = CueUsageDashboardController(home: home)
+            usageDashboard?.usageDidChange = { [weak self] in self?.menuUsage?.refresh() }
+        }
+        return usageDashboard!
     }
+    @objc func openUsage() { openWorkspacePage(.usage) }
 
-    @objc func openUsage() {
-        statusPopover?.performClose(nil)
-        if usageDashboard == nil { usageDashboard = CueUsageDashboardController(home: home) }
-        usageDashboard?.showWindow(nil)
-        usageDashboard?.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    func makeTaskActions() -> CueStatusPopoverActions {
+        var actions = CueStatusPopoverActions(
+            openSettings: { [weak self] in self?.openWorkbench() },
+            openUsage: { [weak self] in self?.openUsage() },
+            toggleEnabled: { [weak self] in self?.toggleEnabled() },
+            toggleSound: { [weak self] in self?.toggleMute() },
+            pause: { [weak self] in self?.togglePause() },
+            demo: { [weak self] in
+                guard let self else { return }
+                self.statusPopover?.performClose(nil)
+                _ = self.preview(kind: "complete", component: "all")
+            },
+            quit: { [weak self] in self?.quit() },
+            openEvent: { [weak self] event in
+                self?.showConversation(event: event)
+            },
+            historyChanged: { [weak self] in
+                guard let self else { return }
+                self.recent = self.recentHistory.events
+                self.refreshMenu(); self.settingsPanel?.updateHealth(); self.writeStatus()
+            },
+            batchConfigure: { [weak self] targets in
+                guard let self else { return }
+                self.statusPopover?.performClose(nil)
+                self.batchController = CueCodexBatchController(home: self.home, targets: targets, connect: { [weak self] in self?.connectManualApproval() }, completion: { [weak self] in self?.updateWatcherHealth() })
+                self.openWorkspacePage(.codingTasks)
+                if let parent = self.settingsPanel?.window { self.batchController?.presentSheet(on: parent) }
+                NSApp.activate(ignoringOtherApps: true)
+            },
+            connectCodex: { [weak self] in
+                self?.statusPopover?.performClose(nil); self?.connectManualApproval()
+            }, dismissInterrupted: { [weak self] task in
+                self?.dismissInterrupted(task)
+            }, openInCodex: { [weak self] event in
+                guard let self else { return }
+                if self.open(event: event) { self.recentHistory.beginReview(event: event); self.statusPopover?.performClose(nil); self.refreshConversationHistory() }
+            }, threadAction: { [weak self] id, command in
+                self?.performThreadAction(threadID: id, command: command)
+            }, openSideChat: { [weak self] chat in
+                guard let self, chat.canOpen else { return }
+                var url = URLComponents()
+                url.scheme = "codex"; url.host = "threads"; url.path = "/" + chat.threadID
+                guard let destination = url.url, self.openConversationURL(destination) else { return }
+                self.statusPopover?.performClose(nil)
+            })
+        actions.openReminderSettings = { [weak self] in self?.openReminderModule() }
+        actions.openCodingTools = { [weak self] in self?.openCodingModule() }
+        actions.openTestTools = { [weak self] in self?.openTestModule() }
+        return actions
     }
 
     @objc func toggleStatusPopover(_ sender: NSButton? = nil) {
@@ -1417,52 +1462,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         }
         if statusPopover?.isShown == true { statusPopover?.performClose(nil); writeStatus(); return }
         if statusPopoverController == nil {
-            var actions = CueStatusPopoverActions(
-                openSettings: { [weak self] in self?.openWorkbench() },
-                openUsage: { [weak self] in self?.openUsage() },
-                toggleEnabled: { [weak self] in self?.toggleEnabled() },
-                toggleSound: { [weak self] in self?.toggleMute() },
-                pause: { [weak self] in self?.togglePause() },
-                demo: { [weak self] in
-                    guard let self else { return }
-                    self.statusPopover?.performClose(nil)
-                    _ = self.preview(kind: "complete", component: "all")
-                },
-                quit: { [weak self] in self?.quit() },
-                openEvent: { [weak self] event in
-                    self?.showConversation(event: event)
-                },
-                historyChanged: { [weak self] in
-                    guard let self else { return }
-                    self.recent = self.recentHistory.events
-                    self.refreshMenu(); self.settingsPanel?.updateHealth(); self.writeStatus()
-                },
-                batchConfigure: { [weak self] targets in
-                    guard let self else { return }
-                    self.statusPopover?.performClose(nil)
-                    self.batchController = CueCodexBatchController(home: self.home, targets: targets, connect: { [weak self] in self?.connectManualApproval() }, completion: { [weak self] in self?.updateWatcherHealth() })
-                    self.batchController?.showWindow(nil); self.batchController?.window?.makeKeyAndOrderFront(nil)
-                    NSApp.activate(ignoringOtherApps: true)
-                },
-                connectCodex: { [weak self] in
-                    self?.statusPopover?.performClose(nil); self?.connectManualApproval()
-                }, dismissInterrupted: { [weak self] task in
-                    self?.dismissInterrupted(task)
-                }, openInCodex: { [weak self] event in
-                    guard let self else { return }
-                    if self.open(event: event) { self.recentHistory.beginReview(event: event); self.statusPopover?.performClose(nil); self.refreshConversationHistory() }
-                }, threadAction: { [weak self] id, command in
-                    self?.performThreadAction(threadID: id, command: command)
-                }, openSideChat: { [weak self] chat in
-                    guard let self, chat.canOpen else { return }
-                    var url = URLComponents()
-                    url.scheme = "codex"; url.host = "threads"; url.path = "/" + chat.threadID
-                    guard let destination = url.url, self.openConversationURL(destination) else { return }
-                    self.statusPopover?.performClose(nil)
-                })
-            actions.openReminderSettings = { [weak self] in self?.openReminderModule() }
-            actions.openCodingTools = { [weak self] in self?.openCodingModule() }
-            actions.openTestTools = { [weak self] in self?.openTestModule() }
+            let actions = makeTaskActions()
             statusPopoverController = CueStatusPopoverController(history: recentHistory, actions: actions)
             let popover = NSPopover(); popover.behavior = .transient
             popover.contentViewController = statusPopoverController
@@ -1473,12 +1473,17 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         writeStatus()
     }
 
+    func populateTaskController(_ controller: CueStatusPopoverController, maximumHeight: CGFloat) {
+        controller.update(status: watcherHealthText, enabled: settings.enabled,
+                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: maximumHeight, runningTasks: runningTasks, interruptedTasks: interruptedTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected,
+                                       connectionSummary: codexConnectionSummary, connectionState: codexConnectionState, showConnectionAction: codexConnectionState == "unsupported", sideChats: sideChats)
+    }
+
     func updateStatusPopover() {
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
         let height = min(1100, (screen?.visibleFrame.height ?? 900) - 52)
-        statusPopoverController?.update(status: watcherHealthText, enabled: settings.enabled,
-                                       soundEnabled: settings.soundEnabled, paused: pausedUntil != nil, maximumHeight: height, runningTasks: runningTasks, interruptedTasks: interruptedTasks, taskDetails: taskDetails, attentionConnected: manualApprovalConnected,
-                                       connectionSummary: codexConnectionSummary, connectionState: codexConnectionState, showConnectionAction: codexConnectionState == "unsupported", sideChats: sideChats)
+        if let controller = statusPopoverController { populateTaskController(controller, maximumHeight: height) }
+        settingsPanel?.updateEmbeddedTasks()
         if let controller = statusPopoverController, controller.isViewLoaded { statusPopover?.contentSize = controller.preferredContentSize }
     }
 
@@ -1560,6 +1565,8 @@ final class CueFlippedView: NSView {
     var backgroundColor: NSColor? { didSet { updateColors() } }
     var outlineColor: NSColor? { didSet { updateColors() } }
     var appearanceDidChange: (() -> Void)?
+    var onLayout: (() -> Void)?
+    override func layout() { super.layout(); onLayout?() }
     override var isFlipped: Bool { true }
     private func updateColors() {
         guard backgroundColor != nil || outlineColor != nil else { return }
@@ -1577,11 +1584,27 @@ final class CueFlippedView: NSView {
 
 final class CueSettingsController: NSWindowController, NSWindowDelegate {
     unowned let cue: CueController
-    let root = CueFlippedView(frame: NSRect(x: 0, y: 0, width: 760, height: 590))
-    let sidebar = CueFlippedView(frame: NSRect(x: 0, y: 0, width: 182, height: 590))
-    let content = CueFlippedView(frame: NSRect(x: 182, y: 0, width: 578, height: 590))
+    let root = CueFlippedView(frame: NSRect(x: 0, y: 0, width: 1280, height: 960))
+    let sidebar = CueFlippedView()
+    let content = CueFlippedView(frame: NSRect(x: 0, y: 0, width: 578, height: 610))
+    let pageScroll = NSScrollView()
+    let pageCanvas = CueFlippedView()
+    let primary = NSSegmentedControl()
+    let secondary = NSSegmentedControl()
+    let homeButton = NSButton(title: "VCGo · 工作台", target: nil, action: nil)
+    let generalButton = NSButton(title: "通用设置", target: nil, action: nil)
     var page = 0
-    var navigation: [NSButton] = []
+    var secondaryPages: [CueWorkspacePage] = []
+    var moduleLastPage: [String: CueWorkspacePage] = [:]
+    var renderedPage: Int?
+    var embeddedView: NSView?
+    var taskController: CueStatusPopoverController?
+    var accountsController: CueCCAccountsController?
+    var preferencesController: CueUsagePreferencesController?
+    var scheduleController: CueUsageScheduleController?
+    var pricesController: CuePriceSourcesController?
+    var conversationController: CueConversationController?
+    private var layingOut = false
     var healthLabel: NSTextField?
     var threadLabel: NSTextField?
     var latestLabel: NSTextField?
@@ -1599,21 +1622,27 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
 
     init(cue: CueController) {
         self.cue = cue
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 590), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        let visible = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1440, height: 1000)
+        let size = NSSize(width: min(1280, visible.width - 40), height: min(960, visible.height - 70))
+        let window = CueConversationWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "VibeCoding Go"
-        window.titleVisibility = .visible
         window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
+        window.contentMinSize = NSSize(width: 960, height: 720)
         window.center()
+        _ = window.setFrameAutosaveName("VCGoWorkspaceWindow")
         super.init(window: window)
-        window.delegate = self
-        window.contentView = root
-        root.wantsLayer = true
+        window.delegate = self; window.contentView = root
+        root.autoresizingMask = [.width, .height]
         root.backgroundColor = .windowBackgroundColor
-        sidebar.wantsLayer = true
-        sidebar.backgroundColor = .underPageBackgroundColor
-        root.addSubview(sidebar); root.addSubview(content)
+        sidebar.backgroundColor = .windowBackgroundColor
+        root.addSubview(sidebar)
+        pageScroll.hasVerticalScroller = true; pageScroll.hasHorizontalScroller = true
+        pageScroll.autohidesScrollers = true; pageScroll.drawsBackground = false
+        pageScroll.borderType = .noBorder; pageScroll.documentView = pageCanvas
+        root.addSubview(pageScroll)
         buildSidebar()
+        root.onLayout = { [weak self] in self?.layoutWorkspace() }
         root.appearanceDidChange = { [weak self] in self?.rebuild() }
         rebuild()
     }
@@ -1631,63 +1660,202 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func buildSidebar() {
-        let mark = NSImageView(frame: NSRect(x: 20, y: 29, width: 30, height: 30))
-        mark.image = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "VibeCoding Go")
-        mark.contentTintColor = .secondaryLabelColor
-        mark.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 24, weight: .semibold)
-        sidebar.addSubview(mark)
-        label("VCGo", in: sidebar, frame: NSRect(x: 60, y: 29, width: 116, height: 30), size: 19, weight: .semibold)
-        label("AI 编程助手", in: sidebar, frame: NSRect(x: 20, y: 73, width: 156, height: 18), size: 11, color: .secondaryLabelColor)
-        func section(_ title: String, y: CGFloat) {
-            let text = label(title, in: sidebar, frame: NSRect(x: 20, y: y, width: 150, height: 16), size: 10, weight: .semibold, color: .tertiaryLabelColor)
-            text.identifier = NSUserInterfaceItemIdentifier("module." + title)
-        }
-        section("提醒", y: 151); section("辅助 Coding · Codex", y: 277); section("Test", y: 403)
-        let positions: [CueWorkspacePage: CGFloat] = [.workspace: 108, .reminderOverview: 169, .reminderRules: 201, .reminderEffects: 233, .codingTasks: 295, .usage: 327, .codexSettings: 359, .networkTests: 421, .testSettings: 453, .general: 497]
-        for item in CueWorkspacePage.ordered {
-            let control = NSButton(title: item.title, target: self, action: #selector(navigate(_:)))
-            control.image = NSImage(systemSymbolName: item.symbol, accessibilityDescription: nil)
-            control.imagePosition = .imageLeading; control.imageScaling = .scaleProportionallyDown
-            control.alignment = .left; control.isBordered = false
-            control.font = .systemFont(ofSize: 12, weight: .medium)
-            control.frame = NSRect(x: 10, y: positions[item] ?? 108, width: 166, height: 30)
-            control.tag = item.rawValue; control.identifier = NSUserInterfaceItemIdentifier("settings.page.\(item.rawValue)")
-            control.toolTip = item.module + " / " + item.title
-            control.wantsLayer = true; control.layer?.cornerRadius = 7
-            sidebar.addSubview(control); navigation.append(control)
-        }
-        let line = NSView(frame: NSRect(x: 20, y: 537, width: 142, height: 1))
-        line.wantsLayer = true; line.layer?.backgroundColor = NSColor.separatorColor.cgColor; sidebar.addSubview(line)
-        label("本机运行 · Codex", in: sidebar, frame: NSRect(x: 20, y: 544, width: 154, height: 17), size: 10.5, color: .secondaryLabelColor)
-        label("VCGo \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.5.0")", in: sidebar, frame: NSRect(x: 20, y: 565, width: 154, height: 17), size: 10.5, color: .tertiaryLabelColor)
+        homeButton.target = self; homeButton.action = #selector(goHome)
+        homeButton.bezelStyle = .rounded; homeButton.font = .systemFont(ofSize: 14, weight: .semibold)
+        homeButton.identifier = NSUserInterfaceItemIdentifier("workspace.home")
+        generalButton.target = self; generalButton.action = #selector(goGeneral)
+        generalButton.bezelStyle = .rounded
+        generalButton.identifier = NSUserInterfaceItemIdentifier("workspace.general")
+        primary.segmentCount = CueWorkspacePage.moduleTitles.count
+        primary.trackingMode = .selectOne; primary.segmentStyle = .rounded
+        primary.font = .systemFont(ofSize: 14, weight: .semibold)
+        for (index, title) in CueWorkspacePage.moduleTitles.enumerated() { primary.setLabel(title, forSegment: index); primary.setWidth(136, forSegment: index) }
+        primary.target = self; primary.action = #selector(changeModule(_:))
+        primary.identifier = NSUserInterfaceItemIdentifier("workspace.primary-tags")
+        secondary.trackingMode = .selectOne; secondary.segmentStyle = .texturedRounded
+        secondary.font = .systemFont(ofSize: 12, weight: .medium)
+        secondary.target = self; secondary.action = #selector(changeSecondary(_:))
+        secondary.identifier = NSUserInterfaceItemIdentifier("workspace.secondary-tags")
+        [homeButton, generalButton, primary, secondary].forEach { sidebar.addSubview($0) }
     }
-
-    @objc func navigate(_ sender: NSButton) {
-        selectPage(sender.tag)
+    @objc func goHome() { selectPage(CueWorkspacePage.workspace.rawValue) }
+    @objc func goGeneral() { selectPage(CueWorkspacePage.general.rawValue) }
+    @objc func changeModule(_ sender: NSSegmentedControl) {
+        guard CueWorkspacePage.moduleTitles.indices.contains(sender.selectedSegment) else { return }
+        let name = CueWorkspacePage.moduleTitles[sender.selectedSegment]
+        let children = CueWorkspacePage.children(of: name, hasConversation: conversationController != nil)
+        selectPage((moduleLastPage[name] ?? children[0]).rawValue)
     }
-    func selectPage(_ value: Int) { page = (CueWorkspacePage(rawValue: value) ?? .workspace).rawValue; rebuild() }
-
+    @objc func changeSecondary(_ sender: NSSegmentedControl) {
+        guard secondaryPages.indices.contains(sender.selectedSegment) else { return }
+        selectPage(secondaryPages[sender.selectedSegment].rawValue)
+    }
+    private func updateTags() {
+        let route = CueWorkspacePage.canonical(page)
+        primary.selectedSegment = CueWorkspacePage.moduleTitles.firstIndex(of: route.module) ?? -1
+        secondaryPages = CueWorkspacePage.children(of: route.module, hasConversation: conversationController != nil)
+        secondary.segmentCount = secondaryPages.count
+        for (index, child) in secondaryPages.enumerated() {
+            secondary.setLabel(child.title, forSegment: index)
+            secondary.setWidth(child.title.count > 5 ? 104 : 92, forSegment: index)
+            secondary.setToolTip(route.module + " / " + child.title, forSegment: index)
+        }
+        secondary.selectedSegment = secondaryPages.firstIndex(of: route) ?? -1
+        secondary.isHidden = secondaryPages.isEmpty
+        window?.title = "VibeCoding Go · " + route.title
+    }
+    @discardableResult func selectPage(_ value: Int) -> Bool {
+        let route = CueWorkspacePage.canonical(value)
+        if route == .conversation && conversationController == nil { return selectPage(CueWorkspacePage.codingTasks.rawValue) }
+        if route.rawValue != page {
+            window?.makeFirstResponder(nil)
+            guard deactivateCurrentEmbedded() else { updateTags(); return false }
+            page = route.rawValue
+            if CueWorkspacePage.moduleTitles.contains(route.module) { moduleLastPage[route.module] = route }
+        }
+        rebuild(); return true
+    }
+    @discardableResult func presentConversation(_ controller: CueConversationController) -> Bool {
+        window?.makeFirstResponder(nil)
+        guard deactivateCurrentEmbedded() else { return false }
+        conversationController = controller
+        controller.onEmbeddedDismiss = { [weak self] in self?.selectPage(CueWorkspacePage.codingTasks.rawValue) }
+        renderedPage = nil
+        page = CueWorkspacePage.conversation.rawValue
+        moduleLastPage["编程助手"] = .conversation
+        rebuild(); return true
+    }
+    private func usageController() -> CueUsageDashboardController {
+        let controller = cue.getUsageController()
+        controller.onNavigateAccounts = { [weak self] in self?.selectPage(CueWorkspacePage.accountQuota.rawValue) }
+        controller.onNavigatePreferences = { [weak self] in self?.selectPage(CueWorkspacePage.usagePreferences.rawValue) }
+        return controller
+    }
+    @discardableResult private func deactivateCurrentEmbedded() -> Bool {
+        switch CueWorkspacePage.canonical(renderedPage ?? page) {
+        case .conversation: if conversationController?.setEmbeddedVisible(false) == false { return false }
+        case .codingTasks: taskController?.setEmbeddedVisible(false)
+        case .usage: cue.usageDashboard?.deactivateEmbedded()
+        case .accountQuota: accountsController?.deactivateEmbedded()
+        case .usagePreferences: preferencesController?.deactivateEmbedded()
+        case .usageSchedule: scheduleController?.deactivateEmbedded()
+        case .priceSources: pricesController?.deactivateEmbedded()
+        case .networkTests, .networkIP, .networkDomain, .networkTrace, .networkPing, .networkHTTP, .networkSpeed: cue.networkTests?.stopEmbeddedWork()
+        default: break
+        }
+        return true
+    }
+    private func activateCurrentEmbedded() {
+        guard window?.isVisible == true else { return }
+        switch CueWorkspacePage.canonical(page) {
+        case .conversation: _ = conversationController?.setEmbeddedVisible(true)
+        case .codingTasks: taskController?.setEmbeddedVisible(true)
+        case .usage: cue.usageDashboard?.activateEmbedded()
+        case .accountQuota: accountsController?.activateEmbedded()
+        case .usagePreferences: preferencesController?.activateEmbedded()
+        case .usageSchedule: scheduleController?.activateEmbedded()
+        case .priceSources: pricesController?.activateEmbedded()
+        default: break
+        }
+    }
+    override func showWindow(_ sender: Any?) {
+        let wasVisible = window?.isVisible == true
+        super.showWindow(sender)
+        if !wasVisible { activateCurrentEmbedded() }
+    }
+    func updateEmbeddedTasks() {
+        guard let taskController else { return }
+        cue.populateTaskController(taskController, maximumHeight: max(430, pageScroll.contentSize.height))
+    }
+    private func embeddedPage(_ route: CueWorkspacePage) -> NSView? {
+        if let kind = route.networkKind {
+            if cue.networkTests == nil { cue.networkTests = CueNetworkTestsController(home: cue.home) }
+            cue.networkTests?.selectKind(kind); return cue.networkTests?.embeddedContentView()
+        }
+        switch route {
+        case .codingTasks:
+            if taskController == nil { taskController = CueStatusPopoverController(history: cue.recentHistory, actions: cue.makeTaskActions(), embedded: true) }
+            updateEmbeddedTasks(); return taskController?.view
+        case .conversation: return conversationController?.embeddedContentView()
+        case .usage: return usageController().embeddedContentView()
+        case .accountQuota:
+            if accountsController == nil { accountsController = CueCCAccountsController(home: cue.home) }
+            return accountsController?.embeddedContentView()
+        case .usagePreferences:
+            if preferencesController == nil {
+                preferencesController = CueUsagePreferencesController(home: cue.home, knownModels: usageController().currentKnownModels) { [weak self] in self?.cue.usageDashboard?.refreshAfterPreferences() }
+                preferencesController?.onNavigateSchedule = { [weak self] in self?.selectPage(CueWorkspacePage.usageSchedule.rawValue) }
+                preferencesController?.onNavigatePrices = { [weak self] in self?.selectPage(CueWorkspacePage.priceSources.rawValue) }
+            }
+            return preferencesController?.embeddedContentView()
+        case .usageSchedule:
+            if scheduleController == nil { scheduleController = CueUsageScheduleController(home: cue.home) { [weak self] in self?.cue.usageDashboard?.refreshAfterPreferences() } }
+            return scheduleController?.embeddedContentView()
+        case .priceSources:
+            if pricesController == nil { pricesController = CuePriceSourcesController(home: cue.home) { [weak self] in
+                self?.cue.usageDashboard?.refreshAfterPreferences()
+                self?.preferencesController?.refreshPricingPreservingDrafts()
+            } }
+            return pricesController?.embeddedContentView()
+        default: return nil
+        }
+    }
+    func layoutWorkspace() {
+        guard !layingOut else { return }; layingOut = true; defer { layingOut = false }
+        let width = root.bounds.width, height = root.bounds.height
+        sidebar.frame = NSRect(x: 0, y: 0, width: width, height: 118)
+        homeButton.frame = NSRect(x: 20, y: 20, width: 160, height: 34)
+        primary.frame = NSRect(x: max(190, (width - 420) / 2), y: 20, width: 420, height: 34)
+        generalButton.frame = NSRect(x: width - 124, y: 22, width: 104, height: 30)
+        secondary.frame = NSRect(x: 24, y: 75, width: width - 48, height: 29)
+        pageScroll.frame = NSRect(x: 18, y: 118, width: width - 36, height: max(400, height - 134))
+        let route = CueWorkspacePage.canonical(page)
+        var minimum = NSSize(width: 578, height: 610), fixed = false
+        switch route {
+        case .usage: minimum = NSSize(width: 1000, height: 760)
+        case .priceSources: minimum = NSSize(width: 800, height: 620)
+        case .usagePreferences: minimum = NSSize(width: 650, height: 660); fixed = true
+        case .usageSchedule: minimum = NSSize(width: 620, height: 385); fixed = true
+        case .accountQuota: minimum = NSSize(width: 640, height: 420)
+        case .codingTasks: minimum = NSSize(width: 680, height: 430)
+        case .conversation: minimum = NSSize(width: 760, height: 590)
+        default: if route.networkKind != nil { minimum = NSSize(width: 760, height: 430) }
+        }
+        let size = NSSize(width: max(minimum.width, pageScroll.contentSize.width), height: max(minimum.height, pageScroll.contentSize.height))
+        pageCanvas.setFrameSize(size)
+        if let embeddedView {
+            embeddedView.frame = fixed ? NSRect(x: (size.width - minimum.width) / 2, y: 0, width: minimum.width, height: minimum.height) : NSRect(origin: .zero, size: size)
+            embeddedView.needsLayout = true
+            if route == .codingTasks { taskController?.resizeEmbedded(to: size) }
+        } else { content.frame = NSRect(x: (size.width - 578) / 2, y: 0, width: 578, height: 610) }
+    }
     func rebuild() {
+        let route = CueWorkspacePage.canonical(page)
+        updateTags()
+        if renderedPage == page && route.isEmbedded { layoutWorkspace(); updateHealth(); return }
+        pageCanvas.subviews.forEach { $0.removeFromSuperview() }; embeddedView = nil
         content.subviews.forEach { $0.removeFromSuperview() }
         healthLabel = nil; threadLabel = nil; latestLabel = nil; hookLabel = nil; codingConnectionLabel = nil; codingCountsLabel = nil; sliderLabels = [:]; previewStatusLabel = nil
-        for button in navigation {
-            button.layer?.backgroundColor = (button.tag == page ? NSColor.controlAccentColor.withAlphaComponent(0.1) : .clear).cgColor
-            button.contentTintColor = button.tag == page ? .labelColor : .secondaryLabelColor
+        if let view = embeddedPage(route) {
+            embeddedView = view; pageCanvas.addSubview(view)
+        } else {
+            pageCanvas.addSubview(content)
+            switch route {
+            case .workspace: overview()
+            case .reminderOverview: reminderOverview()
+            case .reminderRules: notifications()
+            case .reminderEffects: glowAndSound()
+            case .codexSettings: providers()
+            case .testSettings: testPreferences()
+            case .general: generalPreferences()
+            default: break
+            }
+            if [2, 5, 9].contains(page) { label(cue.appearanceMigrationError.isEmpty ? "变更会立即保存到本机。" : cue.appearanceMigrationError, in: content, frame: NSRect(x: 26, y: 580, width: 525, height: 18), size: 11, color: cue.appearanceMigrationError.isEmpty ? .tertiaryLabelColor : .systemOrange) }
         }
-        switch CueWorkspacePage(rawValue: page) ?? .workspace {
-        case .workspace: overview()
-        case .reminderOverview: reminderOverview()
-        case .reminderRules: notifications()
-        case .reminderEffects: glowAndSound()
-        case .codexSettings: providers()
-        case .codingTasks: codingOverview()
-        case .usage: codingUsage()
-        case .networkTests: testOverview()
-        case .testSettings: testPreferences()
-        case .general: generalPreferences()
-        }
-        if [2, 5, 9].contains(page) { label(cue.appearanceMigrationError.isEmpty ? "变更会立即保存到本机。" : cue.appearanceMigrationError, in: content, frame: NSRect(x: 26, y: 558, width: 525, height: 18), size: 11, color: cue.appearanceMigrationError.isEmpty ? .tertiaryLabelColor : .systemOrange) }
-        updateHealth()
+        renderedPage = page
+        layoutWorkspace(); pageScroll.contentView.scroll(to: .zero)
+        pageScroll.reflectScrolledClipView(pageScroll.contentView)
+        activateCurrentEmbedded(); updateHealth()
     }
 
     func heading(_ title: String, _ detail: String) {
@@ -1751,8 +1919,8 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func overview() {
-        heading("工作台", "提醒、辅助 Coding 与 Test，按板块进入，分别设置。")
-        for (y, title, detail, target) in [(CGFloat(106), "提醒", "完成、等待输入、人工批准 · 规则、光影、提示框与声音", 5), (CGFloat(246), "辅助 Coding · Codex", "任务与对话、运行状态、用量统计、账号额度和连接设置", 6), (CGFloat(386), "Test · 网络检测", "IP 信誉、域名可达性、出口痕迹、全球 Ping 与下载测速", 7)] {
+        heading("工作台", "从上方两级标签切换功能，任务与设置都在同一面板。")
+        for (y, title, detail, target) in [(CGFloat(106), "任务提醒", "完成、等待输入、人工批准 · 规则、光影、提示框与声音", 5), (CGFloat(246), "编程助手", "任务与对话、运行状态、用量统计、账号额度和连接设置", 6), (CGFloat(386), "网络检测", "IP 信誉、域名可达性、出口痕迹、全球 Ping 与下载测速", 7)] {
             let box = card(y, 124)
             label(title, in: box, frame: NSRect(x: 20, y: 17, width: 480, height: 25), size: 16, weight: .semibold)
             label(detail, in: box, frame: NSRect(x: 20, y: 51, width: 480, height: 33), size: 11.5, color: .secondaryLabelColor, lines: 2)
@@ -1764,13 +1932,13 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     @objc func goCoding() { selectPage(CueWorkspacePage.codingTasks.rawValue) }
     @objc func goUsage() { selectPage(CueWorkspacePage.usage.rawValue) }
     @objc func goReminder() { selectPage(CueWorkspacePage.reminderOverview.rawValue) }
-    @objc func showTasks() { cue.toggleStatusPopover() }
+    @objc func showTasks() { selectPage(CueWorkspacePage.codingTasks.rawValue) }
     @objc func showUsage() { cue.openUsage() }
     @objc func showAccounts() { cue.openAccountQuota() }
     @objc func runNetworkTool(_ sender: NSButton) { cue.showNetworkTests(kind: sender.identifier?.rawValue ?? "ip_reputation") }
 
     func codingOverview() {
-        heading("辅助 Coding · Codex", "当前支持 Codex；对话、任务状态和设置集中管理。")
+        heading("编程助手", "当前支持 Codex；对话、任务状态和设置集中管理。")
         let live = card(106, 181)
         label("任务与对话", in: live, frame: NSRect(x: 20, y: 17, width: 486, height: 26), size: 17, weight: .semibold)
         codingCountsLabel = label("", in: live, frame: NSRect(x: 20, y: 54, width: 486, height: 24), size: 13)
@@ -1795,7 +1963,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         _ = button("查看账号额度", in: quota, frame: NSRect(x: 16, y: 116, width: 490, height: 31), action: #selector(showAccounts))
     }
     func testOverview() {
-        heading("Test · 网络检测", "手动发起检测，运行前显示第三方来源与检测范围。")
+        heading("网络检测", "手动发起检测，运行前显示第三方来源与检测范围。")
         for (index, item) in [("IP 纯净度与信誉", "归属、网络类型与公开风险信号，缺少的信号明确标注。", "ip_reputation"), ("域名可达性与封禁线索", "检查 DNS、TLS 与 HTTP，也可比较全球节点结果。", "domain"), ("出口 IP 与痕迹", "查看出口与系统代理信号，按需进入浏览器泄露检测。", "ip_trace"), ("全球 Ping 与测速", "全球节点的 Ping / HTTP 表现，以及本机下载速度。", "global_ping")].enumerated() {
             let box = card(106 + CGFloat(index) * 108, 95)
             label(item.0, in: box, frame: NSRect(x: 20, y: 13, width: 330, height: 23), size: 14, weight: .semibold)
@@ -1804,7 +1972,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         }
     }
     func testPreferences() {
-        heading("Test · 检测来源与范围", "检测由你手动发起，公网 IP 或目标会发送给相应检测服务。")
+        heading("网络检测 · 来源与范围", "检测由你手动发起，公网 IP 或目标会发送给相应检测服务。")
         let limits = card(106, 173)
         label("检测范围", in: limits, frame: NSRect(x: 20, y: 15, width: 486, height: 24), size: 14, weight: .semibold)
         label("全球检测节点数", in: limits, frame: NSRect(x: 20, y: 57, width: 260, height: 23), size: 12)
@@ -1838,7 +2006,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func reminderOverview() {
-        heading("提醒 · 概览", "管理需要你注意的时刻：完成、提问和人工批准。")
+        heading("任务提醒 · 概览", "管理需要你注意的时刻：完成、提问和人工批准。")
         let status = card(106, 199)
         label("CODEX · 本机监控", in: status, frame: NSRect(x: 20, y: 17, width: 480, height: 21), size: 11, weight: .semibold, color: .secondaryLabelColor)
         healthLabel = label("", in: status, frame: NSRect(x: 20, y: 50, width: 480, height: 26), size: 18, weight: .semibold)
@@ -1853,10 +2021,10 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         label("测试会使用目前的提醒与音量设置；一般提醒不会抢走输入焦点。", in: content, frame: NSRect(x: 27, y: 505, width: 520, height: 34), size: 11, color: .secondaryLabelColor, lines: 2)
     }
 
-    @objc func openRecentInbox(_ sender: NSButton) { cue.toggleStatusPopover(sender) }
+    @objc func openRecentInbox(_ sender: NSButton) { selectPage(CueWorkspacePage.codingTasks.rawValue) }
 
     func notifications() {
-        heading("提醒 · 规则与样式", "按提醒类型配置屏幕特效、提示框与声音，点选即预览。")
+        heading("任务提醒 · 规则与样式", "按提醒类型配置屏幕特效、提示框与声音，点选即预览。")
         let selector = NSPopUpButton(frame: NSRect(x: 26, y: 106, width: 526, height: 31), pullsDown: false)
         for (name, kind) in [("本轮已完成", "complete"), ("需要回答或判断", "input"), ("人工批准", "permission")] {
             selector.addItem(withTitle: name); selector.lastItem?.representedObject = kind
@@ -2109,7 +2277,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func glowAndSound() {
-        heading("提醒 · 全局效果与音量", "这些设置仅影响提醒，不影响 Coding 工具和 Test 检测。")
+        heading("任务提醒 · 全局效果与音量", "这些设置仅影响提醒，编程助手与网络检测可独立使用。")
         let glow = card(106, 204)
         toggle("屏幕边缘泛光", "提示卡仍会显示对话名称。", in: glow, y: 16, key: "glow_enabled", on: cue.settings.glowEnabled)
         toggle("在所有屏幕显示泛光", "关闭后只使用鼠标所在的屏幕。", in: glow, y: 78, key: "all_displays", on: cue.settings.allDisplays)
@@ -2141,6 +2309,7 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
     }
 
     func updateHealth() {
+        updateEmbeddedTasks()
         codingConnectionLabel?.stringValue = cue.codexConnectionSummary
         codingConnectionLabel?.textColor = cue.codexConnectionState == "connected" ? .secondaryLabelColor : .systemOrange
         let work = CueMenuBarWork(records: cue.recentHistory.records, running: cue.runningTasks, interrupted: cue.interruptedTasks, followups: cue.recentHistory.followups.records)
@@ -2269,7 +2438,14 @@ final class CueSettingsController: NSWindowController, NSWindowDelegate {
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         NSWorkspace.shared.open(logs)
     }
-    func windowWillClose(_ notification: Notification) { DispatchQueue.main.async { self.cue.writeStatus() } }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        window?.makeFirstResponder(nil)
+        return deactivateCurrentEmbedded()
+    }
+    func windowWillClose(_ notification: Notification) {
+        _ = deactivateCurrentEmbedded()
+        DispatchQueue.main.async { self.cue.writeStatus() }
+    }
     func capture(to path: String) {
         root.layoutSubtreeIfNeeded()
         guard let rep = root.bitmapImageRepForCachingDisplay(in: root.bounds) else { return }

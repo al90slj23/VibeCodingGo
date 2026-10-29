@@ -74,6 +74,15 @@ private final class CueConversationSendButton: NSButton {
 final class CueConversationController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
     let event: CueEvent
     var onClosed: (() -> Void)?
+    var onEmbeddedDismiss: (() -> Void)?
+    private var embedded = false
+    private var embeddedVisible = false
+    var isEmbeddedActive: Bool { embedded && embeddedVisible }
+    var presentationWindow: NSWindow? { embedded ? root.window : window }
+    private var isPresentationVisible: Bool {
+        guard !embedded || embeddedVisible, let host = presentationWindow else { return false }
+        return host.isVisible && !host.isMiniaturized
+    }
     private let client: CueUsageClient
     private let drafts: CueConversationDrafts
     private let windowGeometry: CueConversationWindowState
@@ -205,25 +214,78 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit { timer?.invalidate(); saveWork?.cancel(); stopLifecycleObservers() }
 
+    /// The main shell owns presentation; this window remains only for old
+    /// callers and fixture captures. Moving the root never displays a new window.
+    func embeddedContentView() -> NSView {
+        if !embedded {
+            embedded = true; remembersWindowGeometry = false
+            timer?.invalidate(); timer = nil; stopLifecycleObservers()
+            window?.orderOut(nil)
+            if window?.contentView === root { window?.contentView = NSView(frame: .zero) }
+            root.autoresizingMask = [.width, .height]
+            layout()
+        }
+        return root
+    }
+
+    /// Returning false leaves the pane active so the shell can preserve an
+    /// editor whose draft could not be saved. Navigation never stops mutations.
+    @discardableResult func setEmbeddedVisible(_ visible: Bool) -> Bool {
+        if visible && !embedded { _ = embeddedContentView() }
+        guard embedded else { return true }
+        guard embeddedVisible != visible else { return true }
+        if !visible && !saveDraft() { return false }
+        embeddedVisible = visible; remembersWindowGeometry = false
+        if visible {
+            handled = false; canSend = false; canLoad = false
+            automaticReconnect = true; connection.stringValue = "正在自动连接 Codex…"
+            lastRead = .distantPast; nextStatusCheck = .distantPast
+            updateControls(); beginVisibleWork()
+        } else {
+            saveWork?.cancel(); saveWork = nil
+            timer?.invalidate(); timer = nil; stopLifecycleObservers()
+            // Status/read callbacks from this presentation cannot re-enable old
+            // state. A send/load callback still commits its original receipt.
+            connectionGeneration += 1; loadGeneration += 1
+            connectionRefreshQueued = false; canSend = false; canLoad = false
+            updateControls()
+        }
+        return true
+    }
+
     override func showWindow(_ sender: Any?) {
+        if embedded { _ = setEmbeddedVisible(true); return }
         remembersWindowGeometry = false
         if !fixtureMode, window?.isVisible != true { restoreWindowGeometry() }
         super.showWindow(sender); handled = false; window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         guard !fixtureMode else { return }
-        remembersWindowGeometry = true
+        remembersWindowGeometry = true; beginVisibleWork()
+    }
+    private func beginVisibleWork() {
+        guard !fixtureMode else { return }
         startLifecycleObservers()
         connectionGeneration += 1
         if checking { connectionRefreshQueued = true }
         readConversation(); checkConnection(force: true)
         timer?.invalidate(); timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            guard let self, self.window?.isVisible == true, self.window?.isMiniaturized != true else { return }
+            guard let self, self.isPresentationVisible else { return }
             self.refreshMetrics(); self.readConversation(); self.checkConnection()
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
-    func windowWillClose(_ notification: Notification) { remembersWindowGeometry = false; windowGeometry.flush(); timer?.invalidate(); timer = nil; stopLifecycleObservers(); saveDraft(); if !hasInFlightOperation { onClosed?() }; /* Closing never handles a task. */ }
+    func windowWillClose(_ notification: Notification) {
+        if embedded { _ = setEmbeddedVisible(false); return }
+        remembersWindowGeometry = false; windowGeometry.flush(); timer?.invalidate(); timer = nil
+        stopLifecycleObservers(); saveDraft(); if !hasInFlightOperation { onClosed?() }
+        // Closing never handles a task.
+    }
     func windowShouldClose(_ sender: NSWindow) -> Bool { saveDraft() }
-    func stop() { windowGeometry.flush(); timer?.invalidate(); timer = nil; stopLifecycleObservers(); saveDraft(); client.stop() }
+    /// Ownership shutdown only. Page changes use setEmbeddedVisible(false) so
+    /// an in-flight send/load can finish and retain its crash-safe receipt.
+    func stop() {
+        if !embedded { windowGeometry.flush() }
+        timer?.invalidate(); timer = nil; stopLifecycleObservers(); saveDraft(); client.stop()
+    }
     private func startLifecycleObservers() {
         guard applicationObservers.isEmpty, workspaceObservers.isEmpty else { return }
         applicationObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
@@ -246,7 +308,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }; workspaceObservers.removeAll()
     }
     private func refreshConnectionAfterLifecycle(invalidate: Bool) {
-        guard !fixtureMode, window?.isVisible == true, window?.isMiniaturized != true else { return }
+        guard !fixtureMode, isPresentationVisible else { return }
         nextStatusCheck = .distantPast
         if invalidate {
             connectionGeneration += 1
@@ -260,14 +322,14 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     }
     func windowDidMove(_ notification: Notification) { rememberWindowGeometry() }
     func windowDidResize(_ notification: Notification) { rememberWindowGeometry() }
-    func windowDidEndLiveResize(_ notification: Notification) { rememberWindowGeometry(); if !fixtureMode { windowGeometry.flush() } }
+    func windowDidEndLiveResize(_ notification: Notification) { guard !embedded else { return }; rememberWindowGeometry(); if !fixtureMode { windowGeometry.flush() } }
     private func rememberWindowGeometry() {
-        guard remembersWindowGeometry, !fixtureMode, let window, window.isVisible,
+        guard !embedded, remembersWindowGeometry, !fixtureMode, let window, window.isVisible,
               !window.isMiniaturized, !window.styleMask.contains(.fullScreen) else { return }
         windowGeometry.record(window.frame)
     }
     private func restoreWindowGeometry() {
-        guard let window else { return }
+        guard !embedded, let window else { return }
         let minimum = window.frameRect(forContentRect: NSRect(origin: .zero, size: NSSize(width: 640, height: 580))).size
         guard let saved = windowGeometry.restoredFrame(screens: CueConversationWindowState.visibleScreens, minimum: minimum) else { return }
         let chrome = window.frame.height - window.contentRect(forFrameRect: window.frame).height
@@ -275,7 +337,10 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         window.setFrame(saved, display: false)
     }
     private func releaseClosedWindowIfIdle() {
-        if window?.isVisible != true && !hasInFlightOperation { onClosed?() }
+        // Embedded instances are retained/evicted by the main shell. In-flight
+        // callbacks must never mistake a hidden compatibility window for close.
+        guard !embedded else { return }
+        if !isPresentationVisible && !hasInFlightOperation { onClosed?() }
     }
 
     private func layout() {
@@ -295,7 +360,8 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         composer.textContainer?.containerSize = NSSize(width: max(120, column - 32), height: CGFloat.greatestFiniteMagnitude)
         if let container = composer.textContainer { composer.layoutManager?.ensureLayout(for: container) }
         let textHeight = composer.textContainer.flatMap { composer.layoutManager?.usedRect(for: $0).height } ?? 20
-        let inputHeight = min(154, max(44, ceil(textHeight) + 20))
+        let inputLimit = embedded ? max(44, min(154, h - 250)) : 154
+        let inputHeight = min(inputLimit, max(44, ceil(textHeight) + 20))
         let composeHeight = inputHeight + 42
         let bottom: CGFloat = feedback.stringValue.isEmpty ? 18 : 49
         let composeY = h - bottom - composeHeight
@@ -316,7 +382,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         for (button, width) in [(unlockButton, CGFloat(160)), (connectButton, 107), (loadButton, 85)] where !button.isHidden {
             actionX -= width; button.frame = NSRect(x: actionX, y: composeY - 31, width: width - 4, height: 26)
         }
-        transcript.frame = NSRect(x: 0, y: 82, width: mainWidth, height: max(170, composeY - 119))
+        transcript.frame = NSRect(x: 0, y: 82, width: mainWidth, height: max(embedded ? 32 : 170, composeY - 119))
         feedback.frame = NSRect(x: left + 2, y: h - 39, width: column - 4, height: 32)
         feedback.isHidden = feedback.stringValue.isEmpty
         let notesShown = notesVisible
@@ -341,7 +407,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
     }
     private func payload(_ values: [String: Any]) -> Data? { try? JSONSerialization.data(withJSONObject: values) }
     private func readConversation() {
-        guard !reading, Date().timeIntervalSince(lastRead) > readDelay else { return }
+        guard !fixtureMode, isPresentationVisible, !reading, Date().timeIntervalSince(lastRead) > readDelay else { return }
         reading = true; lastRead = Date(); loadGeneration += 1; let generation = loadGeneration
         var request: [String: Any] = ["thread_id": event.threadID]
         if !fingerprint.isEmpty { request["if_fingerprint"] = fingerprint }
@@ -392,7 +458,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         guard let date else { return "" }; let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm"; return formatter.string(from: date)
     }
     private func checkConnection(force: Bool = false) {
-        guard !fixtureMode, !checking, window?.isVisible == true, window?.isMiniaturized != true,
+        guard !fixtureMode, !checking, isPresentationVisible,
               force || Date() >= nextStatusCheck else { return }
         checking = true; nextStatusCheck = Date().addingTimeInterval(8)
         let generation = connectionGeneration
@@ -496,7 +562,7 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
                 self.feedback.stringValue = "发送结果未确认。消息可能已提交，请查看对话后再决定是否重发。"; self.feedback.textColor = .systemOrange
             }
             self.saveDraft(); self.updateControls()
-            if self.window?.isVisible == true { self.lastRead = .distantPast; self.readConversation(); self.checkConnection(force: true) }
+            if self.isPresentationVisible { self.lastRead = .distantPast; self.readConversation(); self.checkConnection(force: true) }
             else { self.releaseClosedWindowIfIdle() }
         }
     }
@@ -519,14 +585,22 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
             switch result { case .success(let data): self.feedback.stringValue = data["message"] as? String ?? "载入结果待确认。"
             case .failure(let error): self.feedback.stringValue = error.localizedDescription }
             self.updateControls()
-            if self.window?.isVisible == true { self.checkConnection(force: true) }
+            if self.isPresentationVisible { self.checkConnection(force: true) }
             else { self.releaseClosedWindowIfIdle() }
         }
     }
-    @objc private func markHandled() { guard !sending && !loading && saveDraft() else { return }; handled = true; onHandled(); summary.stringValue = "已标记处理完成 · 有新提醒时仍会再次通知"; updateControls(); close() }
-    @objc private func closeForLater() { window?.performClose(nil) }
+    @objc private func markHandled() {
+        guard !sending && !loading && saveDraft() else { return }
+        handled = true; onHandled(); summary.stringValue = "已标记处理完成 · 有新提醒时仍会再次通知"; updateControls()
+        if embedded { if setEmbeddedVisible(false) { onEmbeddedDismiss?() } }
+        else { close() }
+    }
+    @objc private func closeForLater() {
+        if embedded { if setEmbeddedVisible(false) { onEmbeddedDismiss?() } }
+        else { window?.performClose(nil) }
+    }
     @objc private func showMore() { moreButton.menu?.popUp(positioning: nil, at: NSPoint(x: 0, y: moreButton.bounds.maxY + 4), in: moreButton) }
-    @objc private func toggleNotes() { notesVisible.toggle(); noteToggle.contentTintColor = notesVisible ? .controlAccentColor : .secondaryLabelColor; layout(); if notesVisible { window?.makeFirstResponder(note) } }
+    @objc private func toggleNotes() { notesVisible.toggle(); noteToggle.contentTintColor = notesVisible ? .controlAccentColor : .secondaryLabelColor; layout(); if notesVisible { presentationWindow?.makeFirstResponder(note) } }
     @objc private func openCodex() { saveDraft(); onCodex() }
     @objc private func connectCodex() { if needsLegacyConnectionSetup { onConnect() } else { retryConnection() } }
     @objc private func retryConnection() { nextStatusCheck = .distantPast; if checking { connectionRefreshQueued = true } else { checkConnection(force: true) } }
@@ -670,6 +744,42 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         firstViewer.fixtureMode = true; firstViewer.remembersWindowGeometry = true
         firstViewer.window?.setFrameOrigin(NSPoint(x: -10000, y: -10000)); firstViewer.rememberWindowGeometry(); firstViewer.windowGeometry.flush()
         results["conversation_fixture_offscreen_frame_never_replaces_user_geometry"] = (try? Data(contentsOf: geometry.file)) == previousGeometry
+
+        let embeddedEvent = CueEvent(runningThreadID: "embedded-conversation", title: "主面板对话", date: Date())
+        var embeddedHandled = 0, embeddedDismissed = 0, embeddedClosed = 0
+        let embeddedViewer = CueConversationController(home: geometryHome, event: embeddedEvent, detailProvider: { nil }, onHandled: { embeddedHandled += 1 }, onCodex: {}, onConnect: {}, onPathAction: { _ in })
+        embeddedViewer.fixtureMode = true
+        embeddedViewer.onClosed = { embeddedClosed += 1 }
+        embeddedViewer.onEmbeddedDismiss = { embeddedDismissed += 1 }
+        let embeddedRoot = embeddedViewer.embeddedContentView()
+        let shell = CueConversationWindow(contentRect: NSRect(x: -10000, y: -10000, width: 760, height: 430), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        shell.isReleasedWhenClosed = false; shell.contentView = embeddedRoot
+        embeddedRoot.frame.size = NSSize(width: 760, height: 430); embeddedViewer.layout()
+        let activated = embeddedViewer.setEmbeddedVisible(true)
+        results["embedded_conversation_uses_only_the_main_shell_window"] = activated && embeddedViewer.isEmbeddedActive && embeddedViewer.presentationWindow === shell && embeddedViewer.window?.contentView !== embeddedRoot && embeddedViewer.window?.isVisible != true
+        let oldGeometry = try? Data(contentsOf: geometry.file)
+        embeddedViewer.fixtureMode = false; embeddedViewer.remembersWindowGeometry = true
+        embeddedViewer.windowDidEndLiveResize(Notification(name: NSWindow.didEndLiveResizeNotification)); embeddedViewer.rememberWindowGeometry()
+        results["embedded_conversation_never_records_main_shell_geometry"] = (try? Data(contentsOf: geometry.file)) == oldGeometry
+        embeddedViewer.fixtureMode = true
+        embeddedViewer.composer.string = "发送中的草稿"; embeddedViewer.pendingRequestID = "embedded-send-one"; embeddedViewer.sending = true
+        let hiddenDuringSend = embeddedViewer.setEmbeddedVisible(false)
+        embeddedViewer.releaseClosedWindowIfIdle()
+        let embeddedSaved = CueConversationDrafts(home: geometryHome).values(embeddedEvent.threadID)
+        results["embedded_switch_keeps_inflight_send_and_pending_receipt"] = hiddenDuringSend && !embeddedViewer.isEmbeddedActive && embeddedViewer.hasInFlightOperation && embeddedViewer.pendingRequestID == "embedded-send-one" && embeddedSaved["pending_request_id"] == "embedded-send-one" && embeddedSaved["draft"] == "发送中的草稿" && embeddedClosed == 0 && embeddedViewer.timer == nil && embeddedViewer.applicationObservers.isEmpty && embeddedViewer.workspaceObservers.isEmpty
+        embeddedViewer.sending = false
+        embeddedViewer.applySendResult(["status": "accepted", "thread_id": embeddedEvent.threadID, "request_id": "embedded-send-one"], sentText: "发送中的草稿", requestID: "embedded-send-one")
+        embeddedViewer.releaseClosedWindowIfIdle()
+        results["embedded_hidden_receipt_finishes_without_replay_or_close_callback"] = embeddedViewer.pendingRequestID.isEmpty && embeddedViewer.composer.string.isEmpty && embeddedClosed == 0 && embeddedHandled == 0
+        _ = embeddedViewer.setEmbeddedVisible(true); embeddedViewer.markHandled()
+        let handledDismiss = embeddedDismissed == 1 && embeddedHandled == 1 && !embeddedViewer.isEmbeddedActive
+        _ = embeddedViewer.setEmbeddedVisible(true); embeddedViewer.closeForLater()
+        results["embedded_handled_and_later_return_to_tasks_without_closing_shell"] = handledDismiss && embeddedDismissed == 2 && embeddedHandled == 1 && shell.contentView === embeddedRoot && embeddedClosed == 0
+        results["embedded_conversation_compact_composer_does_not_cover_transcript"] = embeddedViewer.transcript.frame.maxY < embeddedViewer.composerSurface.frame.minY && embeddedViewer.root.bounds.contains(embeddedViewer.composerSurface.frame)
+        let failingEmbedded = CueConversationController(home: blocked, event: event, detailProvider: { nil }, onHandled: {}, onCodex: {}, onConnect: {}, onPathAction: { _ in })
+        failingEmbedded.fixtureMode = true; _ = failingEmbedded.embeddedContentView(); _ = failingEmbedded.setEmbeddedVisible(true)
+        failingEmbedded.composer.string = "尚未写入磁盘的编辑"
+        results["embedded_draft_save_failure_blocks_switching_away"] = !failingEmbedded.setEmbeddedVisible(false) && failingEmbedded.isEmbeddedActive && failingEmbedded.composer.string == "尚未写入磁盘的编辑"
         return results
     }
 

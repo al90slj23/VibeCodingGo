@@ -211,6 +211,12 @@ private final class CueUsageMetric: NSView {
 final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     let home: URL
     var usageDidChange: (() -> Void)?
+    var onNavigateAccounts: (() -> Void)?
+    var onNavigatePreferences: (() -> Void)?
+    private var isEmbedded = false
+    private var embeddedVisible = false
+    private var hostObservers: [NSObjectProtocol] = []
+    private var presentationWindow: NSWindow? { surface.window ?? (isEmbedded ? nil : window) }
     private let client: CueUsageClient
     private let surface = CueUsageSurface()
     private let titleLabel = NSTextField(labelWithString: "用量统计")
@@ -242,6 +248,10 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private let previous = NSButton(title: "上一页", target: nil, action: nil), next = NSButton(title: "下一页", target: nil, action: nil)
     private var rows: [[String: Any]] = []
     private var snapshot: [String: Any] = [:]
+    var currentKnownModels: [String] {
+        let filters = snapshot["filters"] as? [String: Any] ?? [:]
+        return Array(Set((filters["models"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }.filter { !$0.isEmpty })).sorted()
+    }
     private var page = 1, pages = 1
     private var pageSize = 50
     private var queryID = 0
@@ -369,17 +379,49 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     deinit {
         backgroundTimer?.invalidate(); visibleTimer?.invalidate(); pricingTimer?.invalidate()
         if let scheduleObserver { NotificationCenter.default.removeObserver(scheduleObserver) }
+        hostObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
+    /// Reparent the existing collector's page rather than creating another collector.
+    func embeddedContentView() -> NSView {
+        if !isEmbedded {
+            isEmbedded = true; window?.orderOut(nil); window?.contentView = nil
+            for name in [NSWindow.didResignKeyNotification, NSWindow.willMiniaturizeNotification, NSWindow.willCloseNotification] {
+                hostObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                    guard let self, let host = note.object as? NSWindow, host === self.presentationWindow else { return }
+                    self.heatmap.hidePreview()
+                    if name == NSWindow.willCloseNotification { self.deactivateEmbedded() }
+                })
+            }
+        }
+        return surface
+    }
+    func activateEmbedded() {
+        embeddedVisible = true
+        guard !stopped else { return }
+        query(); refreshExchange(); configureVisibleTimer()
+    }
+    func deactivateEmbedded() {
+        embeddedVisible = false; heatmap.hidePreview()
+        visibleTimer?.invalidate(); visibleTimer = nil
+    }
+    /// Saved settings refresh the existing page without changing the selected tag.
+    func refreshAfterPreferences() {
+        guard !stopped else { return }
+        schedule = CueUsageSchedulePreferences(home: home)
+        configureBackgroundTimer(); configureVisibleTimer(); query(invalidate: true); usageDidChange?()
+    }
     override func showWindow(_ sender: Any?) {
+        if isEmbedded { activateEmbedded(); presentationWindow?.makeKeyAndOrderFront(nil); return }
         super.showWindow(sender); window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         query(); refreshExchange(); configureVisibleTimer()
     }
     private func configureVisibleTimer() {
         visibleTimer?.invalidate(); visibleTimer = nil
-        guard !stopped, window?.isVisible == true else { return }
+        guard !stopped, let host = presentationWindow, isEmbedded ? embeddedVisible : host.isVisible else { return }
         let timer = Timer(timeInterval: schedule.displayInterval, repeats: true) { [weak self] _ in
-            guard let self, self.window?.isVisible == true, !self.window!.isMiniaturized else { return }
+            guard let self, let host = self.presentationWindow, host.isVisible, !host.isMiniaturized,
+                  !self.isEmbedded || self.embeddedVisible else { return }
             self.query(); self.refreshExchange()
         }
         RunLoop.main.add(timer, forMode: .common); visibleTimer = timer
@@ -412,7 +454,14 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         backgroundTimer?.invalidate(); backgroundTimer = nil; visibleTimer?.invalidate(); visibleTimer = nil
         pricingTimer?.invalidate(); pricingTimer = nil; client.stop()
     }
-    func windowWillClose(_ notification: Notification) { visibleTimer?.invalidate(); visibleTimer = nil; heatmap.hidePreview() }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === detailController?.window, sender.sheetParent != nil { closeDetails(); return false }
+        return true
+    }
+    func windowWillClose(_ notification: Notification) {
+        guard let host = notification.object as? NSWindow, host === presentationWindow else { return }
+        visibleTimer?.invalidate(); visibleTimer = nil; heatmap.hidePreview()
+    }
     func windowWillMiniaturize(_ notification: Notification) { heatmap.hidePreview() }
     func windowDidResignKey(_ notification: Notification) { heatmap.hidePreview() }
 
@@ -491,7 +540,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         priced.readPricingSchedule(["pricing_next_refresh_at": NSNull(), "pricing_refresh_due": false])
         report["usage_schedule_no_remote_sources_cancel_price_timer"] = priced.pricingTimer == nil && priced.pricingNextRefreshAt == nil && priceTimer?.isValid == false
         priced.backgroundStarted = false
-        for size in [NSSize(width: 1000, height: 760), NSSize(width: 1120, height: 850), NSSize(width: 1440, height: 900)] {
+        for size in [NSSize(width: 1000, height: 760), NSSize(width: 1280, height: 760), NSSize(width: 1440, height: 760), NSSize(width: 1120, height: 850), NSSize(width: 1440, height: 900)] {
             for currency in ["CNY", "USD", "both"] {
                 let controller = fixtureController(size: size, currency: currency, dark: true)
                 defer { controller.window?.orderOut(nil) }
@@ -534,6 +583,27 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         paging.queryInFlight = true // Exercise invalidation without starting a worker.
         paging.nextPage()
         report["usage_pagination_changes_only_list_loading"] = paging.page == 2 && paging.rows.isEmpty && paging.pageLabel.stringValue.contains("第 2 页") && paging.metrics.map { $0.value.stringValue } == overview && paging.heatmap.days.count == calendarDays && paging.status.stringValue == message
+        let embedded = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
+        let host = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 850), styleMask: [.titled], backing: .buffered, defer: false)
+        let canvas = embedded.embeddedContentView(); host.contentView = canvas
+        // Prevent any worker or exchange request during this lifecycle fixture.
+        embedded.queryInFlight = true; embedded.lastExchangeRefresh = Date()
+        embedded.backgroundStarted = true
+        embedded.backgroundTimer = Timer(timeInterval: 600, repeats: false) { _ in }
+        let background = embedded.backgroundTimer
+        embedded.activateEmbedded(); let displayTimer = embedded.visibleTimer
+        embedded.deactivateEmbedded()
+        report["usage_embedded_page_retains_canvas_and_uses_main_host"] = embedded.embeddedContentView() === canvas && embedded.presentationWindow === host && embedded.window?.contentView !== canvas
+        report["usage_hidden_tag_stops_display_refresh_without_stopping_collector"] = displayTimer != nil && displayTimer?.isValid == false && embedded.visibleTimer == nil && embedded.backgroundStarted && embedded.backgroundTimer === background
+        var visits: [String] = []
+        embedded.onNavigateAccounts = { visits.append("accounts") }; embedded.onNavigatePreferences = { visits.append("preferences") }
+        embedded.showAccounts(); embedded.showMoneyPreferences()
+        report["usage_navigation_buttons_reuse_main_panel_tags"] = visits == ["accounts", "preferences"] && embedded.accountController == nil && embedded.preferencesController == nil
+        embedded.schedule = CueUsageSchedulePreferences(autoSync: false)
+        embedded.refreshAfterPreferences()
+        report["usage_saved_settings_do_not_activate_hidden_statistics_tag"] = !embedded.embeddedVisible && embedded.visibleTimer == nil && embedded.queryPending
+        embedded.backgroundTimer?.invalidate(); embedded.backgroundTimer = nil; embedded.pricingTimer?.invalidate(); embedded.pricingTimer = nil; embedded.backgroundStarted = false
+        host.contentView = nil
         return report
     }
 
@@ -608,7 +678,10 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         heatmapSummary.frame = NSRect(x: 292, y: 260, width: max(120, width - 590), height: 19)
         heatmapRange.frame = NSRect(x: width - 285, y: 260, width: 260, height: 19)
         heatmapRange.stringValue = heatmap.rangeDescription
-        let calendarHeight = CueUsageHeatmap.preferredHeight(width: width - 48)
+        // A wide main panel may still be short. Reserve 180 points for the
+        // list: its pager, native table header and legacy scroller tracks must
+        // leave at least 90 points for rows. The full calendar stays scrollable.
+        let calendarHeight = min(CueUsageHeatmap.preferredHeight(width: width - 48), max(120, height - 592))
         heatmapScroll.frame = NSRect(x: 24, y: 287, width: width - 48, height: calendarHeight)
         heatmap.frame = NSRect(x: 0, y: 0, width: heatmapScroll.contentSize.width, height: heatmap.contentHeight(width: heatmapScroll.contentSize.width))
         heatmapScroll.tile()
@@ -624,7 +697,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         columnsButton.frame = NSRect(x: width - 212, y: tabsY, width: 88, height: 29)
         detailsButton.frame = NSRect(x: width - 118, y: tabsY, width: 94, height: 29)
         let tableY = tabsY + 41
-        listSection.frame = NSRect(x: 24, y: tableY, width: width - 48, height: max(160, height - tableY - 42))
+        listSection.frame = NSRect(x: 24, y: tableY, width: width - 48, height: max(180, height - tableY - 42))
         let sectionWidth = listSection.bounds.width, sectionHeight = listSection.bounds.height
         scroll.frame = NSRect(x: 1, y: 1, width: sectionWidth - 2, height: sectionHeight - 40)
         paginationBar.frame = NSRect(x: 1, y: sectionHeight - 39, width: sectionWidth - 2, height: 38)
@@ -796,7 +869,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         start.dateValue = selectedStart.flatMap { formatter.date(from: $0) } ?? Calendar.current.date(byAdding: .day, value: -6, to: Date())!
         end.dateValue = selectedEnd.flatMap { formatter.date(from: $0) } ?? Date()
         alert.accessoryView = root; alert.addButton(withTitle: "应用日期"); alert.addButton(withTitle: "取消")
-        guard let window else { return }
+        guard let window = presentationWindow else { return }
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self else { return }
             if response == .alertFirstButtonReturn, start.dateValue <= end.dateValue {
@@ -831,20 +904,20 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         var lines = ["总 Tokens：" + Self.integer(number(summary, "total_tokens")), "新增输入：" + Self.integer(number(summary, "input_tokens")), "输出：" + Self.integer(number(summary, "output_tokens")), "缓存读取：" + Self.integer(number(summary, "cache_read_tokens")), "缓存写入：" + Self.integer(number(summary, "cache_creation_tokens")), String(format: "缓存命中率：%.1f%%", number(summary, "cache_hit_rate") * 100), "请求记录：" + Self.integer(number(summary, "requests")), "API 参考费用：" + CueUsageMoney.display(summary, currency: currency), "已定价 / 未定价：\(Self.integer(number(summary, "priced_requests"))) / \(Self.integer(number(summary, "unpriced_requests")))"]
         if let apps = snapshot["summary_by_app"] as? [[String: Any]], !apps.isEmpty { lines += ["", "按应用"] + apps.map { "\(appName($0["app"] as? String ?? ""))：\(Self.integer(number($0, "requests"))) 次 · \(Self.compact(number($0, "total_tokens"))) Tokens · \(CueUsageMoney.display($0, currency: currency))" } }
         lines += ["", "缓存命中率以输入与缓存总量为分母，不能相加不同应用的百分比。费用仅按当前基础单价估算，未定价部分不当作零。"]
-        alert.informativeText = lines.joined(separator: "\n"); alert.addButton(withTitle: "知道了"); if let window { alert.beginSheetModal(for: window) }
+        alert.informativeText = lines.joined(separator: "\n"); alert.addButton(withTitle: "知道了"); if let window = presentationWindow { alert.beginSheetModal(for: window) }
     }
     @objc private func changeTab() { page = 1; rememberChoices(); configureColumns(); query(invalidate: true) }
     @objc private func previousPage() { guard page > 1 else { return }; page -= 1; query(invalidate: true, tableOnly: true) }
     @objc private func nextPage() { guard page < pages else { return }; page += 1; query(invalidate: true, tableOnly: true) }
     @objc private func showMoneyPreferences() {
+        if let onNavigatePreferences { onNavigatePreferences(); return }
         if preferencesController == nil {
-            let filters = snapshot["filters"] as? [String: Any] ?? [:]
-            let known = (filters["models"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
-            preferencesController = CueUsagePreferencesController(home: home, knownModels: known) { [weak self] in self?.query(invalidate: true); self?.usageDidChange?() }
+            preferencesController = CueUsagePreferencesController(home: home, knownModels: currentKnownModels) { [weak self] in self?.query(invalidate: true); self?.usageDidChange?() }
         }
         preferencesController?.showWindow(nil)
     }
     @objc func showAccounts() {
+        if let onNavigateAccounts { onNavigateAccounts(); return }
         if accountController == nil { accountController = CueCCAccountsController(home: home) }
         accountController?.showWindow(nil)
     }
@@ -904,7 +977,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         }
         text += "\n\nAPI 参考费用按当前自定义来源优先队列的模型基础单价重新估算：新增输入 × 输入单价 + 输出 × 输出单价 + 缓存读取 × 读取单价 + 缓存创建 × 写入单价。四项单价均为美元／百万 Tokens，不重复计算缓存。未知模型保持未定价，汇总仅包含已定价小计；日志未记录的长上下文、服务档位及协议优惠差价不自动推断。此金额不能换算为订阅每周额度。\n\n人民币可使用自定义汇率或 Frankfurter 公开日参考汇率；自动每 6 小时检查，失败时保留带日期的缓存并标记过期。"
         alert.informativeText = text; alert.addButton(withTitle: "知道了")
-        if let window { alert.beginSheetModal(for: window) } else { alert.runModal() }
+        if let window = presentationWindow { alert.beginSheetModal(for: window) }
     }
 
     private static let logColumns: [(String, String, CGFloat, Bool)] = [("timestamp", "时间", 132, true), ("app", "应用", 82, true), ("provider_name", "供应商", 110, true), ("source", "来源", 118, false), ("model", "模型", 145, true), ("cost", "API 参考费用", 132, true), ("input_tokens", "新增输入", 80, true), ("output_tokens", "输出", 74, true), ("cache_read_tokens", "缓存读取", 90, true), ("cache_creation_tokens", "缓存写入", 96, false), ("cache_hit_rate", "缓存命中率", 96, false), ("speed_tps", "速度 ⓘ", 88, true), ("first_token_ms", "首字 ⓘ", 82, true), ("duration_ms", "总耗时", 96, false), ("status_code", "状态码", 80, false), ("total_tokens", "总 Tokens", 100, false)]
@@ -925,14 +998,29 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         let index = table.selectedRow >= 0 ? table.selectedRow : table.clickedRow
         guard rows.indices.contains(index) else { return }
         let money = snapshot["money"] as? [String: Any] ?? [:], currency = (money["prefs"] as? [String: Any])?["currency"] as? String ?? "CNY"
-        detailController = CueUsageLogDetailsController(row: rows[index], currency: currency, title: currentView == "logs" ? "请求详情" : "分组用量详情"); detailController?.showWindow(nil)
+        guard let host = presentationWindow, host.attachedSheet == nil else { return }
+        let controller = CueUsageLogDetailsController(row: rows[index], currency: currency, title: currentView == "logs" ? "请求详情" : "分组用量详情")
+        guard let sheet = controller.window, let root = sheet.contentView else { return }
+        detailController = controller; sheet.delegate = self
+        let close = NSButton(title: "关闭", target: self, action: #selector(closeDetails))
+        close.bezelStyle = .rounded; close.keyEquivalent = "\u{1b}"
+        close.frame = NSRect(x: 20, y: root.bounds.height - 47, width: 92, height: 30); close.autoresizingMask = [.maxXMargin, .minYMargin]
+        close.identifier = NSUserInterfaceItemIdentifier("usage.details.close"); root.addSubview(close)
+        host.beginSheet(sheet) { [weak self] _ in
+            sheet.orderOut(nil)
+            if self?.detailController?.window === sheet { self?.detailController = nil }
+        }
+    }
+    @objc private func closeDetails() {
+        guard let sheet = detailController?.window else { return }
+        if let host = sheet.sheetParent { host.endSheet(sheet) } else { sheet.orderOut(nil); detailController = nil }
     }
     func menuNeedsUpdate(_ menu: NSMenu) { if table.clickedRow >= 0 { table.selectRowIndexes(IndexSet(integer: table.clickedRow), byExtendingSelection: false) } }
     private func rowTSV(_ row: [String: Any]) -> String { table.tableColumns.map { display(row, key: $0.identifier.rawValue).replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ") }.joined(separator: "\t") }
     @objc private func copyRow() { let index = table.selectedRow >= 0 ? table.selectedRow : table.clickedRow; guard rows.indices.contains(index) else { return }; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(rowTSV(rows[index]), forType: .string) }
     @objc private func exportPage() {
         let panel = NSSavePanel(); panel.nameFieldStringValue = "VibeCoding Go-\(currentView)-page-\(page).csv"; panel.canCreateDirectories = true
-        guard let window else { return }
+        guard let window = presentationWindow else { return }
         panel.beginSheetModal(for: window) { [weak self] response in
             guard response == .OK, let self, let url = panel.url else { return }
             func quote(_ value: String) -> String { let safe = value.first.map { "=+-@".contains($0) } == true ? "'" + value : value; return "\"" + safe.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }

@@ -4,6 +4,10 @@ import Foundation
 /// Display preferences and exact per-model API reference prices. OAuth never
 /// enters this window or the local worker used by it.
 final class CueUsagePreferencesController: NSWindowController {
+    var onNavigateSchedule: (() -> Void)?
+    var onNavigatePrices: (() -> Void)?
+    private let root = CuePreferencesSurface(frame: NSRect(x: 0, y: 0, width: 650, height: 660))
+    private var isEmbedded = false
     private let client: CueUsageClient
     private let home: URL
     private var scheduleController: CueUsageScheduleController?
@@ -25,6 +29,8 @@ final class CueUsagePreferencesController: NSWindowController {
     private let onChange: () -> Void
     private var busy = false
     private var loaded = false
+    private var pendingPricingRefresh = false
+    private var modelPriceBaseline: [String] = []
     private let knownModels: [String]
     private let priceKeys = ["input", "output", "cache_read", "cache_creation"]
 
@@ -33,7 +39,7 @@ final class CueUsagePreferencesController: NSWindowController {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 660), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "统计设置"; window.isReleasedWhenClosed = false; window.center()
         super.init(window: window)
-        let root = CuePreferencesSurface(frame: window.contentLayoutRect); window.contentView = root
+        window.contentView = root
         func label(_ text: String, _ y: CGFloat, size: CGFloat = 12, weight: NSFont.Weight = .regular) {
             let field = NSTextField(labelWithString: text); field.font = .systemFont(ofSize: size, weight: weight)
             field.frame = NSRect(x: 26, y: y, width: 598, height: 22); root.addSubview(field)
@@ -73,11 +79,40 @@ final class CueUsagePreferencesController: NSWindowController {
         for button in [saveButton, priceButton, resetButton, refreshButton] { button.bezelStyle = .rounded; button.target = self }
         saveButton.action = #selector(savePreferences); priceButton.action = #selector(savePrice); resetButton.action = #selector(resetPrice); refreshButton.action = #selector(refreshRate)
         [currency, exchangeMode, model, rate, rateInfo, sourceInfo, feedback, saveButton, priceButton, resetButton, refreshButton].forEach { root.addSubview($0) }
-        setBusy(true)
+        setBusy(false)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    override func showWindow(_ sender: Any?) { super.showWindow(sender); window?.makeKeyAndOrderFront(nil); load() }
+    /// The retained canvas can move between the main panel's tag containers.
+    func embeddedContentView() -> NSView {
+        if !isEmbedded { isEmbedded = true; window?.orderOut(nil); window?.contentView = nil }
+        return root
+    }
+    func activateEmbedded() { if !loaded && !busy { load() } }
+    func deactivateEmbedded() { /* Keep unsubmitted fields while changing tags. */ }
+    /// Source changes must not reset currency, exchange-rate or model-price drafts.
+    func refreshPricingPreservingDrafts() {
+        guard !busy else { pendingPricingRefresh = true; return }
+        guard loaded else { load(); return }
+        setBusy(true)
+        client.run(["settings"], module: "vibecue.usage_money") { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let data):
+                if let prefs = data["prefs"] as? [String: Any], let overrides = prefs["model_overrides"] {
+                    self.preferences["model_overrides"] = overrides
+                }
+                self.applyPricing(data, preservingDrafts: true)
+            case .failure(let error):
+                self.feedback.stringValue = error.localizedDescription; self.feedback.textColor = .systemRed
+            }
+            self.setBusy(false)
+        }
+    }
+    override func showWindow(_ sender: Any?) {
+        if isEmbedded { activateEmbedded(); root.window?.makeKeyAndOrderFront(nil); return }
+        super.showWindow(sender); window?.makeKeyAndOrderFront(nil); load()
+    }
     private func setBusy(_ value: Bool) {
         busy = value
         for control in [currency, exchangeMode, model, rate] as [NSControl] { control.isEnabled = !value && loaded }
@@ -87,6 +122,10 @@ final class CueUsagePreferencesController: NSWindowController {
         rate.isEnabled = !value && loaded && selected(exchangeMode) == "manual"
         priceButton.isEnabled = !value && loaded && !pricing.isEmpty; resetButton.isEnabled = priceButton.isEnabled
         fields.forEach { $0.isEnabled = !value && loaded && !pricing.isEmpty }
+        if !value && pendingPricingRefresh {
+            pendingPricingRefresh = false
+            DispatchQueue.main.async { [weak self] in self?.refreshPricingPreservingDrafts() }
+        }
     }
     private func selected(_ popup: NSPopUpButton) -> String { popup.selectedItem?.representedObject as? String ?? "" }
     private func select(_ popup: NSPopUpButton, _ id: String) { if let item = popup.itemArray.first(where: { $0.representedObject as? String == id }) { popup.select(item) } }
@@ -102,12 +141,28 @@ final class CueUsagePreferencesController: NSWindowController {
         preferences = data["prefs"] as? [String: Any] ?? [:]; loaded = true
         select(currency, preferences["currency"] as? String ?? "CNY"); select(exchangeMode, preferences["fx_mode"] as? String ?? "auto")
         rate.stringValue = (preferences["manual_rate"] as? NSNumber)?.stringValue ?? ""
-        let old = selected(model); pricing = data["pricing"] as? [[String: Any]] ?? []
-        let pricedIDs = Set(pricing.compactMap { $0["model"] as? String })
-        pricing += knownModels.filter { !pricedIDs.contains($0) }.map { ["model": $0, "source": "unpriced"] }
+        applyPricing(data, preservingDrafts: false)
+        updateRate(data["fx"] as? [String: Any] ?? [:]); setBusy(false)
+    }
+    private func applyPricing(_ data: [String: Any], preservingDrafts: Bool) {
+        let old = selected(model), oldValues = fields.map(\.stringValue), oldBaseline = modelPriceBaseline
+        let hasDraft = preservingDrafts && !old.isEmpty && oldBaseline.count == fields.count && oldValues != oldBaseline
+        pricing = data["pricing"] as? [[String: Any]] ?? []
+        let pricedIDs = Set(pricing.compactMap { $0["model"] as? String ?? $0["id"] as? String ?? $0["model_id"] as? String })
+        var extras = knownModels
+        if preservingDrafts && !old.isEmpty { extras.append(old) }
+        pricing += Set(extras).filter { !$0.isEmpty && !pricedIDs.contains($0) }.map { ["model": $0, "source": "unpriced"] }
         pricing.sort { ($0["model"] as? String ?? "") < ($1["model"] as? String ?? "") }; model.removeAllItems()
         for row in pricing { guard let id = row["model"] as? String ?? row["id"] as? String ?? row["model_id"] as? String else { continue }; model.addItem(withTitle: id); model.lastItem?.representedObject = id }
-        select(model, old); modelChanged(); updateRate(data["fx"] as? [String: Any] ?? [:]); setBusy(false)
+        select(model, old); modelChanged()
+        if hasDraft {
+            for (field, value) in zip(fields, oldValues) { field.stringValue = value }
+            modelPriceBaseline = oldBaseline
+            let previousInfo = sourceInfo.stringValue, previousTip = sourceInfo.toolTip ?? previousInfo
+            let notice = "来源价格已更新；未保存单价已保留，切换模型后采用新价格。"
+            sourceInfo.stringValue = notice + "\n" + previousInfo
+            sourceInfo.toolTip = notice + "\n" + previousTip
+        }
     }
     private func updateRate(_ fx: [String: Any]) {
         if let value = fx["rate"] as? NSNumber {
@@ -118,8 +173,9 @@ final class CueUsagePreferencesController: NSWindowController {
     }
     @objc private func exchangeChanged() { setBusy(busy) }
     @objc private func modelChanged() {
-        guard let row = pricing.first(where: { ($0["model"] as? String ?? $0["id"] as? String ?? $0["model_id"] as? String) == selected(model) }) else { fields.forEach { $0.stringValue = "" }; return }
+        guard let row = pricing.first(where: { ($0["model"] as? String ?? $0["id"] as? String ?? $0["model_id"] as? String) == selected(model) }) else { fields.forEach { $0.stringValue = "" }; modelPriceBaseline = fields.map(\.stringValue); return }
         for (index, key) in priceKeys.enumerated() { fields[index].stringValue = (row[key] as? NSNumber)?.stringValue ?? (row[key] as? String ?? "") }
+        modelPriceBaseline = fields.map(\.stringValue)
         let source = row["source"] as? String ?? "unpriced"
         let name = row["source_name"] as? String ?? (source == "custom" ? "手动模型单价" : source == "ccswitch" ? "CC Switch 本机价格" : source)
         let missing = priceKeys.filter { row[$0] == nil || row[$0] is NSNull }
@@ -131,10 +187,12 @@ final class CueUsagePreferencesController: NSWindowController {
         }
     }
     @objc private func showSchedule() {
+        if let onNavigateSchedule { onNavigateSchedule(); return }
         if scheduleController == nil { scheduleController = CueUsageScheduleController(home: home, onChange: { [weak self] in self?.onChange() }) }
         scheduleController?.showWindow(nil); scheduleController?.window?.makeKeyAndOrderFront(nil)
     }
     @objc private func showSources() {
+        if let onNavigatePrices { onNavigatePrices(); return }
         if sourcesController == nil { sourcesController = CuePriceSourcesController(home: home, onChange: { [weak self] in self?.load(); self?.onChange() }) }
         sourcesController?.showWindow(nil); sourcesController?.window?.makeKeyAndOrderFront(nil)
     }
@@ -213,6 +271,25 @@ final class CueUsagePreferencesController: NSWindowController {
         partial.apply(["prefs": ["currency": "USD"], "pricing": [["model": "partial-model", "input": 2, "output": 10, "cache_read": NSNull(), "cache_creation": NSNull(), "source": "public-source", "source_name": "公开样例"]]])
         results["missing_source_cache_prices_stay_blank_in_editor"] = partial.fields[2].stringValue.isEmpty && partial.fields[3].stringValue.isEmpty && partial.sourceInfo.stringValue.contains("未提供")
         results["effective_price_source_name_is_visible"] = partial.sourceInfo.stringValue.contains("公开样例")
+        let host = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 660), styleMask: [.titled], backing: .buffered, defer: false)
+        let view = controller.embeddedContentView(); host.contentView = view
+        controller.rate.stringValue = "8.88"; controller.deactivateEmbedded(); controller.activateEmbedded()
+        results["usage_preferences_embedded_canvas_is_retained_and_reusable"] = view === controller.embeddedContentView() && view.window === host && controller.window?.contentView !== view
+        results["usage_preferences_tag_switch_preserves_unsubmitted_fields"] = controller.rate.stringValue == "8.88" && !controller.busy
+        controller.select(controller.currency, "both"); controller.select(controller.exchangeMode, "manual")
+        controller.fields[0].stringValue = "123.45"
+        let pendingPrice = controller.fields.map(\.stringValue)
+        let newPricing: [String: Any] = ["pricing": [["model": "exact-model", "input": 3, "output": 11, "cache_read": 0.2, "cache_creation": 0, "source": "new-public-source", "source_name": "新来源"]]]
+        controller.applyPricing(newPricing, preservingDrafts: true)
+        results["pricing_source_refresh_preserves_currency_and_exchange_drafts"] = controller.selected(controller.currency) == "both" && controller.selected(controller.exchangeMode) == "manual" && controller.rate.stringValue == "8.88"
+        results["pricing_source_refresh_preserves_unsubmitted_model_price"] = controller.fields.map(\.stringValue) == pendingPrice && controller.sourceInfo.stringValue.contains("未保存单价已保留") && controller.sourceInfo.stringValue.contains("新来源")
+        controller.modelChanged(); controller.applyPricing(["pricing": [["model": "exact-model", "input": 4, "output": 12, "cache_read": 0.3, "cache_creation": 0, "source": "latest"]]], preservingDrafts: true)
+        results["pricing_source_refresh_updates_clean_model_fields"] = controller.fields[0].stringValue == "4" && !controller.sourceInfo.stringValue.contains("未保存")
+        var visits: [String] = []
+        controller.onNavigateSchedule = { visits.append("schedule") }; controller.onNavigatePrices = { visits.append("prices") }
+        controller.showSchedule(); controller.showSources()
+        results["usage_preferences_buttons_navigate_main_panel_tags"] = visits == ["schedule", "prices"] && controller.scheduleController == nil && controller.sourcesController == nil
+        host.contentView = nil
         return results
     }
 }
