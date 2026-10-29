@@ -24,6 +24,9 @@ class DesktopFixture:
         self.result = {'turn': {'id': 'accepted-turn'}}
         self.error = None
 
+    def require_capability(self, name):
+        if name != 'reply': raise AssertionError(name)
+
     def runtime_snapshot(self):
         return self.snapshot.copy()
 

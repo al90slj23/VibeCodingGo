@@ -243,6 +243,7 @@ class DesktopChatController(ChatController):
         identifier = thread_id(params, ('thread_id',))
         if identifier != self.channel.thread_id:
             raise ControlError('回复对话与窗口不一致')
+        self.channel.require_capability('reply')
         snapshot = self.channel.runtime_snapshot()
         if snapshot.get('thread_id') != identifier:
             raise ControlError('Codex 返回的对话与所选项不一致')
@@ -340,9 +341,11 @@ def desktop_run(operation, params, home=None):
             if recoverable and attempt == 0 and time.monotonic() + .15 < deadline:
                 time.sleep(.15)
                 continue
+            incompatible = isinstance(error, DesktopProtocolUnsupported)
             return {'schema_version': 1, 'thread_id': identifier, 'connected': False,
                 'supported': False, 'can_send': False, 'needs_load': False,
-                'auto_reconnect': recoverable, 'retry_after_seconds': 2 if recoverable else None,
+                'auto_reconnect': recoverable or (readonly and incompatible),
+                'retry_after_seconds': 2 if recoverable else 30 if readonly and incompatible else None,
                 **prompt_suggestion_metadata(connected=False),
                 'state': 'reconnecting' if recoverable else 'unavailable', 'transport': 'desktop_ipc',
                 'status': 'unavailable' if operation == 'status' else 'failed',

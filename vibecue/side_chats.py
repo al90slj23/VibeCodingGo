@@ -382,6 +382,8 @@ class SideChatService:
                     'message': self.message, 'by_parent': groups}
 
     def _follow(self, thread, owner, value):
+        self.channel.require_method("thread-stream-following-changed")
+        if value: self.channel.require_method("thread-stream-state-changed")
         self.channel._send({'type': 'broadcast', 'sourceClientId': self.channel.client_id,
                             'targetClientIds': [owner], 'method': 'thread-stream-following-changed', 'version': 1,
                             'params': {'conversationId': thread, 'hostId': 'local', 'following': value}})
@@ -429,6 +431,7 @@ class SideChatService:
                     self.known.popitem(last=False)
 
     def _discover(self):
+        self.channel.require_capability("attention")
         now = self.clock()
         if now >= self.next_scan:
             self.next_scan = now + SCAN_SECONDS
@@ -517,6 +520,7 @@ class SideChatService:
                 channel = self.channel_factory('vibecue-sidechat-health', self.codex_home, timeout=2, on_message=self._on_message)
                 self.channel = channel
                 with channel:
+                    channel.require_capability("attention")
                     with self.lock:
                         self.connected = True
                         self.message = '已连接 Codex 侧边聊天'

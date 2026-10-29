@@ -591,16 +591,25 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         }
     }
     private func applyChatStatus(_ data: [String: Any]) {
-        canSend = data["can_send"] as? Bool == true; chatState = data["state"] as? String ?? "unknown"
+        chatState = data["state"] as? String ?? "unknown"
         connectionSupported = data["supported"] as? Bool == true
+        let protocolUnavailable = data["reason_code"] as? String == "protocol_unsupported"
+        canSend = connectionSupported && data["connected"] as? Bool == true && data["can_send"] as? Bool == true && !protocolUnavailable
         chatTransport = data["transport"] as? String ?? ""
-        canLoad = data["supported"] as? Bool == true && data["connected"] as? Bool == true && (data["needs_load"] as? Bool == true || chatState == "not_loaded")
+        canLoad = connectionSupported && data["connected"] as? Bool == true && !protocolUnavailable && (data["needs_load"] as? Bool == true || chatState == "not_loaded")
         activeTurnID = data["active_turn_id"] as? String ?? ""
         if let value = data["max_text_bytes"] as? Int, value > 0 { messageLimit = value }
         connectionDiagnostic = data["message"] as? String ?? "尚未接通对话输入。"
-        automaticReconnect = data["auto_reconnect"] as? Bool == true
+        // A verified peer can temporarily lack a required method after an
+        // update. Keep the editor and receipts intact and recheck read-only
+        // capability status slowly; never replay a send or load operation.
+        automaticReconnect = data["auto_reconnect"] as? Bool == true || protocolUnavailable
         needsLegacyConnectionSetup = chatState == "legacy_bridge"
-        if automaticReconnect {
+        if protocolUnavailable {
+            connectionFailures = 0
+            nextStatusCheck = Date().addingTimeInterval(30)
+            connection.stringValue = "Codex 回复接口暂不兼容，后台会自动检查恢复；可先在 Codex 操作。"
+        } else if automaticReconnect {
             connectionFailures = min(connectionFailures + 1, 5)
             let requested = (data["retry_after_seconds"] as? Double) ?? 2
             let delay = Self.reconnectDelay(failures: connectionFailures, requested: requested)
@@ -828,8 +837,16 @@ final class CueConversationController: NSWindowController, NSWindowDelegate, NST
         controller.connectionGeneration += 1; controller.checking = true
         controller.finishConnectionCheck(.success(["supported": true, "connected": true, "state": "active", "can_send": true, "message": "过期 owner 的迟到结果"]), generation: oldGeneration)
         results["status_reply_from_before_a_restart_cannot_reenable_sending"] = controller.automaticReconnect && !controller.canSend && !controller.checking && controller.connection.stringValue == "正在自动恢复 Codex 连接…"
-        controller.applyChatStatus(["supported": false, "connected": false, "state": "unavailable", "can_send": false, "auto_reconnect": false, "message": "此版本协议需要更新 VibeCoding Go"])
-        results["nonretryable_connection_reasons_are_not_hidden_as_a_restart"] = !controller.automaticReconnect && !controller.connectButton.isHidden && controller.connection.stringValue == "此版本协议需要更新 VibeCoding Go"
+        controller.applyChatStatus(["supported": false, "connected": false, "state": "unavailable", "can_send": false, "auto_reconnect": false, "message": "Codex 本机连接权限无法确认"])
+        results["nonretryable_connection_reasons_are_not_hidden_as_a_restart"] = !controller.automaticReconnect && !controller.connectButton.isHidden && controller.connection.stringValue == "Codex 本机连接权限无法确认"
+        let protocolDraft = controller.composer.string, protocolNote = controller.note.string
+        controller.pendingRequestID = "unconfirmed-before-protocol-change"
+        controller.applyChatStatus(["supported": false, "connected": false, "state": "unavailable", "reason_code": "protocol_unsupported", "can_send": false, "auto_reconnect": false, "message": "Codex 所需的回复方法版本尚不可用"])
+        results["protocol_mismatch_keeps_readonly_automatic_checks_without_manual_setup"] = controller.automaticReconnect && controller.connectButton.isHidden && controller.nextStatusCheck.timeIntervalSinceNow > 29 && controller.connection.stringValue.contains("自动检查恢复") && !controller.connection.stringValue.contains("更新") && controller.connection.toolTip == "Codex 所需的回复方法版本尚不可用"
+        results["protocol_mismatch_never_replays_or_clears_an_unconfirmed_send"] = !controller.canSend && !controller.canLoad && !controller.sendButton.isEnabled && controller.pendingRequestID == "unconfirmed-before-protocol-change" && controller.composer.string == protocolDraft && controller.note.string == protocolNote && !controller.hasInFlightOperation
+        controller.applyChatStatus(["supported": false, "connected": true, "state": "unavailable", "can_send": true, "message": "尚未确认所需能力"])
+        results["unconfirmed_capability_never_enables_send_despite_a_stray_can_send_field"] = !controller.canSend && !controller.sendButton.isEnabled
+        controller.pendingRequestID = ""
         controller.applyChatStatus(["supported": true, "connected": true, "transport": "desktop_ipc", "state": "waiting", "can_send": false, "message": "请先在 Codex 回答当前问题"])
         results["desktop_pending_input_blocks_send_with_actionable_reason"] = !controller.sendButton.isEnabled && controller.sendButton.toolTip == "请先在 Codex 回答当前问题"
         var released = 0

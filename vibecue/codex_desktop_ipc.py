@@ -1,6 +1,7 @@
 """Narrow adapter for the installed desktop's existing same-user owner IPC.
 
-This is an internal desktop protocol, pinned to the inspected desktop build.
+This is an internal desktop protocol. Identity and per-method contracts are
+verified separately so a compatible desktop update needs no companion release.
 It never starts an app-server, reads credentials, approves tools, changes a model,
 or resumes a conversation. Snapshot bodies stay in transient memory and only
 numeric/status metadata escapes this adapter.
@@ -31,10 +32,22 @@ MAX_STREAM_FRAME = 32 * 1024 * 1024
 MAX_SEND = 32 * 1024
 SNAPSHOT_SETTLE_SECONDS = .2
 SNAPSHOT_SETTLE_FRAMES = 32
-DESKTOP_BUILDS = {('26.1021.31345', '21828')}
 VERSIONS = {'initialize': 0, 'thread-owner-discovery': 1,
             'thread-follower-read-model-settings': 1,
             'thread-follower-start-turn': 2}
+# Versions implemented by this adapter, independent of the installed app build.
+KNOWN_PROTOCOL = dict(VERSIONS, **{'thread-stream-state-changed': 11,
+                                 'thread-stream-following-changed': 1,
+                                 'thread-follower-update-thread-settings': 2})
+CAPABILITY_METHODS = {
+    'reply': ('thread-owner-discovery', 'thread-follower-start-turn',
+              'thread-follower-read-model-settings', 'thread-stream-state-changed',
+              'thread-stream-following-changed'),
+    'control': ('thread-owner-discovery', 'thread-follower-read-model-settings',
+                'thread-follower-update-thread-settings'),
+    'attention': ('thread-owner-discovery', 'thread-stream-state-changed',
+                  'thread-stream-following-changed'),
+}
 
 
 class DesktopOwnerUnavailable(ControlError):
@@ -46,7 +59,7 @@ class DesktopConnectionInterrupted(ControlError):
 
 
 class DesktopProtocolUnsupported(ControlError):
-    """The verified desktop peer uses a build whose protocol is unreviewed."""
+    """A specific interface contract cannot be confirmed on the verified peer."""
 
 
 def _private_socket(path):
@@ -90,13 +103,19 @@ def _peer_bundle(sock):
             info = plistlib.load(stream)
         if info.get('CFBundleIdentifier') != 'com.openai.codex':
             raise ValueError()
-        if (str(info.get('CFBundleShortVersionString')), str(info.get('CFBundleVersion'))) not in DESKTOP_BUILDS:
-            raise DesktopProtocolUnsupported('当前 Codex 版本的窗口回复协议尚未核对，请更新 VibeCoding Go')
         return bundle
     except ControlError:
         raise
     except (OSError, ValueError, StopIteration, struct.error):
         raise ControlError('无法确认本机连接来自 Codex 桌面进程') from None
+
+
+def _protocol_contract(bundle):
+    from .desktop_protocol import read_protocol_contract, ProtocolContractError
+    try:
+        return read_protocol_contract(bundle)
+    except ProtocolContractError as error:
+        raise DesktopProtocolUnsupported(str(error)) from None
 
 
 def _identifier(value):
@@ -149,8 +168,34 @@ class DesktopChannel:
         self.owner = None
         self.subscribed = False
         self._stream_requested = False
+        self.protocol_contract = {}
+
+    def supports(self, method, version=None):
+        expected = KNOWN_PROTOCOL.get(method) if version is None else version
+        # initialize is the router's read-only unversioned handshake (wire v0),
+        # deliberately absent from the static method table in released builds.
+        # Its UUID-bearing success is still required before any capability is used.
+        actual = self.protocol_contract.get(method, 0 if method == 'initialize' and self.protocol_contract else None)
+        return type(expected) is int and type(actual) is int and actual == expected
+
+    def require_method(self, method, version=None):
+        if not self.supports(method, version):
+            raise DesktopProtocolUnsupported(
+                "Codex 接口暂不兼容：" + method + "；后台会自动重新核对")
+
+    @property
+    def capabilities(self):
+        return {name: all(self.supports(method) for method in methods)
+                for name, methods in CAPABILITY_METHODS.items()}
+
+    def require_capability(self, name):
+        if name not in CAPABILITY_METHODS:
+            raise ControlError("此本机连接不允许该能力")
+        for method in CAPABILITY_METHODS[name]:
+            self.require_method(method)
 
     def __enter__(self):
+        self.client_id = None; self.owner = None; self.protocol_contract = {}
         try:
             _private_socket(self.path)
             self.socket = socket.socket(socket.AF_UNIX)
@@ -158,7 +203,8 @@ class DesktopChannel:
             self.socket.connect(str(self.path))
             if _peer_uid(self.socket) != os.getuid():
                 raise ControlError('Codex 连接用户与当前用户不一致')
-            _peer_bundle(self.socket)
+            self.protocol_contract = _protocol_contract(_peer_bundle(self.socket))
+            self.require_method("initialize")
             result = self._call('initialize', {'clientType': 'vibecue'})
             identifier = result.get('clientId')
             if not _uuid(identifier):
@@ -184,6 +230,7 @@ class DesktopChannel:
                     pass
             self.socket.close()
         self.socket = None; self.subscribed = False; self._stream_requested = False
+        self.client_id = None; self.owner = None; self.protocol_contract = {}
 
     def _send(self, value):
         data = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
@@ -255,6 +302,8 @@ class DesktopChannel:
     def _call(self, method, params, *, target=None, mutation=False):
         if method not in self.method_versions:
             raise ControlError('此本机连接不允许该操作')
+        # Reject unsupported writes before request IDs, bytes or mutation receipts.
+        self.require_method(method, self.method_versions[method])
         request = str(uuid.uuid4())
         message = {'type': 'request', 'requestId': request,
                    'sourceClientId': self.client_id or 'initializing-client',
@@ -278,6 +327,9 @@ class DesktopChannel:
                         raise UnconfirmedUpdate('消息已提交，桌面确认尚未返回，请核对对话')
                     if error in ('request-timeout', 'client-disconnected', 'server-closed'):
                         raise DesktopConnectionInterrupted('Codex 正在恢复本机对话连接')
+                    if error in ('request-version-mismatch', 'no-handler-for-request'):
+                        rejected = True  # Explicit rejection proves no write was applied.
+                        raise DesktopProtocolUnsupported('Codex 接口暂不兼容：' + method + '；后台会自动重新核对')
                     if error == 'no-client-found':
                         rejected = True
                         raise DesktopOwnerUnavailable('Codex 当前没有此对话的可用窗口连接，请先在 Codex 打开')
@@ -317,6 +369,7 @@ class DesktopChannel:
         return result.get('settings') if isinstance(result.get('settings'), dict) else {}
 
     def _following(self, following):
+        self.require_method("thread-stream-following-changed")
         self._send({'type': 'broadcast', 'method': 'thread-stream-following-changed',
                     'sourceClientId': self.client_id, 'targetClientIds': [self.owner],
                     'version': 1, 'params': {'conversationId': self.thread_id, 'hostId': 'local', 'following': following}})
@@ -330,6 +383,8 @@ class DesktopChannel:
         # projection here without introducing an initialization-time cycle.
         from .desktop_attention import AttentionProjection
 
+        self.require_method("thread-stream-state-changed")
+        self.require_method("thread-stream-following-changed")
         if not self.owner:
             self.discover()
         self._following(True)

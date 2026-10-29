@@ -225,7 +225,10 @@ class DesktopReadonlyRecoveryTests(unittest.TestCase):
     def test_verified_protocol_incompatibility_is_never_relabelled_as_connected(self):
         from vibecue.codex_desktop_ipc import DesktopProtocolUnsupported
         result, channels, calls = self.desktop('status', DesktopProtocolUnsupported('当前协议需要适配'))
-        self.assertFalse(result['auto_reconnect'])
+        self.assertTrue(result['auto_reconnect'])
+        self.assertEqual(result['retry_after_seconds'],30)
+        self.assertFalse(result['can_send'])
+        self.assertFalse(result['supported'])
         self.assertEqual(result['reason_code'],'protocol_unsupported')
         self.assertEqual((channels,calls),(1,1))
 

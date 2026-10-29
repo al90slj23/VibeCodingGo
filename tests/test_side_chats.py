@@ -1,3 +1,4 @@
+from vibecue.codex_desktop_ipc import DesktopChannel, KNOWN_PROTOCOL
 from datetime import datetime
 import json
 from pathlib import Path
@@ -194,7 +195,17 @@ class ScannerTests(unittest.TestCase):
             self.assertEqual(len(self.scanner.scan()), 1)
 
 
-class FakeChannel:
+
+
+class VerifiedContractFixture:
+    protocol_contract = dict(KNOWN_PROTOCOL)
+    supports = DesktopChannel.supports
+    require_method = DesktopChannel.require_method
+    require_capability = DesktopChannel.require_capability
+    capabilities = DesktopChannel.capabilities
+
+
+class FakeChannel(VerifiedContractFixture):
     client_id = CLIENT
     owner = OWNER
     socket = None
@@ -214,6 +225,14 @@ class ServiceTests(unittest.TestCase):
         scanner = type('Scanner', (), {'scan': lambda _: [CHILD]})()
         self.service = SideChatService('/fixture', home='/fixture', channel_factory=None, scanner=scanner, clock=lambda: self.now)
         self.service.channel = FakeChannel(); self.service.connected = True
+
+    def test_unknown_stream_contract_prevents_discovery_and_subscription(self):
+        self.service.channel.protocol_contract = dict(KNOWN_PROTOCOL)
+        self.service.channel.protocol_contract['thread-stream-state-changed'] = 12
+        with self.assertRaises(ControlError): self.service._discover()
+        self.assertEqual(self.service.channel.calls, [])
+        self.assertEqual(self.service.channel.sent, [])
+        self.assertEqual(self.service.projections, {})
 
     def message(self, value=None, revision=1, **replace):
         result = {'type': 'broadcast', 'method': 'thread-stream-state-changed', 'version': 11,

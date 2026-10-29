@@ -7,9 +7,18 @@ from unittest.mock import patch
 from vibecue import codex_control, desktop_control
 from vibecue.codex_control import ControlError, UnconfirmedUpdate
 from vibecue.desktop_control import DesktopControlChannel
+from vibecue.codex_desktop_ipc import DesktopChannel, KNOWN_PROTOCOL
 
 
-class FakeChannel:
+class VerifiedContractFixture:
+    protocol_contract = dict(KNOWN_PROTOCOL)
+    supports = DesktopChannel.supports
+    require_method = DesktopChannel.require_method
+    require_capability = DesktopChannel.require_capability
+    capabilities = DesktopChannel.capabilities
+
+
+class FakeChannel(VerifiedContractFixture):
     rows = {}
     updates = []
     reads = []
@@ -57,12 +66,35 @@ class DesktopControlTests(unittest.TestCase):
         FakeChannel.rows = {'one': {'model': 'model-one', 'reasoningEffort': 'high', 'resumeState': 'resumed'},
                             'two': {'model': 'model-one', 'reasoningEffort': 'high', 'resumeState': 'resumed'}}
         FakeChannel.updates = []; FakeChannel.reads = []; FakeChannel.entered = []
+        FakeChannel.protocol_contract = dict(KNOWN_PROTOCOL)
         FakeChannel.fail = None; FakeChannel.applied = True; FakeChannel.verify = True
         helper = patch('vibecue.desktop_control.DesktopControlChannel', FakeChannel)
         helper.start(); self.addCleanup(helper.stop)
 
     def call(self, operation, params=None):
         return desktop_control.run(operation, params, codex_home=self.home)
+
+    def test_catalog_does_not_claim_control_when_update_contract_changed(self):
+        FakeChannel.protocol_contract['thread-follower-update-thread-settings'] = 3
+        result = self.call('catalog')
+        self.assertFalse(result['connected'])
+        self.assertEqual(FakeChannel.updates, [])
+        self.assertEqual(FakeChannel.reads, [])
+
+    def test_apply_checks_changed_contract_before_submitting_or_marking_uncertain(self):
+        FakeChannel.protocol_contract['thread-follower-update-thread-settings'] = 3
+        result = self.call('apply', {'thread_ids':['one'], 'effort':'max'})
+        self.assertEqual(result['results'][0]['status'], 'failed')
+        self.assertEqual(FakeChannel.updates, [])
+        self.assertEqual(self.call('inspect', {'thread_ids':['one']})['results'][0]['status'], 'read')
+
+    def test_speed_change_never_submits_when_readback_stream_is_incompatible(self):
+        FakeChannel.protocol_contract['thread-stream-state-changed'] = 12
+        result = self.call('apply', {'thread_ids':['one'], 'speed':'standard'})
+        self.assertEqual(result['results'][0]['status'], 'failed')
+        self.assertEqual(FakeChannel.updates, [])
+        plain = self.call('apply', {'thread_ids':['one'], 'effort':'max'})
+        self.assertEqual(plain['results'][0]['status'], 'verified')
 
     def test_catalog_auto_connects_without_loading_or_discovering_a_chat(self):
         result = self.call('catalog')

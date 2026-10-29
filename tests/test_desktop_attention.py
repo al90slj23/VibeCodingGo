@@ -13,7 +13,16 @@ from vibecue.desktop_attention import (AttentionProjection, DesktopAttentionMoni
                                        DesktopAttentionService, AttentionRevisionGap,
                                        _AttentionChannel, request_metadata)
 from vibecue.codex_desktop_ipc import (DesktopChannel, DesktopOwnerUnavailable,
-                                      DesktopConnectionInterrupted, DesktopProtocolUnsupported)
+                                      DesktopConnectionInterrupted, DesktopProtocolUnsupported, KNOWN_PROTOCOL)
+
+
+
+class VerifiedContractFixture:
+    protocol_contract = dict(KNOWN_PROTOCOL)
+    supports = DesktopChannel.supports
+    require_method = DesktopChannel.require_method
+    require_capability = DesktopChannel.require_capability
+    capabilities = DesktopChannel.capabilities
 
 THREAD = 'thread-one'
 OWNER = '22222222-2222-4222-8222-222222222222'
@@ -162,8 +171,34 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.monitor.pending, {})
 
 
+class ContractHealthTests(unittest.TestCase):
+    def test_reply_contract_change_keeps_compatible_control_and_attention_discovery(self):
+        service = DesktopAttentionService('/fixture')
+        channel = VerifiedContractFixture()
+        channel.protocol_contract = dict(KNOWN_PROTOCOL)
+        channel.protocol_contract['thread-follower-start-turn'] = 3
+        self.assertTrue(service._contract_health(channel))
+        health = service.snapshot()
+        self.assertEqual(health['capabilities'], {'reply':False, 'control':True, 'attention':False})
+        self.assertTrue(health['connected'])
+        self.assertEqual(health['subscribed_threads'], 0)
+
+    def test_unknown_stream_never_claims_attention_and_keeps_compatible_control(self):
+        service = DesktopAttentionService('/fixture')
+        channel = VerifiedContractFixture()
+        channel.protocol_contract = dict(KNOWN_PROTOCOL)
+        channel.protocol_contract['thread-stream-state-changed'] = 12
+        self.assertFalse(service._contract_health(channel))
+        health = service.snapshot()
+        self.assertFalse(health['capabilities']['reply'])
+        self.assertFalse(health['capabilities']['attention'])
+        self.assertTrue(health['capabilities']['control'])
+        self.assertEqual(health['reason_code'], 'protocol_unsupported')
+        self.assertEqual(health['pending_count'], 0)
+
+
 class ServiceTests(unittest.TestCase):
-    class Channel:
+    class Channel(VerifiedContractFixture):
         def __init__(self, on_message, server_list):
             self.socket, self.server = socket.socketpair()
             self.client_id, self.owner = CLIENT, OWNER
@@ -461,7 +496,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_unqueried_retained_tasks_do_not_starve_behind_retried_missing_owners(self):
         service = DesktopAttentionService('/fixture')
-        class Channel:
+        class Channel(VerifiedContractFixture):
             owner, client_id = OWNER, CLIENT
             def discover(self): return {'owner_client_id': OWNER}
             def _send(self, value): pass
@@ -472,7 +507,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_no_owner_reports_not_loaded_instead_of_indefinite_sync(self):
         service = DesktopAttentionService('/fixture')
-        class Channel:
+        class Channel(VerifiedContractFixture):
             def discover(self): raise DesktopOwnerUnavailable('no owner')
         service.channel = Channel(); service.set_threads([THREAD]); service._health['connected'] = True
         service._discover([THREAD])
@@ -492,7 +527,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_failed_readonly_candidate_is_quarantined_before_socket_reset(self):
         service = DesktopAttentionService('/fixture')
-        class Channel:
+        class Channel(VerifiedContractFixture):
             def discover(self): raise ControlError('Codex 本机对话连接已中断')
         service.channel = Channel()
         with self.assertRaises(ControlError): service._discover([THREAD])
@@ -502,7 +537,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_transport_loss_during_discovery_does_not_quarantine_a_healthy_candidate(self):
         service = DesktopAttentionService('/fixture')
-        class Channel:
+        class Channel(VerifiedContractFixture):
             def discover(self): raise DesktopConnectionInterrupted('router restarted')
         service.channel = Channel()
         with self.assertRaises(DesktopConnectionInterrupted): service._discover([THREAD])
@@ -510,7 +545,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_repeated_chat_projection_failures_back_off_with_a_finite_cap(self):
         service = DesktopAttentionService('/fixture')
-        class Channel:
+        class Channel(VerifiedContractFixture):
             client_id = CLIENT
             def _send(self, value): pass
         service.channel = Channel()

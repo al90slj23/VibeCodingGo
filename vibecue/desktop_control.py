@@ -89,10 +89,9 @@ def run(operation, params=None, home=None, codex_home=None, deadline=None):
     models = cached_catalog(codex_home)
     if operation == 'catalog':
         try:
-            # Peer identity and audited build are sufficient to identify this
-            # control capability. No fictitious thread is discovered or loaded.
-            with DesktopControlChannel('vibecue-control-probe', codex_home=codex_home, timeout=4):
-                pass
+            # Verify implemented method contracts without probing a write.
+            with DesktopControlChannel('vibecue-control-probe', codex_home=codex_home, timeout=4) as channel:
+                channel.require_capability('control')
             return {'schema_version': SCHEMA_VERSION, 'connected': True,
                     'transport': 'desktop_ipc', 'models': models,
                     'message': '已自动复用当前 Codex；模型与档位来自本机模型缓存，应用后逐项核对。'}
@@ -131,6 +130,10 @@ def run(operation, params=None, home=None, codex_home=None, deadline=None):
                     patch['serviceTier'] = model['fast_tier']
                 if time.monotonic() >= deadline:
                     raise ControlError('本轮批量操作已到时，此项未提交')
+                channel.require_method('thread-follower-update-thread-settings', 2)
+                if 'serviceTier' in patch:
+                    channel.require_method('thread-stream-state-changed', 11)
+                    channel.require_method('thread-stream-following-changed', 1)
                 submitted = True
                 applied = channel.update_settings(patch)
                 if not applied:

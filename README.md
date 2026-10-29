@@ -28,6 +28,8 @@
 
 0.28.2 将常驻 UI 工作统一到按可见性与预算调度的时钟，文件/JSON 工作移出主线程；列表、对话和统计按变化更新。后续功能遵循[性能架构与回归约束](docs/performance-architecture.md)，避免每加一个页面就新增轮询、全文解析与整页重建。每次构建自动执行隔离的性能结构检查，现场结果见[优化报告](docs/performance-ui-2026-10-29.md)。
 
+0.28.3 将 Codex 桌面的构建号白名单改为逐接口契约检查；兼容的客户端更新自动复用连接，真正变化的接口按功能退化并保留自动复查。见[桌面更新兼容机制](docs/codex-desktop-compatibility.md)。
+
 ## 项目名称与兼容升级
 
 0.26.0 起，项目由 VibeCue 更名为 **VibeCoding Go**，简称 **VCGo**；源码与仓库名称为 `VibeCodingGo`。应用为 `/Applications/VibeCoding Go.app`，可执行程序为 `VCGo`，常用命令入口为 `./scripts/vcgo`。

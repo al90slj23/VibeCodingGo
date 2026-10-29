@@ -86,6 +86,7 @@ class DesktopIPCTests(unittest.TestCase):
         patches = [patch.object(ipc, '_private_socket'),
                    patch.object(ipc, '_peer_uid', return_value=os.getuid()),
                    patch.object(ipc, '_peer_bundle', return_value=Path('/Applications/ChatGPT.app')),
+                   patch.object(ipc, '_protocol_contract', return_value=dict(ipc.KNOWN_PROTOCOL)),
                    patch.object(ipc.socket, 'socket', return_value=fake),
                    patch.object(ipc.select, 'select', side_effect=lambda read, write, error, timeout:
                                 ([fake] if fake.pending else [], [], []))]
@@ -201,6 +202,7 @@ class DesktopIPCTests(unittest.TestCase):
                 connection, server = socket.socketpair()
                 channel = ipc.DesktopChannel(THREAD, timeout=1)
                 channel.socket, channel.client_id, channel.owner = connection, CLIENT, OWNER
+                channel.protocol_contract = dict(ipc.KNOWN_PROTOCOL)
                 try:
                     server.sendall(frame(FakeSocket().snapshot()) + partial)
                     with self.assertRaises(ipc.DesktopConnectionInterrupted):
@@ -268,7 +270,7 @@ class DesktopIPCTests(unittest.TestCase):
         self.assertEqual(fake.sent, [])
         self.assertTrue(fake.closed)
 
-    def test_only_verified_codex_peer_build_mismatch_has_unsupported_type(self):
+    def test_codex_identity_does_not_reject_new_build_number(self):
         def proc_pidpath(pid, buffer, size):
             buffer.value = b'/Applications/Codex.app/Contents/MacOS/Codex'
             return len(buffer.value)
@@ -279,12 +281,83 @@ class DesktopIPCTests(unittest.TestCase):
         with patch.object(ipc.sys, 'platform', 'darwin'), patch.object(ipc.ctypes, 'CDLL', return_value=libproc), \
                 patch.object(Path, 'resolve', return_value=Path('/Applications/Codex.app')), \
                 patch.object(Path, 'open', mock_open(read_data=b'plist')), patch.object(ipc.plistlib, 'load', return_value=info):
-            with self.assertRaises(ipc.DesktopProtocolUnsupported):
-                ipc._peer_bundle(peer)
+            self.assertEqual(ipc._peer_bundle(peer), Path('/Applications/Codex.app'))
             info['CFBundleIdentifier'] = 'com.example.other'
             with self.assertRaises(ControlError) as caught:
                 ipc._peer_bundle(peer)
             self.assertNotIsInstance(caught.exception, ipc.DesktopProtocolUnsupported)
+
+    def test_unversioned_initialize_is_proved_by_readonly_handshake(self):
+        fake, channel = self.connect()
+        protocol = dict(ipc.KNOWN_PROTOCOL)
+        protocol.pop('initialize')
+        with patch.object(ipc, '_protocol_contract', return_value=protocol):
+            with channel:
+                self.assertEqual(channel.client_id, CLIENT)
+                self.assertTrue(channel.capabilities['reply'])
+        self.assertEqual(fake.sent[0]['method'], 'initialize')
+        self.assertEqual(fake.sent[0]['version'], 0)
+
+    def test_changed_initialize_contract_sends_no_bytes(self):
+        fake, channel = self.connect()
+        protocol = dict(ipc.KNOWN_PROTOCOL, initialize=1)
+        with patch.object(ipc, '_protocol_contract', return_value=protocol):
+            with self.assertRaises(ipc.DesktopProtocolUnsupported):
+                with channel: pass
+        self.assertEqual(fake.sent, [])
+        self.assertTrue(fake.closed)
+
+    def test_method_contracts_are_feature_scoped_not_build_scoped(self):
+        fake, channel = self.connect()
+        protocol = dict(ipc.KNOWN_PROTOCOL)
+        protocol['thread-follower-start-turn'] = 3
+        protocol['future-added-method'] = 1
+        with patch.object(ipc, '_protocol_contract', return_value=protocol):
+            with channel:
+                self.assertEqual(channel.capabilities, {'reply': False, 'control': True, 'attention': True})
+                self.assertEqual(channel.runtime_snapshot()['resume_state'], 'resumed')
+                before = len(fake.sent)
+                with self.assertRaises(ipc.DesktopProtocolUnsupported):
+                    channel.start_turn(self.request())
+                self.assertEqual(len(fake.sent), before)
+        self.assertFalse(any(channel.capabilities.values()))
+
+    def test_missing_or_unknown_stream_contract_never_follows(self):
+        for version in [None, 12, True]:
+            fake, channel = self.connect()
+            protocol = dict(ipc.KNOWN_PROTOCOL)
+            protocol['thread-stream-state-changed'] = version
+            with patch.object(ipc, '_protocol_contract', return_value=protocol):
+                with channel:
+                    self.assertFalse(channel.capabilities['attention'])
+                    with self.assertRaises(ipc.DesktopProtocolUnsupported):
+                        channel.runtime_snapshot()
+            self.assertEqual([m['method'] for m in fake.sent], ['initialize'])
+
+    def test_explicit_runtime_contract_rejection_is_not_retried_or_uncertain(self):
+        def handler(sock, value):
+            if value.get('method') == 'thread-follower-start-turn':
+                sock.pending.extend(frame({'type':'response','requestId':value['requestId'],
+                    'resultType':'error','error':'request-version-mismatch'})); return True
+        fake, channel = self.connect(FakeSocket(handler))
+        with channel:
+            with self.assertRaises(ipc.DesktopProtocolUnsupported):
+                channel.start_turn(self.request())
+        self.assertEqual(sum(m.get('method') == 'thread-follower-start-turn' for m in fake.sent), 1)
+
+    def test_reconnect_rechecks_contract_and_does_not_reuse_old_owner(self):
+        fake, channel = self.connect()
+        with channel:
+            channel.discover()
+            self.assertTrue(channel.capabilities['reply'])
+        protocol = dict(ipc.KNOWN_PROTOCOL)
+        protocol.pop('thread-follower-start-turn')
+        with patch.object(ipc, '_protocol_contract', return_value=protocol):
+            with channel:
+                self.assertIsNone(channel.owner)
+                self.assertFalse(channel.capabilities['reply'])
+        initializations = [m for m in fake.sent if m['method'] == 'initialize']
+        self.assertEqual([m['sourceClientId'] for m in initializations], ['initializing-client'] * 2)
 
     def test_private_socket_rejects_symlink_and_broad_permissions(self):
         folder = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=os.getuid())

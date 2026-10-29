@@ -498,6 +498,8 @@ class DesktopAttentionService:
             self._follow(thread, projection.owner, False)
 
     def _follow(self, thread, owner, value):
+        self.channel.require_method("thread-stream-following-changed")
+        if value: self.channel.require_method("thread-stream-state-changed")
         self.channel._send({'type': 'broadcast', 'sourceClientId': self.channel.client_id,
                             'targetClientIds': [owner], 'method': 'thread-stream-following-changed', 'version': 1,
                             'params': {'conversationId': thread, 'hostId': 'local', 'following': value}})
@@ -553,6 +555,17 @@ class DesktopAttentionService:
             if attempted >= 1:
                 break
 
+    def _contract_health(self, channel):
+        capabilities = channel.capabilities
+        available = capabilities['reply'] or capabilities['control'] or capabilities['attention']
+        with self._lock:
+            self._health.update(connected=available, status='connected' if available else 'unsupported',
+                reason_code='connected' if capabilities['attention'] else 'protocol_unsupported',
+                message='已自动复用当前 Codex 连接' if capabilities['attention'] else
+                        'Codex 状态订阅接口暂不兼容，其他已确认能力可继续使用；后台会自动检查',
+                last_seen=time.time(), capabilities=dict(capabilities, attention=False))
+        return capabilities['attention']
+
     def _run(self):
         delay = 1
         self._reconnect_stamp = self._retry_stamp()
@@ -564,9 +577,11 @@ class DesktopAttentionService:
                 with self._lock:
                     self.channel = channel
                 with channel:
-                    with self._lock:
-                        self._health.update(connected=True, status='connected', reason_code='connected', message='已自动复用当前 Codex 连接', last_seen=time.time(),
-                                            capabilities={'reply': True, 'control': True, 'attention': False})
+                    if not self._contract_health(channel):
+                        # Re-open at a bounded cadence to recheck replaced resources.
+                        # Other compatible capabilities remain advertised meanwhile.
+                        self._wait_retry(30)
+                        continue
                     while not self._stop.is_set():
                         if time.monotonic() - opened_at >= 10:
                             delay = 1
