@@ -419,7 +419,7 @@ final class CueCodexBatchController: NSWindowController, NSWindowDelegate {
     private func finishSummary() {
         let allVerified = targets.allSatisfy { lastResults[$0.threadID]?["status"] as? String == "verified" }
         let queued = lastResults.values.contains { $0["status"] as? String == "queued" }
-        status.stringValue = allVerified ? "全部已由 Codex 原生设置回读确认，后续轮次生效。" : queued ? "未载入项已后台排队；Codex 自身载入后自动应用，不切换窗口。" : "批次已结束，部分项目未生效或待核验；请查看逐项结果。"
+        status.stringValue = allVerified ? "全部已由 Codex 原生设置回读确认，后续轮次生效。" : queued ? "连接或运行者暂不可用，已后台排队并自动重试，无需打开对话。" : "批次已结束，部分项目未生效或待核验；请查看逐项结果。"
         status.textColor = allVerified ? .systemGreen : .systemOrange
         progressLabel.stringValue = summaryText
     }
@@ -440,7 +440,7 @@ final class CueCodexBatchController: NSWindowController, NSWindowDelegate {
         progressBar.doubleValue = max(progressBar.doubleValue, Double(completed))
         progressLabel.stringValue = "已处理 \(completed) / \(applyingIDs.count) · \(summaryText)"
         let phase = event["phase"] as? String ?? "starting"
-        let name = ["starting": "准备中", "reading": "读取原生设置", "writing": "正在写入", "verifying": "回读核验", "completed": "已处理"] [phase] ?? "处理中"
+        let name = ["starting": "准备中", "reading": "读取原生设置", "loading": "后台载入配置", "writing": "正在写入", "verifying": "回读核验", "completed": "已处理"] [phase] ?? "处理中"
         let title = targets.first { $0.threadID == event["thread_id"] as? String }?.title ?? ""
         status.stringValue = "\(name) · \(title)"; status.textColor = .secondaryLabelColor
         if collect, let row = event["result"] as? [String: Any] {
@@ -497,14 +497,16 @@ final class CueCodexBatchController: NSWindowController, NSWindowDelegate {
     }
     static func readbackMatches(_ row: [String: Any], expected: [String: String]) -> Bool {
         guard row["status"] as? String == "read", !expected.isEmpty,
-              let actual = row["settings"] as? [String: Any], let saved = row["saved_settings"] as? [String: Any],
-              let composer = row["composer_settings"] as? [String: Any] else { return false }
+              let actual = row["settings"] as? [String: Any], let saved = row["saved_settings"] as? [String: Any] else { return false }
+        let persisted = row["verification_basis"] as? String == "persisted_settings" && row["loaded"] as? Bool == false
+        if persisted && row["verified"] as? Bool != true { return false }
+        guard let independent = row[persisted ? "indexed_settings" : "composer_settings"] as? [String: Any] else { return false }
         return expected.allSatisfy { key, value in
             func equal(_ candidate: Any?) -> Bool {
                 guard let candidate = candidate as? String else { return false }
                 return candidate == value || key == "service_tier" && ["priority", "fast"].contains(value) && ["priority", "fast"].contains(candidate)
             }
-            return equal(actual[key]) && equal(saved[key]) && (key == "service_tier" || equal(composer[key]))
+            return equal(actual[key]) && equal(saved[key]) && (key == "service_tier" || equal(independent[key]))
         }
     }
     @objc private func verifyResults() {
@@ -512,7 +514,7 @@ final class CueCodexBatchController: NSWindowController, NSWindowDelegate {
         let ids = targets.filter { ["verified", "unverified"].contains(lastResults[$0.threadID]?["status"] as? String ?? "") }.map(\.threadID)
         guard !ids.isEmpty else { return }
         busy = true; applyingIDs = ids; progressBar.maxValue = Double(ids.count); progressBar.doubleValue = 0
-        status.stringValue = "正在重新读取 Codex 原生设置，此操作不会写入设置。"; updateControls()
+        status.stringValue = "正在重新读取 Codex 原生设置；不修改模型配置，不启动任务。"; updateControls()
         client.run("inspect", input: ["thread_ids": ids], progress: { [weak self] event in self?.receiveProgress(event, collect: false) }) { [weak self] result in
             guard let self else { return }; self.busy = false; self.applyingIDs = []
             switch result {
@@ -617,6 +619,12 @@ final class CueCodexBatchController: NSWindowController, NSWindowDelegate {
         results["batch_saved_echo_cannot_hide_stale_native_settings_or_composer"] = !readbackMatches(stale, expected: expected) && !readbackMatches(staleComposer, expected: expected)
         var missing = matching; missing.removeValue(forKey: "composer_settings")
         results["batch_missing_native_evidence_never_becomes_verified"] = !readbackMatches(missing, expected: expected)
+        var persisted = matching; persisted.removeValue(forKey: "composer_settings")
+        persisted["loaded"] = false; persisted["verified"] = true; persisted["verification_basis"] = "persisted_settings"
+        persisted["indexed_settings"] = ["model": "fixture", "effort": "max"]
+        results["batch_unloaded_verification_uses_independent_persisted_index"] = readbackMatches(persisted, expected: expected)
+        persisted["indexed_settings"] = ["model": "fixture", "effort": "ultra"]
+        results["batch_unloaded_index_conflict_is_never_marked_verified"] = !readbackMatches(persisted, expected: expected)
         do {
             var decoder = CueControlStreamDecoder()
             let events: [[String: Any]] = [["event": "progress", "phase": "reading", "thread_id": "中文", "total": 2, "completed": 0],

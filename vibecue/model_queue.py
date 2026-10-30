@@ -1,7 +1,7 @@
-"""Explicit model-setting intents, applied only to an already observed owner.
+"""Explicit model-setting intents, retried through owner or cold metadata worker.
 
-No navigation, thread resume, chat input or independent polling is provided.
-The existing app health snapshot admits a finite drain when an owner is ready.
+No navigation, chat input or independent polling is provided.
+The existing app health snapshot admits one finite, writer-guarded drain.
 Submitting is persisted before a write; a lost process is never blindly retried.
 """
 from contextlib import contextmanager
@@ -75,7 +75,7 @@ def enqueue(identifier, params, home=None):
     queue_id = str(uuid.uuid4())
     result = {'thread_id': identifier, 'queue_id': queue_id, 'status': 'queued', 'verified': False,
               'requested_parameters': values,
-              'message': '已后台排队；等待 Codex 自身载入后自动应用，不切换窗口。'}
+              'message': '连接或运行者暂不可用，已后台排队并自动重试，无需打开对话。'}
     with _locked(home) as rows:
         if identifier not in rows and len(rows) >= MAX_RECORDS:
             removable = [key for key, row in rows.items() if row['status'] not in ('queued', 'submitting')]
@@ -117,7 +117,7 @@ def cancel(items, home=None):
 
 
 def drain(identifiers, home=None, codex_home=None):
-    """At most one already-observed owner, with a finite eight-second budget."""
+    """At most one owner/cold worker, with a finite twenty-second budget."""
     from .codex_control import unique_threads
     from .desktop_control import run as apply_native
     eligible = unique_threads(identifiers)
@@ -142,9 +142,10 @@ def drain(identifiers, home=None, codex_home=None):
         if chosen is None:
             return {'results': []}
         identifier, queue_id = chosen['thread_id'], chosen['queue_id']
+        attempts = min(8, max(0, chosen.get('attempts', 0) if type(chosen.get('attempts', 0)) is int else 0) + 1)
         try:
             answer = apply_native('apply', {'thread_ids': [identifier], **chosen['params']},
-                                  home=home, codex_home=codex_home, deadline=time.monotonic()+8,
+                                  home=home, codex_home=codex_home, deadline=time.monotonic()+20,
                                   queued_execution=True)
             result = next((item for item in (answer or {}).get('results', []) if item.get('thread_id') == identifier), None)
             if result is None:
@@ -162,5 +163,6 @@ def drain(identifiers, home=None, codex_home=None):
             current = rows.get(identifier)
             if current and current['queue_id'] == queue_id:
                 current.update(status=result['status'], result=result, updated_at=time.time(),
-                               retry_at=time.time()+30 if result['status'] == 'queued' else 0)
+                               attempts=attempts,
+                               retry_at=time.time()+min(600, 30 * 2 ** (attempts - 1)) if result['status'] == 'queued' else 0)
         return {'results': [result]}

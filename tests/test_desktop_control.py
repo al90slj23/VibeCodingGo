@@ -119,6 +119,31 @@ class DesktopControlTests(unittest.TestCase):
         self.assertEqual(FakeChannel.entered, ['vibecue-control-probe'])
         self.assertEqual(FakeChannel.reads, []); self.assertEqual(FakeChannel.updates, [])
 
+    def test_unloaded_apply_uses_background_worker_without_window_navigation(self):
+        from vibecue.background_settings import BackgroundUpdateUnconfirmed
+        FakeChannel.rows['one']['resumeState'] = 'needs-resume'
+        background_result = {'thread_id': 'one', 'status': 'verified', 'verified': True,
+                             'verification_basis': 'persisted_settings'}
+        with patch('vibecue.background_settings.run', return_value=background_result) as worker:
+            result = self.call('apply', {'thread_ids': ['one'], 'effort': 'max', 'defer_unloaded': True})
+        self.assertEqual(result['summary']['verified'], 1)
+        self.assertEqual(FakeChannel.updates, [])
+        self.assertEqual(worker.call_args.args[:2], ('one', {'thread_ids': ['one'], 'effort': 'max', 'defer_unloaded': True}))
+        self.assertFalse((self.home / 'codex-model-queue.json').exists())
+        with patch('vibecue.background_settings.run', side_effect=BackgroundUpdateUnconfirmed({'effort': 'max'})):
+            result = self.call('apply', {'thread_ids': ['one'], 'effort': 'max', 'defer_unloaded': True})
+        self.assertEqual(result['results'][0]['status'], 'unverified')
+        self.assertEqual(result['results'][0]['expected_settings'], {'effort': 'max'})
+        self.assertFalse((self.home / 'codex-model-queue.json').exists())
+
+    def test_unloaded_inspect_uses_background_readback_without_update(self):
+        FakeChannel.rows['one']['resumeState'] = 'needs-resume'
+        with patch('vibecue.background_settings.run', return_value={'thread_id': 'one', 'status': 'read'}) as worker:
+            result = self.call('inspect', {'thread_ids': ['one']})
+        self.assertEqual(result['results'][0]['status'], 'read')
+        self.assertEqual(worker.call_args.args[:2], ('one', None))
+        self.assertEqual(FakeChannel.updates, [])
+
     def test_inspect_returns_only_settings_from_existing_owner(self):
         FakeChannel.rows['one']['private'] = 'PRIVATE BODY OR TOKEN'
         result = self.call('inspect', {'thread_ids': ['one', 'one', 'two']})

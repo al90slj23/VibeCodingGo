@@ -1,7 +1,8 @@
 import Foundation
 
 /// Driven by the existing watcher heartbeat. No timer, resident child process,
-/// thread resume or window navigation is owned by the deferred settings queue.
+/// or window navigation is owned by the deferred settings queue. A finite
+/// native worker also handles unloaded chats without waiting for a window owner.
 final class CueCodexModelQueue {
     private let home: URL
     private let snapshots = CueJSONSnapshotReader()
@@ -36,9 +37,11 @@ final class CueCodexModelQueue {
             }
             guard !self.inFlight, Date() >= self.nextAttempt else { return }
             let now = Date().timeIntervalSince1970
-            guard let id = pending.first(where: { row in
+            let ordered = pending.filter { readyIDs.contains($0["thread_id"] as? String ?? "") }
+                + pending.filter { !readyIDs.contains($0["thread_id"] as? String ?? "") }
+            guard let id = ordered.first(where: { row in
                 guard let id = row["thread_id"] as? String else { return false }
-                return readyIDs.contains(id) && (row["retry_at"] as? Double ?? 0) <= now
+                return CueIdentifier.isValid(id) && (row["retry_at"] as? Double ?? 0) <= now
             })?["thread_id"] as? String else { return }
             self.inFlight = true
             let completion: (Result<[String: Any], Error>) -> Void = { [weak self] result in
@@ -82,7 +85,7 @@ final class CueCodexModelQueue {
             "result": ["thread_id": "waiting-thread", "queue_id": "fixture-queue", "status": "queued"]]
         try! JSONSerialization.data(withJSONObject: ["schema_version": 1, "records": [row]]).write(to: home.appendingPathComponent("codex-model-queue.json"))
         evaluate(["other-thread"])
-        result["model_queue_waits_for_owner_metadata_without_opening_windows"] = starts.isEmpty && monitor.pendingIDs == ["waiting-thread"]
+        result["model_queue_admits_unloaded_chats_without_waiting_for_window_owners"] = starts == ["waiting-thread"] && monitor.pendingIDs == ["waiting-thread"]
         evaluate(["waiting-thread"]); evaluate(["waiting-thread"])
         result["model_queue_admits_only_one_finite_job_from_existing_health_updates"] = starts == ["waiting-thread"] && monitor.inFlight
         done?(.success(["busy": true, "results": []])); evaluate(["waiting-thread"])

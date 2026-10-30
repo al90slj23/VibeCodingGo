@@ -1,7 +1,8 @@
 """Explicit model/effort/speed changes through the running desktop owner.
 
-This adapter never sends input, resumes a chat, changes permissions, or starts a
-second app-server. The model catalogue remains the desktop's local cache; its
+This adapter never sends input or changes permissions. Writer-free unloaded
+chats use a finite metadata worker; loaded chats stay with their current owner.
+The model catalogue remains the desktop's local cache; its
 origin is shown explicitly. A settings mutation is only verified after a matching
 read from the same owner. A submitted update is never retried on another channel.
 """
@@ -64,6 +65,25 @@ def _read(channel):
         raise DesktopOwnerUnavailable('此对话尚未在 Codex 就绪，请先在 Codex 打开')
     result = settings_subset(raw)
     return result
+
+
+def resolve_patch(params, current, models):
+    """One validation policy for the existing owner and the cold metadata worker."""
+    selected = params.get('model') or current.get('model')
+    model = next((row for row in models if row['id'] == selected), None)
+    if model is None:
+        raise ControlError('本机模型缓存没有目标模型，请先在 Codex 刷新模型目录')
+    effort = params.get('effort') or current.get('effort')
+    if effort and effort not in [row['id'] for row in model['efforts']]:
+        raise ControlError('目标模型缓存未确认支持此强度，未修改此对话')
+    patch = {key: params[key] for key in ('model', 'effort') if key in params}
+    if params.get('speed') == 'standard':
+        patch['serviceTier'] = 'default'
+    elif params.get('speed') == 'fast':
+        if not model['fast_tier']:
+            raise ControlError('目标模型缓存未提供快速档位，未修改此对话')
+        patch['serviceTier'] = model['fast_tier']
+    return patch
 
 
 def _summary(identifiers, results, connected):
@@ -152,20 +172,7 @@ def run(operation, params=None, home=None, codex_home=None, deadline=None, progr
                                     'loaded': True, 'status': 'read'})
                     progress_event(progress, identifiers, results, 'completed', identifier)
                     continue
-                selected = params.get('model') or current.get('model')
-                model = by_model.get(selected)
-                if model is None:
-                    raise ControlError('本机模型缓存没有目标模型，请先在 Codex 刷新模型目录')
-                effort = params.get('effort') or current.get('effort')
-                if effort and effort not in [row['id'] for row in model['efforts']]:
-                    raise ControlError('目标模型缓存未确认支持此强度，未修改此对话')
-                patch = {key: params[key] for key in ('model', 'effort') if key in params}
-                if params.get('speed') == 'standard':
-                    patch['serviceTier'] = 'default'
-                elif params.get('speed') == 'fast':
-                    if not model['fast_tier']:
-                        raise ControlError('目标模型缓存未提供快速档位，未修改此对话')
-                    patch['serviceTier'] = model['fast_tier']
+                patch = resolve_patch(params, current, models)
                 if time.monotonic() >= deadline:
                     raise ControlError('本轮批量操作已到时，此项未提交')
                 channel.require_method('thread-follower-update-thread-settings', 2)
@@ -193,6 +200,21 @@ def run(operation, params=None, home=None, codex_home=None, deadline=None, progr
             uncertain = submitted or isinstance(error, UnconfirmedUpdate)
             unavailable = not submitted and (isinstance(error, (DesktopOwnerUnavailable, DesktopConnectionInterrupted))
                                              or '先在 Codex 打开' in str(error))
+            if unavailable:
+                from .background_settings import run as background_run, BackgroundUnavailable
+                try:
+                    # The native worker independently checks the global writer
+                    # lock. A missing window owner never permits a takeover.
+                    results.append(background_run(identifier, params if operation == 'apply' else None,
+                        home=home, codex_home=codex_home, deadline=min(deadline, item_deadline),
+                        phase=lambda phase: progress_event(progress, identifiers, results, phase, identifier)))
+                    progress_event(progress, identifiers, results, 'completed', identifier)
+                    continue
+                except (ControlError, OSError, ValueError, TypeError) as background_error:
+                    error = background_error
+                    uncertain = isinstance(error, UnconfirmedUpdate)
+                    patch = getattr(error, 'patch', patch)
+                    unavailable = isinstance(error, BackgroundUnavailable)
             if unavailable and operation == 'apply' and params.get('defer_unloaded') is True:
                 from .model_queue import enqueue
                 try:
@@ -204,8 +226,9 @@ def run(operation, params=None, home=None, codex_home=None, deadline=None, progr
             results.append({'thread_id': identifier,
                             'status': 'unverified' if uncertain else 'failed',
                             'verified': False, 'settings': settings_subset(patch),
+                            'expected_settings': settings_subset(patch),
                             'error_kind': 'not_loaded' if unavailable else 'unconfirmed' if uncertain else 'rejected',
                             'message': ('设置可能已提交，请在 Codex 核对；不会自动重试。' if uncertain else
-                                        '此对话尚未在 Codex 就绪，未修改。打开此对话后可仅重试未生效项。' if unavailable else clean(error, 300))})
+                                        clean(error, 300))})
         progress_event(progress, identifiers, results, 'completed', identifier)
     return _summary(identifiers, results, connected)
