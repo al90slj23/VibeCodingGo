@@ -1488,6 +1488,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             statusPopoverController = CueStatusPopoverController(history: recentHistory, actions: actions)
             let popover = NSPopover(); popover.behavior = .transient
             popover.contentViewController = statusPopoverController
+            popover.delegate = statusPopoverController
             statusPopover = popover
         }
         updateStatusPopover()
@@ -2629,6 +2630,14 @@ if CommandLine.arguments.contains("--engineering-self-test") {
     results.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
     results.merge(CueWorkspacePage.validationReport()) { _, new in new }
     results.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--task-preview-self-test") {
+    _ = NSApplication.shared
+    var results = CueStatusPopoverController.validationReport()
+    results.merge(CueTaskHoverController.validationReport()) { _, new in new }
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
     exit(results.values.allSatisfy { $0 } ? 0 : 1)
 }

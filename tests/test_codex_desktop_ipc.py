@@ -375,8 +375,49 @@ class DesktopIPCTests(unittest.TestCase):
         sent = fake.sent[-1]
         self.assertEqual(sent['targetClientId'], OWNER)
         self.assertEqual(sent['version'], 2)
-        self.assertEqual(sent['params'], {'conversationId': THREAD, 'turnStart': {'request': self.request(), 'context': {'inheritThreadSettings': True}}})
+        expected = self.request()
+        expected['input'][0]['text_elements'] = []
+        self.assertEqual(sent['params'], {'conversationId': THREAD, 'turnStart': {'request': expected, 'context': {'inheritThreadSettings': True}}})
         self.assertFalse(set(sent) & {'hostId', 'model', 'approvalPolicy', 'sandbox'})
+
+    def test_native_optimistic_text_is_renderable_before_server_normalization(self):
+        # Native consumers inspect text_elements.some/length in the retained
+        # turn input. Exercising the actual framed sender catches a backend-
+        # accepted message that would still crash the native transcript.
+        request = self.request()
+        request['input'][0]['text'] = '中文、emoji ' + chr(0x1F9ED) + '\\n  保留空白  '
+        original = json.loads(json.dumps(request))
+        fake, channel = self.connect()
+        with channel:
+            channel.start_turn(request)
+        wire = next(row for row in fake.sent if row.get('method') == 'thread-follower-start-turn')
+        turn = wire['params']['turnStart']
+        inputs = turn['request']['input']
+        continuation_markers = [
+            element for item in inputs if item['type'] == 'text'
+            for element in item['text_elements']
+            if element.get('placeholder') == 'aeon-continuation'
+        ]
+        self.assertEqual(continuation_markers, [])
+        self.assertEqual(len(inputs[0]['text_elements']), 0)
+        self.assertEqual(inputs[0]['text'], original['input'][0]['text'])
+        self.assertEqual(turn['request']['clientUserMessageId'], MESSAGE)
+        self.assertEqual(turn['context'], {'inheritThreadSettings': True})
+        self.assertEqual(request, original)
+
+    def test_sender_cannot_inject_annotations_attachments_or_app_context(self):
+        fake, channel = self.connect()
+        with channel:
+            for key, value in [('text_elements', []),
+                               ('text_elements', [{'placeholder': 'aeon-continuation'}]),
+                               ('image_url', 'https://example.invalid/image'),
+                               ('untrusted', False)]:
+                with self.subTest(field=key, value=value):
+                    request = self.request()
+                    request['input'][0][key] = value
+                    with self.assertRaises(ControlError):
+                        channel.start_turn(request)
+        self.assertFalse(any(row.get('method') == 'thread-follower-start-turn' for row in fake.sent))
 
     def test_start_rejects_overrides_wrong_target_and_invalid_uuid(self):
         fake, channel = self.connect()

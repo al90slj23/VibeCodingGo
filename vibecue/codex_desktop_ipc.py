@@ -465,10 +465,16 @@ class DesktopChannel:
         message_id = request.get('clientUserMessageId')
         if not _uuid(message_id):
             raise ControlError('消息请求标识无效')
+        # The desktop retains this request in its optimistic turn state.
+        # Its native transcript/title consumers require text_elements even for
+        # plain user text, before an app-server round trip can normalize it.
+        # Keep the public sender text-only; construct empty annotations here
+        # rather than accepting caller-supplied placeholders or app metadata.
+        wire_request = dict(request, input=[dict(inputs[0], text_elements=[])])
         if not self.owner:
             self.discover()
         result = self._call('thread-follower-start-turn', {'conversationId': self.thread_id,
-                            'turnStart': {'request': request, 'context': {'inheritThreadSettings': True}}}, target=self.owner, mutation=True)
+                            'turnStart': {'request': wire_request, 'context': {'inheritThreadSettings': True}}}, target=self.owner, mutation=True)
         inner = result.get('result')
         if not isinstance(inner, dict):
             raise UnconfirmedUpdate('消息已提交，但桌面未返回可核对的发送回执，请查看 Codex')

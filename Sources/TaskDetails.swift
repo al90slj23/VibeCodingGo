@@ -475,17 +475,28 @@ private final class CueTaskHoverSurface: NSVisualEffectView {
     override func mouseExited(with event: NSEvent) { exited?() }
 }
 
+private final class CueTaskHoverTextView: NSTextView {
+    var selectionTrackingChanged: ((Bool) -> Void)?
+    override func mouseDown(with event: NSEvent) {
+        selectionTrackingChanged?(true)
+        defer { selectionTrackingChanged?(false) }
+        super.mouseDown(with: event)
+    }
+}
+
 /// A nonactivating hover panel. All preview text lives only in this controller.
 final class CueTaskHoverController: NSObject {
     private var panel: CueTaskHoverPanel?
     private let titleField = NSTextField(labelWithString: "")
+    private let openCodexButton = NSButton(title: "在 Codex 打开", target: nil, action: nil)
     private let summaryField = NSTextField(labelWithString: "")
     private let modelField = NSTextField(labelWithString: "")
     private let breakdownField = NSTextField(wrappingLabelWithString: "")
     private let previewHeading = NSTextField(labelWithString: "最近对话")
     private let footerField = NSTextField(labelWithString: "移入浮窗暂停滚动 · 可选择文字")
     private let scroll = NSScrollView()
-    private let text = NSTextView()
+    private let text = CueTaskHoverTextView()
+    private var selectingText = false
     private var showWork: DispatchWorkItem?
     private var hideWork: DispatchWorkItem?
     private var refreshLease: CueActivityLease?
@@ -493,6 +504,13 @@ final class CueTaskHoverController: NSObject {
     private let activityKey = "hover:" + UUID().uuidString
     private var selectionObserver: NSObjectProtocol?
     private var activeThreadID: String?
+    private var openActionThreadID: String?
+    private var openAction: (() -> Void)?
+    private var trackingMenus = Set<ObjectIdentifier>()
+    private var menuTracking: Bool { !trackingMenus.isEmpty }
+    private var menuObservers: [NSObjectProtocol] = []
+    private var fixtureVisibility: Bool?
+    private var pointerLocation: () -> NSPoint? = { NSEvent.mouseLocation }
     private weak var anchor: NSView?
     private var provider: (() -> CueTaskDetail?)?
     private var currentTitle = ""
@@ -510,12 +528,15 @@ final class CueTaskHoverController: NSObject {
         ["visible": isVisible, "markdown_renders": markdownRenderCount,
          "data_job": refreshLease?.isValid == true, "scroll_job": scrollLease?.isValid == true]
     }
-    var isVisible: Bool { panel?.isVisible == true }
+    var isVisible: Bool { fixtureVisibility ?? (panel?.isVisible == true) }
     var isEngaged: Bool { overRow || overPanel || isVisible }
 
-    func hover(threadID: String, title: String, anchor: NSView, provider: @escaping () -> CueTaskDetail?) {
-        hideWork?.cancel(); overRow = true
+    func hover(threadID: String, title: String, anchor: NSView, provider: @escaping () -> CueTaskDetail?, onOpen: (() -> Void)? = nil) {
+        hideWork?.cancel(); overRow = true; overPanel = false
         self.anchor = anchor; self.provider = provider; currentTitle = title
+        openAction = onOpen; openActionThreadID = onOpen == nil ? nil : threadID
+        openCodexButton.isEnabled = onOpen != nil && !threadID.isEmpty
+        openCodexButton.toolTip = "在 Codex 打开：" + title
         if activeThreadID == threadID, isVisible {
             // Pointer reconciliation can call this several times per second.
             // The shared one-second data job owns refreshes of a stable row.
@@ -536,6 +557,8 @@ final class CueTaskHoverController: NSObject {
         showWork?.cancel(); hideWork?.cancel(); refreshLease?.cancel(); refreshLease = nil; scrollLease?.cancel(); scrollLease = nil
         if let panel { panel.parent?.removeChildWindow(panel); panel.orderOut(nil) }
         provider = nil; anchor = nil; activeThreadID = nil; overRow = false; overPanel = false
+        openAction = nil; openActionThreadID = nil; openCodexButton.isEnabled = false; trackingMenus.removeAll(); selectingText = false
+        if fixtureVisibility != nil { fixtureVisibility = false }
         currentBody = ""; renderedMessages = ""; hasRenderedMessages = false; text.string = ""; currentDetail = CueTaskDetail(raw: [:])
     }
 
@@ -559,13 +582,72 @@ final class CueTaskHoverController: NSObject {
         updateScrollActivity()
     }
 
-    private func scheduleHide() {
+    /// The list's existing pointer reconciliation checks this before rows.
+    /// This also handles a popup that overlaps a row on a narrow display.
+    func contains(screenPoint: NSPoint) -> Bool {
+        isVisible && panel?.frame.contains(screenPoint) == true
+    }
+    func reconcilePointer(screenPoint: NSPoint) -> Bool {
+        if contains(screenPoint: screenPoint) {
+            panelEntered()
+            return true
+        }
+        // Non-key panels do not always receive an exit event when another app
+        // owns the pointer. Reuse the list's existing reconciliation job.
+        if overPanel && !menuTracking && !selectingText { panelExited() }
+        return false
+    }
+    var preservesParentPopover: Bool {
+        guard isVisible else { return false }
+        if let event = NSApp.currentEvent, event.type == .keyDown, event.keyCode == 53 { return false }
+        if menuTracking || selectingText { return true }
+        if let point = pointerLocation(), contains(screenPoint: point) { return true }
+        // currentEvent may be an old click or key even after app deactivation;
+        // it cannot establish ongoing pointer or selection ownership.
+        return false
+    }
+    private func panelEntered() {
+        overPanel = true; overRow = false; hideWork?.cancel(); updateScrollActivity()
+    }
+    private func panelExited() {
+        overPanel = false; updateScrollActivity(); scheduleHide()
+    }
+    private func inTransferGap(_ point: NSPoint) -> Bool {
+        guard let panel, let anchor, let host = anchor.window else { return false }
+        let row = host.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+        let tip = panel.frame
+        let minY = max(row.minY, tip.minY) - 8, maxY = min(row.maxY, tip.maxY) + 8
+        guard maxY > minY else { return false }
+        if row.maxX <= tip.minX {
+            return NSRect(x: row.maxX - 2, y: minY, width: tip.minX - row.maxX + 4, height: maxY - minY).contains(point)
+        }
+        if tip.maxX <= row.minX {
+            return NSRect(x: tip.maxX - 2, y: minY, width: row.minX - tip.maxX + 4, height: maxY - minY).contains(point)
+        }
+        return false
+    }
+    private func scheduleHide(allowTransferGrace: Bool = true) {
         hideWork?.cancel()
+        guard !menuTracking else { return }
+        let expectedThread = activeThreadID
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.overRow, !self.overPanel else { return }
+            guard let self, self.activeThreadID == expectedThread, !self.overRow, !self.overPanel, !self.menuTracking, !self.selectingText else { return }
+            if let point = self.pointerLocation() {
+                if self.reconcilePointer(screenPoint: point) { return }
+                if allowTransferGrace && self.inTransferGap(point) {
+                    self.scheduleHide(allowTransferGrace: false); return
+                }
+            }
             self.hide()
         }
-        hideWork = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+        hideWork = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+    @objc private func openInCodex() {
+        guard isVisible, activeThreadID != nil, activeThreadID == openActionThreadID, let invoke = openAction else { return }
+        // Invalidate the callback before navigation; repeated or late actions
+        // cannot open the previous row after a new preview has replaced it.
+        hide()
+        invoke()
     }
 
     private func makePanel() {
@@ -580,10 +662,18 @@ final class CueTaskHoverController: NSObject {
         surface.material = .popover; surface.blendingMode = .withinWindow; surface.state = .active
         surface.wantsLayer = true; surface.layer?.cornerRadius = 13; surface.layer?.masksToBounds = true
         surface.layer?.borderWidth = 0.7; surface.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.6).cgColor
-        surface.entered = { [weak self] in self?.overPanel = true; self?.hideWork?.cancel(); self?.updateScrollActivity() }
-        surface.exited = { [weak self] in self?.overPanel = false; self?.updateScrollActivity(); self?.scheduleHide() }
+        surface.entered = { [weak self] in self?.panelEntered() }
+        surface.exited = { [weak self] in self?.panelExited() }
         window.contentView = surface
-        titleField.frame = NSRect(x: 18, y: 14, width: 464, height: 24)
+        titleField.frame = NSRect(x: 18, y: 14, width: 310, height: 24)
+        openCodexButton.frame = NSRect(x: 338, y: 9, width: 147, height: 32)
+        openCodexButton.bezelStyle = .rounded; openCodexButton.font = .systemFont(ofSize: 11.5, weight: .medium)
+        openCodexButton.image = NSImage(systemSymbolName: "arrow.up.forward", accessibilityDescription: nil)
+        openCodexButton.imagePosition = .imageLeading
+        openCodexButton.target = self; openCodexButton.action = #selector(openInCodex)
+        openCodexButton.isEnabled = openAction != nil && activeThreadID == openActionThreadID
+        openCodexButton.identifier = NSUserInterfaceItemIdentifier("task-hover.open-codex")
+        openCodexButton.setAccessibilityLabel("在 Codex 打开此对话")
         titleField.font = .systemFont(ofSize: 14, weight: .semibold); titleField.lineBreakMode = .byTruncatingTail
         summaryField.frame = NSRect(x: 18, y: 43, width: 464, height: 20)
         summaryField.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
@@ -609,11 +699,43 @@ final class CueTaskHoverController: NSObject {
         text.textContainerInset = NSSize(width: 0, height: 7)
         text.textContainer?.widthTracksTextView = true; text.textContainer?.lineFragmentPadding = 0
         text.setAccessibilityLabel("最近用户和助手对话，可滚动并选择文字")
+        text.selectionTrackingChanged = { [weak self] tracking in
+            guard let self else { return }
+            self.selectingText = tracking
+            if tracking { self.hideWork?.cancel(); self.updateScrollActivity() }
+            else if let point = self.pointerLocation(), self.reconcilePointer(screenPoint: point) { return }
+            else { self.panelExited() }
+        }
         scroll.documentView = text
         footerField.frame = NSRect(x: 18, y: 447, width: 464, height: 17)
         footerField.font = .systemFont(ofSize: 10); footerField.textColor = .tertiaryLabelColor
-        for view in [titleField, summaryField, modelField, breakdownField, separator, previewHeading, follow, scroll, footerField] { surface.addSubview(view) }
+        for view in [titleField, openCodexButton, summaryField, modelField, breakdownField, separator, previewHeading, follow, scroll, footerField] { surface.addSubview(view) }
         selectionObserver = NotificationCenter.default.addObserver(forName: NSTextView.didChangeSelectionNotification, object: text, queue: .main) { [weak self] _ in self?.updateScrollActivity() }
+        for name in [NSMenu.didBeginTrackingNotification, NSMenu.didEndTrackingNotification] {
+            menuObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let self, self.isVisible, let menu = note.object as? NSMenu else { return }
+                let id = ObjectIdentifier(menu)
+                if name == NSMenu.didBeginTrackingNotification {
+                    if self.preservesParentPopover {
+                        self.trackingMenus.insert(id); self.hideWork?.cancel(); self.updateScrollActivity()
+                    }
+                } else if self.trackingMenus.remove(id) != nil && self.trackingMenus.isEmpty {
+                    if let point = self.pointerLocation(), self.reconcilePointer(screenPoint: point) { return }
+                    self.panelExited()
+                }
+            })
+        }
+        menuObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: NSApp, queue: .main) { [weak self] _ in
+            // A passive nonactivating tip shown over Codex does not produce
+            // this transition. An active VCGo losing focus must release it.
+            self?.hide()
+        })
+        for name in [NSWindow.willCloseNotification, NSWindow.willMiniaturizeNotification] {
+            menuObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let self, let parent = self.anchor?.window, note.object as? NSWindow === parent else { return }
+                self.hide()
+            })
+        }
         panel = window
     }
 
@@ -624,7 +746,9 @@ final class CueTaskHoverController: NSObject {
             panel.parent?.removeChildWindow(panel); parent.addChildWindow(panel, ordered: .above)
         }
         // Deliberately no activate/makeKey: showing a tip must not steal typing.
-        panel.orderFrontRegardless(); previousTick = Date()
+        if fixtureVisibility != nil { fixtureVisibility = true }
+        else { panel.orderFrontRegardless() }
+        previousTick = Date()
         refreshLease?.cancel()
         refreshLease = CueActivityScheduler.shared.observe(key: activityKey + ":data", interval: 1,
             isActive: { [weak self] in self?.isVisible == true },
@@ -683,12 +807,12 @@ final class CueTaskHoverController: NSObject {
             if newSelection.location != NSNotFound { text.setSelectedRange(newSelection) }
         }
         if wasEmpty { scrollToLatestMessage() }
-        else if wasAtEnd && !overPanel { scrollToEnd() }
+        else if wasAtEnd && !overPanel && !menuTracking && !selectingText { scrollToEnd() }
         else { scroll.contentView.scroll(to: scroll.contentView.constrainBoundsRect(NSRect(origin: origin, size: scroll.contentSize)).origin); scroll.reflectScrolledClipView(scroll.contentView) }
     }
 
     private var canAdvanceScroll: Bool {
-        isVisible && !overPanel && text.selectedRange().length == 0 && scroll.contentView.bounds.origin.y < max(0, text.frame.height - scroll.contentSize.height)
+        isVisible && !overPanel && !menuTracking && !selectingText && text.selectedRange().length == 0 && scroll.contentView.bounds.origin.y < max(0, text.frame.height - scroll.contentSize.height)
     }
     private func updateScrollActivity() {
         guard canAdvanceScroll else { scrollLease?.cancel(); scrollLease = nil; return }
@@ -705,7 +829,7 @@ final class CueTaskHoverController: NSObject {
         if !canAdvanceScroll { updateScrollActivity() }
     }
     private func advanceScroll(elapsed: TimeInterval) {
-        guard !overPanel, text.selectedRange().length == 0 else { return }
+        guard !overPanel, !menuTracking, !selectingText, text.selectedRange().length == 0 else { return }
         let maximum = max(0, text.frame.height - scroll.contentSize.height)
         let current = scroll.contentView.bounds.origin
         if current.y < maximum {
@@ -732,6 +856,7 @@ final class CueTaskHoverController: NSObject {
     deinit {
         showWork?.cancel(); hideWork?.cancel(); refreshLease?.cancel(); scrollLease?.cancel()
         if let selectionObserver { NotificationCenter.default.removeObserver(selectionObserver) }
+        menuObservers.forEach(NotificationCenter.default.removeObserver)
         if let panel { panel.parent?.removeChildWindow(panel); panel.orderOut(nil) }
     }
 
@@ -847,6 +972,66 @@ final class CueTaskHoverController: NSObject {
         hover.update(detail: styled, title: "重新打开")
         results["task_hover_reopening_same_markdown_is_not_blank"] = hover.currentBody.contains("同样文字") && !hover.renderedMessages.isEmpty
         hover.hide()
+        let interactive = CueTaskHoverController()
+        interactive.fixtureVisibility = false; interactive.pointerLocation = { nil }
+        interactive.makePanel()
+        var opened: [String] = []
+        interactive.hover(threadID: "first", title: "第一个任务", anchor: anchor, provider: { reading }, onOpen: { opened.append("first") })
+        interactive.showNow()
+        let buttonFrame = interactive.openCodexButton.frame
+        // hitTest receives its receiver's superview coordinates. The popup
+        // surface is flipped, while the native window theme frame is not.
+        let buttonHitPoint = interactive.openCodexButton.convert(NSPoint(x: interactive.openCodexButton.bounds.midX, y: interactive.openCodexButton.bounds.midY),
+                                                                 to: interactive.panel?.contentView?.superview)
+        results["task_hover_codex_button_has_text_accessibility_and_independent_hit_target"] = interactive.openCodexButton.title == "在 Codex 打开"
+            && interactive.openCodexButton.identifier?.rawValue == "task-hover.open-codex" && interactive.openCodexButton.isEnabled
+            && interactive.titleField.frame.maxX + 8 <= buttonFrame.minX
+            && interactive.panel?.contentView?.hitTest(buttonHitPoint) === interactive.openCodexButton
+        interactive.leaveRow(); let rowExitHide = interactive.hideWork
+        let inside = NSPoint(x: interactive.panel!.frame.midX, y: interactive.panel!.frame.midY)
+        interactive.pointerLocation = { inside }
+        let reconciled = interactive.reconcilePointer(screenPoint: inside)
+        rowExitHide?.perform()
+        results["task_hover_row_to_popup_transfer_cancels_hide_and_preserves_parent"] = reconciled && interactive.isVisible && interactive.overPanel
+            && rowExitHide?.isCancelled == true && interactive.preservesParentPopover && interactive.scrollLease == nil
+        interactive.text.setSelectedRange(NSRange(location: 0, length: 2))
+        let readPosition = interactive.scroll.contentView.bounds.origin
+        interactive.update(detail: appended, title: "保持阅读")
+        results["task_hover_interactive_popup_keeps_selection_and_scroll"] = interactive.text.selectedRange().length == 2 && interactive.scroll.contentView.bounds.origin == readPosition
+        let textMenu = NSMenu(), textSubmenu = NSMenu()
+        NotificationCenter.default.post(name: NSMenu.didBeginTrackingNotification, object: textMenu)
+        NotificationCenter.default.post(name: NSMenu.didBeginTrackingNotification, object: textSubmenu)
+        NotificationCenter.default.post(name: NSMenu.didEndTrackingNotification, object: textSubmenu)
+        interactive.pointerLocation = { NSPoint(x: -100000, y: -100000) }; interactive.panelExited()
+        let menuPosition = interactive.scroll.contentView.bounds.origin
+        interactive.advanceScroll(elapsed: 1)
+        results["task_hover_text_context_menu_keeps_popup_and_pauses_scroll"] = interactive.menuTracking && interactive.isVisible
+            && interactive.scroll.contentView.bounds.origin == menuPosition && interactive.preservesParentPopover
+        NotificationCenter.default.post(name: NSMenu.didEndTrackingNotification, object: textMenu)
+        results["task_hover_menu_end_releases_outside_popup_with_bounded_hide"] = !interactive.menuTracking && interactive.hideWork != nil
+        interactive.text.selectionTrackingChanged?(true)
+        results["task_hover_text_drag_keeps_parent_only_for_actual_selection_tracking"] = interactive.selectingText && interactive.preservesParentPopover
+        interactive.text.selectionTrackingChanged?(false)
+        results["task_hover_pointer_outside_after_drag_cannot_stick_to_previous_event"] = !interactive.selectingText && !interactive.preservesParentPopover && !interactive.overPanel && interactive.hideWork != nil
+        let staleHide = interactive.hideWork
+        interactive.pointerLocation = { nil }
+        interactive.hover(threadID: "second", title: "第二个任务", anchor: anchor, provider: { messages }, onOpen: { opened.append("second") })
+        interactive.showNow(); staleHide?.perform()
+        results["task_hover_previous_hide_cannot_dismiss_replacement_task"] = interactive.isVisible && interactive.activeThreadID == "second" && interactive.currentBody.contains("可见回复")
+        interactive.openCodexButton.performClick(nil); interactive.openCodexButton.performClick(nil)
+        results["task_hover_navigation_opens_only_current_task_once_and_releases_preview"] = opened == ["second"] && !interactive.isVisible
+            && interactive.openAction == nil && interactive.activeThreadID == nil && interactive.text.string.isEmpty
+        results["task_hover_hiding_releases_all_preview_activity"] = interactive.refreshLease == nil && interactive.scrollLease == nil
+            && !interactive.openCodexButton.isEnabled && interactive.showWork?.isCancelled == true
+        interactive.hover(threadID: "third", title: "失焦释放", anchor: anchor, provider: { reading }, onOpen: { opened.append("third") })
+        interactive.showNow()
+        let focusedPoint = NSPoint(x: interactive.panel!.frame.midX, y: interactive.panel!.frame.midY)
+        interactive.pointerLocation = { focusedPoint }; _ = interactive.reconcilePointer(screenPoint: focusedPoint)
+        NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
+        interactive.openCodexButton.performClick(nil)
+        results["task_hover_app_deactivation_releases_visible_preview_jobs_and_navigation"] = !interactive.isVisible && !interactive.isEngaged
+            && interactive.refreshLease == nil && interactive.scrollLease == nil && interactive.openAction == nil
+            && !interactive.openCodexButton.isEnabled && !interactive.preservesParentPopover && opened == ["second"]
         return results
     }
 

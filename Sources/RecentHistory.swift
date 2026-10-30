@@ -845,7 +845,7 @@ private final class CueRunningRowButton: NSButton {
     }
 }
 
-final class CueStatusPopoverController: NSViewController {
+final class CueStatusPopoverController: NSViewController, NSPopoverDelegate, NSMenuDelegate {
     let history: CueRecentHistory
     let actions: CueStatusPopoverActions
     private let scroll = NSScrollView()
@@ -870,6 +870,7 @@ final class CueStatusPopoverController: NSViewController {
     private var connectionState = "legacy"
     private var showConnectionAction: Bool?
     private let hoverController = CueTaskHoverController()
+    private var rowMenuTracking = false
     private var batchMode = false
     private var selectedThreads = Set<String>()
     private var batchTargets: [String: CueBatchTarget] = [:]
@@ -989,13 +990,32 @@ final class CueStatusPopoverController: NSViewController {
     override func viewDidDisappear() { super.viewDidDisappear(); presentationManaged = true; if embedded { embeddedActive = false }; stopObservation() }
     deinit { pointerLease?.cancel(); elapsedLease?.cancel(); if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) } }
 
+    // A transient status popover must not treat its interactive child preview
+    // as an outside click. Explicit close/navigation still invalidates both.
+    func popoverShouldClose(_ popover: NSPopover) -> Bool {
+        !hoverController.preservesParentPopover
+    }
+    func popoverWillClose(_ notification: Notification) {
+        pointerAnchor = nil; hoverController.hide(); sideChatsController.close()
+    }
+    func menuWillOpen(_ menu: NSMenu) {
+        rowMenuTracking = true; pointerAnchor = nil; hoverController.hide()
+    }
+    func menuDidClose(_ menu: NSMenu) {
+        rowMenuTracking = false; pointerAnchor = nil
+    }
+
     /// Status-item popovers can be visible while Codex remains the active app.
     /// Tracking is activeAlways, and this geometry check also handles a pointer
     /// already inside a row when a non-key popover first appears or scrolls.
     private func reconcilePointerHover() {
         if pendingStructure && !batchMode && !hoverController.isEngaged && !sideChatsController.isShown && workVisible { pendingStructure = false; renderCurrentState() }
-        guard (!embedded || embeddedActive), !batchMode, !sideChatsController.isShown, isViewLoaded, let window = view.window, window.isVisible, let document = recentDocument,
+        guard (!embedded || embeddedActive), !batchMode, !rowMenuTracking, !sideChatsController.isShown, isViewLoaded, let window = view.window, window.isVisible, let document = recentDocument,
               let screenPoint = pointerLocation() else { return }
+        if hoverController.reconcilePointer(screenPoint: screenPoint) || hoverController.preservesParentPopover {
+            pointerAnchor = nil
+            return
+        }
         let point = window.convertPoint(fromScreen: screenPoint)
         let clipPoint = scroll.contentView.convert(point, from: nil)
         let inViewport = scroll.contentView.bounds.contains(clipPoint)
@@ -1466,6 +1486,18 @@ final class CueStatusPopoverController: NSViewController {
         stable.update(status: "悬停后台更新", enabled: true, soundEnabled: true, paused: false, runningTasks: [], taskDetails: ["new-background": completed])
         let afterHoverRow = stable.recentDocument?.subviews.compactMap { $0 as? CueRunningRowButton }.first { $0.task.threadID == "new-background" }
         results["hover_background_refresh_preserves_row_identity_and_preview"] = hoverRow != nil && hoverRow === afterHoverRow && stable.hoverController.isVisible
+        let visibleHover = NSApplication.shared.windows.first { $0.isVisible && $0.className.contains("CueTaskHoverPanel") }
+        if let visibleHover {
+            let tipPoint = NSPoint(x: visibleHover.frame.midX, y: visibleHover.frame.midY)
+            let parentBefore = stable.pointerAnchor
+            stable.pointerLocation = { tipPoint }; stable.reconcilePointerHover()
+            results["status_pointer_over_preview_never_selects_underlying_task_row"] = parentBefore != nil && stable.pointerAnchor == nil && stable.hoverController.isVisible
+        } else { results["status_pointer_over_preview_never_selects_underlying_task_row"] = false }
+        let rowMenu = stable.navigationContextMenu(running("new-background").ephemeralCueEvent)
+        stable.menuWillOpen(rowMenu)
+        results["status_row_context_menu_hides_preview_and_suppresses_new_hover"] = !stable.hoverController.isVisible && stable.rowMenuTracking && rowMenu.delegate === stable
+        stable.menuDidClose(rowMenu)
+        results["status_row_menu_end_restores_pointer_discovery_without_a_new_timer"] = !stable.rowMenuTracking && stable.pointerAnchor == nil
         let observedMetadata = hoverRow?.subviews.compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == "row-metadata" }
         if let hoverRow { hoverRow.refresh(task: running("new-background"), detail: hoverDetail) }
         results["running_partial_time_labels_observation_start"] = observedMetadata?.stringValue.contains("观测起点") == true
@@ -1648,12 +1680,19 @@ final class CueStatusPopoverController: NSViewController {
         results["running_unread_shortcut_pins_workflow_without_fake_completion"] = quickUnread?.unread == true && quickUnread?.isPinned == true && quickHistory.records.count == 1 && quickLocal == 0
         let pinnedQuickRow = quick.recentDocument!.subviews.compactMap { $0 as? CueRunningRowButton }.first { $0.task.threadID == "quick-running" }
         results["already_unread_shortcut_is_visible_and_disabled"] = quickButton(pinnedQuickRow, "unread")?.isEnabled == false && quickButton(pinnedQuickRow, "unread")?.isHidden == false
+        let hoverCallbacks = quickRows.compactMap { quick.hoverNavigation(for: $0) }
+        let beforeHoverNavigation = quickExternal.count
+        hoverCallbacks.forEach { $0() }
+        results["hover_codex_navigation_targets_each_row_kind_without_local_viewer"] = hoverCallbacks.count == 4
+            && Set(quickExternal.dropFirst(beforeHoverNavigation)) == ["quick-history-thread", "quick-running", "quick-interrupted", "quick-follow"] && quickLocal == 0
         quick.toggleBatchMode()
         results["batch_mode_hides_row_actions_and_preserves_checkbox_hits"] = quick.recentDocument!.subviews.filter { $0 is CueRecentRowButton || $0 is CueRunningRowButton }.allSatisfy { $0.subviews.compactMap { $0 as? CueRowQuickButton }.allSatisfy(\.isHidden) }
         results["batch_mode_omits_hidden_actions_from_accessibility"] = quick.recentDocument!.subviews.filter { $0 is CueRecentRowButton || $0 is CueRunningRowButton }.allSatisfy { $0.accessibilityChildren()?.isEmpty == true }
         let callsBeforeBatch = quickExternal.count
         quickButton(quickReminder, "open-codex")?.invoke?()
         results["stale_quick_actions_do_nothing_in_batch_mode"] = quickExternal.count == callsBeforeBatch && quickLocal == 0
+        hoverCallbacks.forEach { $0() }
+        results["stale_hover_navigation_cannot_open_tasks_after_batch_mode_begins"] = quickExternal.count == callsBeforeBatch && quickLocal == 0
         results.merge(CueSideChat.validationReport()) { _, next in next }
         results.merge(CueSideChatsPopoverController.validationReport()) { _, next in next }
         let sideHistory = CueRecentHistory(home: home.appendingPathComponent("side-chats"))
@@ -1908,7 +1947,8 @@ final class CueStatusPopoverController: NSViewController {
         return menu
     }
     private func navigationContextMenu(_ event: CueEvent, followup: CueThreadFollowup? = nil, includePin: Bool = true) -> NSMenu {
-        let menu = NSMenu(); menu.autoenablesItems = false
+        hoverController.hide(); pointerAnchor = nil
+        let menu = NSMenu(); menu.delegate = self; menu.autoenablesItems = false
         @discardableResult func item(_ title: String, _ action: Selector, value: Any? = nil) -> NSMenuItem {
             let next = NSMenuItem(title: title, action: action, keyEquivalent: ""); next.target = self
             next.representedObject = value ?? event; menu.addItem(next); return next
@@ -2261,11 +2301,31 @@ final class CueStatusPopoverController: NSViewController {
         }
     }
     private func hover(_ inside: Bool, threadID: String, title: String, row: NSView) {
-        guard !sideChatsController.isShown else { hoverController.hide(); return }
+        guard !rowMenuTracking, !sideChatsController.isShown else { hoverController.hide(); return }
         if inside {
+            // Preview windows can overlap the list on smaller displays. A
+            // row underneath the popup must not replace the popup's target.
+            if let point = pointerLocation(), hoverController.reconcilePointer(screenPoint: point) || hoverController.preservesParentPopover {
+                pointerAnchor = nil; return
+            }
             pointerAnchor = row
-            hoverController.hover(threadID: threadID, title: title, anchor: row, provider: { [weak self] in self?.taskDetails[threadID] })
-        } else { if pointerAnchor === row { pointerAnchor = nil }; hoverController.leaveRow() }
+            hoverController.hover(threadID: threadID, title: title, anchor: row,
+                                  provider: { [weak self] in self?.taskDetails[threadID] }, onOpen: hoverNavigation(for: row))
+        } else {
+            guard pointerAnchor === row else { return }
+            pointerAnchor = nil; hoverController.leaveRow()
+        }
+    }
+    private func hoverNavigation(for row: NSView) -> (() -> Void)? {
+        let event = (row as? CueRecentRowButton)?.record.event
+            ?? (row as? CueRunningRowButton).map { $0.followup?.event ?? $0.task.ephemeralCueEvent }
+        guard let event, event.provider == "codex",
+              CueBatchTarget(threadID: event.threadID, title: event.title, provider: event.provider) != nil else { return nil }
+        return { [weak self] in
+            guard let self, !self.batchMode, !self.rowMenuTracking else { return }
+            self.pointerAnchor = nil; self.hoverController.hide()
+            self.actions.openInCodex(event)
+        }
     }
     private func select(id: String) {
         selectedID = id

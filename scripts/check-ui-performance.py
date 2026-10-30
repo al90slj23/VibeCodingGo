@@ -11,8 +11,8 @@ root = Path(__file__).resolve().parents[1]
 app = root / 'build/VibeCoding Go.app'
 info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 version = tuple(int(value) for value in info['CFBundleShortVersionString'].split('.'))
-if info.get('CFBundleIdentifier') != 'local.vibecue' or version < (0, 34, 0):
-    raise SystemExit('Build VibeCoding Go 0.34.0 or newer before running this check.')
+if info.get('CFBundleIdentifier') != 'local.vibecue' or version < (0, 34, 1):
+    raise SystemExit('Build VibeCoding Go 0.34.1 or newer before running this check.')
 with tempfile.TemporaryDirectory(prefix='vcgo-ui-contract-') as home:
     env = os.environ.copy()
     env['VIBECUE_HOME'] = home
@@ -37,4 +37,12 @@ with tempfile.TemporaryDirectory(prefix='vcgo-ui-contract-') as home:
     page_failed = [key for key, value in page_checks.items() if value is not True]
     print(json.dumps({'resident_page_checks': len(page_checks), 'failed': page_failed,
                       'report': str(page_output)}, ensure_ascii=False))
-    raise SystemExit(run.returncode or pages.returncode or bool(failed) or bool(page_failed))
+    preview = subprocess.run([str(app / 'Contents/MacOS/VCGo'), '--task-preview-self-test'],
+                             env=env, capture_output=True, text=True, timeout=30)
+    preview_checks = json.loads(preview.stdout)
+    preview_output = root / 'build/vcgo-task-preview-validation.json'
+    preview_output.write_text(json.dumps(preview_checks, ensure_ascii=False, indent=2) + '\n')
+    preview_failed = [key for key, value in preview_checks.items() if value is not True]
+    print(json.dumps({'task_preview_checks': len(preview_checks), 'failed': preview_failed,
+                      'report': str(preview_output)}, ensure_ascii=False))
+    raise SystemExit(run.returncode or pages.returncode or preview.returncode or bool(failed) or bool(page_failed) or bool(preview_failed))
