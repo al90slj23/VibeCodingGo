@@ -3,9 +3,8 @@ import WebKit
 
 /// LSUIElement apps still need a real Edit menu for the AppKit responder chain.
 enum CueEditingMenu {
-    static func install() {
+    static func install(workspaceTarget: AnyObject? = nil, workspaceAction: Selector? = nil) {
         let main = NSApp.mainMenu ?? NSMenu()
-        guard !main.items.contains(where: { $0.identifier?.rawValue == "vibecue.edit-menu" }) else { return }
         if main.items.isEmpty {
             let application = NSMenuItem(title: "VibeCoding Go", action: nil, keyEquivalent: "")
             let menu = NSMenu(title: "VibeCoding Go")
@@ -14,6 +13,17 @@ enum CueEditingMenu {
             menu.addItem(withTitle: "退出 VibeCoding Go", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             application.submenu = menu; main.addItem(application)
         }
+        if let workspaceTarget, let workspaceAction,
+           !main.items.contains(where: { $0.identifier?.rawValue == "workspace.navigation-menu" }) {
+            let navigation = NSMenuItem(title: "工作台", action: nil, keyEquivalent: "")
+            navigation.identifier = NSUserInterfaceItemIdentifier("workspace.navigation-menu")
+            let menu = NSMenu(title: "工作台")
+            let open = NSMenuItem(title: "打开工作台…", action: workspaceAction, keyEquivalent: ",")
+            open.target = workspaceTarget; open.keyEquivalentModifierMask = .command
+            menu.addItem(open); navigation.submenu = menu
+            main.addItem(navigation)
+        }
+        guard !main.items.contains(where: { $0.identifier?.rawValue == "vibecue.edit-menu" }) else { return }
         let item = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
         item.identifier = NSUserInterfaceItemIdentifier("vibecue.edit-menu")
         let edit = NSMenu(title: "编辑")

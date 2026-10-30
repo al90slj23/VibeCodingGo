@@ -333,6 +333,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var muted: Bool { get { !settings.soundEnabled } set { settings.soundEnabled = !newValue } }
     var settingsPanel: CueSettingsController?
     var audioPlayer: AVAudioPlayer?
+    let soundPreparation = CueSoundPreparation()
+    var lastSoundPreparationMs = 0.0
+    var lastSoundPreparedOnMainThread = false
     var lastSound = ""
     var lastSoundPlayStarted = false
     var lastSoundPlayingAfter100ms = false
@@ -382,7 +385,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             NSApp.terminate(nil); return
         }
         ownsLock = true
-        CueEditingMenu.install()
+        CueEditingMenu.install(workspaceTarget: self, workspaceAction: #selector(openWorkbench))
         try? FileManager.default.removeItem(at: home.appendingPathComponent("disabled"))
         if let data = try? Data(contentsOf: home.appendingPathComponent("settings.json")),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -501,7 +504,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         _ = recentHistory.resolve(id: resolution.targetID)
         recent = recentHistory.events
         if let current, ["permission", "input"].contains(current.kind), current.id == resolution.targetID {
-            audioPlayer?.stop(); hideWindows(); self.current = nil
+            stopAudio(); hideWindows(); self.current = nil
         }
         refreshMenu(); writeStatus()
         if resume, current == nil, pausedUntil == nil { showNext() }
@@ -523,7 +526,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         if current?.isPreview == true {
             previewFeedback = "任务提醒优先显示，预览已停止。"
             settingsPanel?.updatePreviewFeedback(previewFeedback)
-            audioPlayer?.stop(); hideWindows(); current = nil
+            stopAudio(); hideWindows(); current = nil
         }
         // Keep the latest state per conversation while preserving other conversations.
         if !event.threadID.isEmpty { pending.removeAll { $0.threadID == event.threadID } }
@@ -564,7 +567,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             return finish("已保存选择，右侧可查看样例。真实任务提醒正在显示或排队，稍后可再次预览。")
         }
         if current?.isPreview == true { hideWindows(); current = nil }
-        audioPlayer?.stop()
+        stopAudio()
         previewComponent = component
         if component == "sound" {
             playChime(kind: kind, name: settings.soundName(for: kind))
@@ -600,22 +603,29 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     func makeWindows(for event: CueEvent) {
         if resolvedEventID != event.id { resolveStyles(for: event, reroll: true) }
         guard presentsWindows else { return }
-        edges.forEach { $0.close() }; edges.removeAll(); edgeViews.removeAll()
+        edgeViews.forEach { $0.finish() }; edges.forEach { $0.close() }; edges.removeAll(); edgeViews.removeAll()
         banner?.close(); banner = nil
         let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
         let screens = settings.allDisplays ? NSScreen.screens : targetScreen.map { [$0] } ?? []
         let showEdges = settings.glowEnabled && (!event.isPreview || previewComponent != "card")
+        let visual = resolvedVisualStyle(for: event)
         for screen in showEdges ? screens : [] {
-            let panel = CuePanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            configure(panel, clickThrough: true)
-            let glow = CueEdgeEffectView(frame: NSRect(origin: .zero, size: screen.frame.size), style: resolvedVisualStyle(for: event))
-            glow.displayDuration = event.isPreview ? Self.previewDuration : settings.duration(event.kind)
-            glow.advance(to: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : Date().timeIntervalSince(shownAt))
-            panel.contentView = glow
-            edgeViews.append(glow)
-            panel.alphaValue = settings.glowIntensity
-            panel.orderFrontRegardless()
-            edges.append(panel)
+            // Small, non-overlapping edge surfaces avoid a full-screen
+            // transparent drawable/compositing pass over video and other apps.
+            for viewport in CueEdgeEffectView.edgeViewports(size: screen.frame.size, style: visual) {
+                let frame = viewport.offsetBy(dx: screen.frame.minX, dy: screen.frame.minY)
+                let panel = CuePanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+                configure(panel, clickThrough: true)
+                let glow = CueEdgeEffectView(frame: NSRect(origin: .zero, size: viewport.size), style: visual,
+                                             canvasSize: screen.frame.size, viewportOrigin: viewport.origin)
+                glow.displayDuration = event.isPreview ? Self.previewDuration : settings.duration(event.kind)
+                panel.contentView = glow
+                glow.advance(to: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : Date().timeIntervalSince(shownAt))
+                edgeViews.append(glow)
+                panel.alphaValue = settings.glowIntensity
+                panel.orderFrontRegardless()
+                edges.append(panel)
+            }
         }
         if event.isPreview && previewComponent == "effect" { startEffectClock(); return }
         guard let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main else { return }
@@ -665,6 +675,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                 self.writeStatus()
             }
         }
+        pulseTimer?.tolerance = 0.15 / fps
         RunLoop.main.add(pulseTimer!, forMode: .common)
     }
 
@@ -680,8 +691,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func hideWindows() {
         pulseTimer?.invalidate(); pulseTimer = nil; effectFrameRate = 0
+        soundPreparation.cancel()
         hideTimer?.invalidate(); hideTimer = nil
-        edges.forEach { $0.close() }; edges.removeAll(); edgeViews.removeAll()
+        edgeViews.forEach { $0.finish() }; edges.forEach { $0.close() }; edges.removeAll(); edgeViews.removeAll()
         if let panel = banner {
             panel.ignoresMouseEvents = true
             if shuttingDown || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { panel.close() }
@@ -836,52 +848,58 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
     @objc func toggleMute() {
         muted.toggle(); saveSettings()
-        if muted { audioPlayer?.stop() }
+        if muted { stopAudio() }
         refreshMenu(); settingsPanel?.rebuild(); writeStatus()
     }
 
-    func playChime(kind: String, name: String) {
+    func stopAudio() {
+        soundPreparation.cancel()
         audioPlayer?.stop()
+        audioPlayer = nil
+    }
+
+    func playChime(kind: String, name: String) {
+        stopAudio()
         let selectedSound = CueResolvedSelection(fields: settings.eventStyles[kind] ?? [:]).fields["sound"] ?? kind
         let token = current?.kind == kind && resolvedEventID == current?.id ? (resolvedFields["sound"] ?? kind) : selectedSound
+        let eventID = current?.id
         lastPlayedSoundToken = token
         lastSound = token.hasPrefix("custom:") ? "自选音效" : token == "silent" ? "静音" : CueSoundCatalog.displayName(id: token)
         lastSoundPlayStarted = false; lastSoundPlayingAfter100ms = false
         lastSoundPath = ""; lastSoundPeakDBFS = -160; lastSoundPlaybackTime = 0
+        lastSoundPreparationMs = 0; lastSoundPreparedOnMainThread = false
         lastSoundFinished = false; lastSoundFinishSucceeded = false; lastSoundError = ""
-        guard settings.enabled, pausedUntil == nil, !muted, token != "silent" else { writeStatus(); return }
-        do {
-            let path: URL
-            if token.hasPrefix("custom:") {
-                guard CueSettings.validSoundToken(token) else { throw NSError(domain: "VibeCueAudio", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid custom sound selection"]) }
-                path = home.appendingPathComponent("sounds/custom", isDirectory: true).appendingPathComponent(String(token.dropFirst(7)))
-                let properties = try path.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-                guard properties.isRegularFile == true, properties.isSymbolicLink != true else { throw NSError(domain: "VibeCueAudio", code: 4, userInfo: [NSLocalizedDescriptionKey: "Custom sound is unavailable"]) }
-            } else {
-                path = try CueChime.write(kind: token, directory: home.appendingPathComponent("sounds", isDirectory: true))
-            }
-            lastSoundPath = path.path
-            let player = try AVAudioPlayer(contentsOf: path)
-            player.volume = Float(settings.soundVolume)
-            player.isMeteringEnabled = true
-            player.delegate = self
-            audioPlayer = player // Retain until playback completes or a new chime replaces it.
-            guard player.prepareToPlay() else { throw NSError(domain: "VibeCueAudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "Audio output preparation failed"]) }
-            lastSoundPlayStarted = player.play()
-            lastSoundOutputDevice = player.currentDevice ?? "system-default"
-            if !lastSoundPlayStarted { lastSoundError = "AVAudioPlayer.play returned false" }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self, weak player] in
-                guard let self, let player, self.audioPlayer === player else { return }
-                player.updateMeters()
-                self.lastSoundPlayingAfter100ms = player.isPlaying
-                self.lastSoundPlaybackTime = player.currentTime
-                self.lastSoundPeakDBFS = player.peakPower(forChannel: 0)
+        guard settings.enabled, pausedUntil == nil, !muted, token != "silent", !shuttingDown else { writeStatus(); return }
+        soundPreparation.prepare(kind: token, customDirectory: home.appendingPathComponent("sounds/custom", isDirectory: true),
+                                 volume: Float(settings.soundVolume)) { [weak self] result in
+            guard let self, !self.shuttingDown, self.settings.enabled, self.pausedUntil == nil, !self.muted,
+                  self.current?.id == eventID, self.lastPlayedSoundToken == token else { return }
+            switch result {
+            case .success(let prepared):
+                let player = prepared.player
+                player.volume = Float(self.settings.soundVolume)
+                player.delegate = self
+                self.audioPlayer = player
+                self.lastSoundPath = prepared.sourcePath
+                self.lastSoundPreparationMs = prepared.preparationMilliseconds
+                self.lastSoundPreparedOnMainThread = prepared.wasPreparedOnMainThread
+                self.lastSoundPlayStarted = player.play()
                 self.lastSoundOutputDevice = player.currentDevice ?? "system-default"
-                self.writeStatus()
+                if !self.lastSoundPlayStarted { self.lastSoundError = "AVAudioPlayer.play returned false" }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self, weak player] in
+                    guard let self, let player, self.audioPlayer === player else { return }
+                    player.updateMeters()
+                    self.lastSoundPlayingAfter100ms = player.isPlaying
+                    self.lastSoundPlaybackTime = player.currentTime
+                    self.lastSoundPeakDBFS = player.peakPower(forChannel: 0)
+                    self.lastSoundOutputDevice = player.currentDevice ?? "system-default"
+                    self.writeStatus()
+                }
+            case .failure(let error):
+                self.lastSoundError = error.localizedDescription
+                fputs("VibeCoding Go: audio playback failed: \(error.localizedDescription)\n", stderr)
             }
-        } catch {
-            lastSoundError = error.localizedDescription
-            fputs("VibeCoding Go: audio playback failed: \(error.localizedDescription)\n", stderr)
+            self.writeStatus()
         }
         writeStatus()
     }
@@ -910,7 +928,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
     @objc func togglePause() {
         pausedUntil = pausedUntil == nil ? Date().addingTimeInterval(1800) : nil
-        audioPlayer?.stop()
+        stopAudio()
         pending.removeAll(); hideWindows(); current = nil
         refreshMenu(); settingsPanel?.updateHealth(updateTasks: false); writeStatus()
     }
@@ -1203,7 +1221,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func applySettings(updateCurrent: Bool = true) {
         saveSettings()
-        if muted || !settings.enabled || pausedUntil != nil { audioPlayer?.stop() }
+        if muted || !settings.enabled || pausedUntil != nil { stopAudio() }
         audioPlayer?.volume = Float(settings.soundVolume)
         pending.removeAll { !settings.allows($0) }
         if let current, updateCurrent || current.isPreview {
@@ -1218,7 +1236,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
                     self.dismissCurrent()
                 }
                 RunLoop.main.add(hideTimer!, forMode: .common)
-            } else { audioPlayer?.stop(); hideWindows(); self.current = nil }
+            } else { stopAudio(); hideWindows(); self.current = nil }
         }
         refreshMenu(); writeStatus()
         if current == nil, pausedUntil == nil { showNext() }
@@ -1505,6 +1523,11 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "current_color": current.map { settings.color(for: $0.kind).cueHex } ?? "",
             "effect_frame_rate": effectFrameRate,
             "effect_render_ms": edgeViews.map { $0.lastRenderDuration * 1000 },
+            "effect_render_timing_scope": "gpu-execution-or-static-fallback",
+            "effect_backends": edgeViews.map(\.renderBackend),
+            "effect_submission_ms": edgeViews.map { $0.lastSubmissionDuration * 1000 },
+            "effect_submitted_frames": edgeViews.map(\.submittedFrameCount),
+            "effect_coalesced_frames": edgeViews.map(\.skippedFrameCount),
             "effect_rendered_frames": edgeViews.map(\.renderedFrameCount),
             "preview_duration": Self.previewDuration,
             "edge_windows": edges.map { ["visible": $0.isVisible, "level": $0.level.rawValue, "alpha": $0.alphaValue, "frame": NSStringFromRect($0.frame)] as [String: Any] },
@@ -1518,6 +1541,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "selected_sound": lastPlayedSoundToken,
             "edge_count": edges.count, "last_sound": lastSound, "sound_play_started": lastSoundPlayStarted,
             "audio_backend": "AVAudioPlayer", "sound_is_playing": audioPlayer?.isPlaying ?? false,
+            "sound_preparation_ms": lastSoundPreparationMs, "sound_prepared_on_main_thread": lastSoundPreparedOnMainThread,
             "sound_is_playing_after_100ms": lastSoundPlayingAfter100ms, "sound_path": lastSoundPath,
             "sound_peak_dbfs": lastSoundPeakDBFS, "sound_playback_time": lastSoundPlaybackTime,
             "sound_output_device_uid": lastSoundOutputDevice, "sound_finished": lastSoundFinished,
@@ -1550,9 +1574,12 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     }
 
     func captureGlow(to path: String) {
-        guard let view = edges.first?.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        if let data = rep.representation(using: .png, properties: [:]) { try? data.write(to: URL(fileURLWithPath: path)) }
+        guard let view = edgeViews.first else { return }
+        CueEffectGPU.exportPNG(style: view.style, canvasSize: view.canvasSize, time: view.elapsed,
+                               duration: view.displayDuration, reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+                               to: URL(fileURLWithPath: path)) { success in
+            if !success { fputs("VibeCoding Go: effect export was unavailable\n", stderr) }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -2528,6 +2555,14 @@ if let index = CommandLine.arguments.firstIndex(of: "--ccswitch-system-action"),
     exit(0)
 }
 
+if CommandLine.arguments.contains("--effects-gpu-self-test") {
+    _ = NSApplication.shared
+    let report = CueEffectGPU.renderingValidationReport()
+    print(String(data: try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]), encoding: .utf8)!)
+    let checks = report["checks"] as? [String: Bool] ?? [:]
+    exit(!checks.isEmpty && checks.values.allSatisfy { $0 } ? 0 : 1)
+}
+
 if CommandLine.arguments.contains("--ui-performance-measure") {
     _ = NSApplication.shared
     var checks = CueActivityScheduler.validationReport()
@@ -2539,6 +2574,8 @@ if CommandLine.arguments.contains("--ui-performance-measure") {
     checks.merge(CueEngineeringMaintenanceMonitor.validationReport()) { _, new in new }
     checks.merge(CueUsageClient.networkEnvironmentValidationReport()) { _, new in new }
     checks.merge(CueNetworkTestsController.validationReport()) { _, new in new }
+    checks.merge(CueSoundPreparation.validationReport()) { _, new in new }
+    checks.merge(CueEffectGPU.invariantReport()) { _, new in new }
     checks.merge(CueSettingsController.engineeringNavigationValidationReport()) { _, new in new }
     let measurement = CueStatusPopoverController.performanceMeasurement()
     checks["unchanged_list_does_not_rebuild"] = measurement["diff_rebuilds"] as? Int == 0
@@ -2662,9 +2699,13 @@ if CommandLine.arguments.contains("--window-preview-self-test") {
     DispatchQueue.main.async {
         _ = cue.preview(kind: "complete", component: "effect")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            results["edge_panels_visible_on_all_screens"] = cue.edges.count == NSScreen.screens.count && !cue.edges.isEmpty && cue.edges.allSatisfy(\.isVisible)
+            results["edge_panels_visible_on_all_screens"] = cue.edges.count == NSScreen.screens.count * 4 && !cue.edges.isEmpty && cue.edges.allSatisfy(\.isVisible)
             results["edge_panels_above_menu_and_dock"] = cue.edges.allSatisfy { $0.level.rawValue > NSWindow.Level.statusBar.rawValue && $0.level.rawValue < NSWindow.Level.screenSaver.rawValue }
-            results["edge_panels_cover_screen_frames"] = zip(cue.edges, NSScreen.screens).allSatisfy { $0.frame == $1.frame }
+            results["edge_panels_cover_only_screen_edges"] = NSScreen.screens.allSatisfy { screen in
+                let panels = cue.edges.filter { screen.frame.contains($0.frame) }
+                let area = panels.reduce(CGFloat(0)) { $0 + $1.frame.width * $1.frame.height }
+                return panels.count == 4 && area < screen.frame.width * screen.frame.height * 0.55
+            }
             results["edge_clock_advances_after_fade_in"] = cue.effectFrameRate > 0 && cue.edgeViews.allSatisfy { $0.elapsed > 0.4 }
             results["lighting_material_actually_renders"] = cue.edgeViews.allSatisfy { $0.renderedFrameCount > 1 && $0.lastRenderDuration > 0 }
             results["recommended_line_has_readable_width"] = CueEffectCatalog.preset(id: "luminous-flow").recipe.layers.contains { $0.minimumWidth >= 1 }

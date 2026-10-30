@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import QuartzCore
 
 struct CueEffectTag { let id: String; let name: String }
 enum CueEffectPath { case perimeter, topEdge, corners }
@@ -680,30 +681,135 @@ private struct CueEffectRenderer {
 }
 
 final class CueEdgeEffectView: NSView {
-    var style: CueVisualStyle { didSet { needsDisplay = true } }
+    var style: CueVisualStyle { didSet { fallbackKey=nil; requestFrame() } }
     var elapsed: TimeInterval = 0
     var displayDuration: TimeInterval?
+    let canvasSize: NSSize
+    let viewportOrigin: NSPoint
     private(set) var lastRenderDuration: TimeInterval = 0
     private(set) var renderedFrameCount = 0
+    private(set) var renderBackend = "preparing"
+    private(set) var lastSubmissionDuration: TimeInterval = 0
+    private(set) var submittedFrameCount = 0
+    private(set) var skippedFrameCount = 0
+    private var frameDriver: CueEffectGPUFrameDriver?
+    private var fallbackKey: String?
+    private var fallbackPreparing = false
+    private var retired = false
+    private var pipelineReady = false
+    private var metalSurface: CAMetalLayer?
     override var isOpaque: Bool { false }
-    init(frame: NSRect, style: CueVisualStyle) {
-        self.style = style; super.init(frame: frame); wantsLayer = true; layer?.backgroundColor = NSColor.clear.cgColor
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {}
+    init(frame: NSRect, style: CueVisualStyle, canvasSize: NSSize? = nil, viewportOrigin: NSPoint = .zero) {
+        self.style = style; self.canvasSize=canvasSize ?? frame.size; self.viewportOrigin=viewportOrigin
+        super.init(frame: frame); wantsLayer=true; layer?.backgroundColor=NSColor.clear.cgColor
+        CueEffectGPU.shared.prepare { [weak self] context in
+            DispatchQueue.main.async {
+                guard let self, !self.retired else { return }
+                self.pipelineReady=true
+                if let context {
+                    let metal=CAMetalLayer(); metal.device=context.device; metal.pixelFormat = .bgra8Unorm
+                    metal.isOpaque=false; metal.backgroundColor=NSColor.clear.cgColor; metal.framebufferOnly=true
+                    metal.colorspace=CGColorSpace(name:CGColorSpace.sRGB)
+                    metal.maximumDrawableCount=2; metal.allowsNextDrawableTimeout=true; metal.presentsWithTransaction=false
+                    metal.actions=["contents":NSNull(),"bounds":NSNull(),"position":NSNull()]
+                    self.layer=metal; self.metalSurface=metal
+                    self.frameDriver=CueEffectGPUFrameDriver(layer:metal,context:context); self.renderBackend="metal"
+                } else { self.renderBackend="static-fallback" }
+                self.requestFrame()
+            }
+        }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    deinit { frameDriver?.cancel() }
+    func finish() { retired=true; frameDriver?.cancel(); frameDriver=nil }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); requestFrame() }
+    override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); requestFrame() }
+    override func layout() { super.layout(); requestFrame() }
     func advance(to time: TimeInterval) {
-        let next = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : max(0, time)
-        guard abs(next - elapsed) >= 1.0 / 32.0 else { return }
-        elapsed = next; needsDisplay = true
+        let next=NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : max(0,time)
+        guard abs(next-elapsed)>=1.0/32.0 else { return }
+        elapsed=next; requestFrame()
+    }
+    private func requestFrame() {
+        guard !retired, pipelineReady, bounds.width>0, bounds.height>0 else { return }
+        let reduced=NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if let frameDriver, let metal=metalSurface {
+            // Backing size changes are main-thread metadata work only. Drawable
+            // acquisition and all encoding stay on the driver's utility queue.
+            let scale=window?.backingScaleFactor ?? 2
+            let pixels=CGSize(width:max(1,ceil(bounds.width*scale)),height:max(1,ceil(bounds.height*scale)))
+            if metal.drawableSize != pixels { metal.drawableSize=pixels; metal.contentsScale=scale }
+            let submittedAt=ProcessInfo.processInfo.systemUptime
+            let values=CueEffectGPU.uniforms(style:style,canvas:canvasSize,origin:viewportOrigin,viewport:bounds.size,time:elapsed,duration:displayDuration,reduceMotion:reduced)
+            let accepted=frameDriver.submit(values) { [weak self] duration in
+                guard let self, !self.retired else { return }
+                self.lastRenderDuration=duration; self.renderedFrameCount += 1
+            }
+            lastSubmissionDuration=ProcessInfo.processInfo.systemUptime-submittedAt
+            if accepted { submittedFrameCount += 1 } else { skippedFrameCount += 1 }
+        } else { prepareStaticFallback() }
+    }
+    private func prepareStaticFallback() {
+        // A machine without Metal gets one finite static frame for this style,
+        // never recurring software shading that can stall other applications.
+        let key=style.effectID+style.paletteHex.joined()+String(describing:bounds.size)+String(describing:style.width)
+        guard fallbackKey != key, !fallbackPreparing else { return }
+        fallbackKey=key; fallbackPreparing=true
+        let captured=style, canvas=canvasSize, origin=viewportOrigin, viewport=bounds.size
+        DispatchQueue.global(qos:.utility).async { [weak self] in
+            let start=ProcessInfo.processInfo.systemUptime
+            let rep=Self.croppedBitmap(style:captured,canvasSize:canvas,origin:origin,size:viewport,time:1.35,scale:1)
+            let image=rep.cgImage, duration=ProcessInfo.processInfo.systemUptime-start
+            DispatchQueue.main.async {
+                guard let self, !self.retired else { return }
+                self.fallbackPreparing=false
+                guard self.fallbackKey == key else { self.prepareStaticFallback(); return }
+                self.layer?.contents=image; self.lastRenderDuration=duration; self.renderedFrameCount += 1
+            }
+        }
     }
     override func draw(_ dirtyRect: NSRect) {
-        let started = ProcessInfo.processInfo.systemUptime
-        defer {
-            lastRenderDuration = ProcessInfo.processInfo.systemUptime - started
-            renderedFrameCount += 1
+        // Actual screen frames are owned by the Metal layer. The original
+        // recipe renderer remains available solely for bounded offline previews.
+    }
+    static func edgeViewports(size: NSSize, style: CueVisualStyle) -> [NSRect] {
+        guard size.width>0, size.height>0 else { return [] }
+        let recipe=CueEffectCatalog.preset(id:style.effectID).recipe
+        let width=min(style.width*style.presence.coreScale,min(size.width,size.height)/5)
+        let spill=style.presence.haloSpread(for:width)
+        let inset=style.inset+width*0.6+min(8,spill*0.35)
+        let main=recipe.layers.filter { $0.opacity>=0.25 }, reference=max(0.001,main.map(\.width).max() ?? 1)
+        var reach: CGFloat=0
+        for layer in recipe.layers {
+            let ratio=layer.opacity<0.25 ? min(4,layer.width/reference) : layer.width/reference
+            let line=max(CGFloat(layer.minimumWidth)*style.presence.coreScale,width*ratio)
+            if layer.brush == .ribbon { reach=max(reach,max(min(max(1.15,line*0.70),22*0.68)*2.7,style.presence.haloSpread(for:line))) }
+            else {
+                let wave=layer.brush == .wave ? abs(layer.amplitude) : 0
+                let ripple=layer.brush == .ripple ? 1.1 : 0
+                let offset=width*style.presence.motionScale*(abs(layer.offset)+wave+ripple)
+                reach=max(reach,offset+line*0.65+style.presence.haloSpread(for:min(line,style.width*1.5))+3)
+            }
         }
-        NSColor.clear.setFill(); dirtyRect.fill(using: .copy); NSGraphicsContext.current?.imageInterpolation = .high
-        CueEffectRenderer(style: style, recipe: CueEffectCatalog.preset(id: style.effectID).recipe, time: elapsed,
-                          reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, duration: displayDuration, capture: false).draw(in: bounds)
+        let border=ceil(inset+reach+4)
+        let vertical=min(border,size.height/2), horizontal=min(border,size.width/2)
+        var frames=[NSRect(x:0,y:0,width:size.width,height:vertical),NSRect(x:0,y:size.height-vertical,width:size.width,height:vertical)]
+        if size.height>vertical*2 {
+            frames.append(NSRect(x:0,y:vertical,width:horizontal,height:size.height-vertical*2))
+            frames.append(NSRect(x:size.width-horizontal,y:vertical,width:horizontal,height:size.height-vertical*2))
+        }
+        return frames.filter { $0.width>0 && $0.height>0 }
+    }
+    static func croppedBitmap(style: CueVisualStyle, canvasSize: NSSize, origin: NSPoint, size: NSSize, time: TimeInterval, scale: CGFloat) -> NSBitmapImageRep {
+        let width=max(16,Int(ceil(size.width*scale))), height=max(16,Int(ceil(size.height*scale)))
+        let rep=NSBitmapImageRep(bitmapDataPlanes:nil,pixelsWide:width,pixelsHigh:height,bitsPerSample:8,samplesPerPixel:4,hasAlpha:true,isPlanar:false,colorSpaceName:.deviceRGB,bytesPerRow:width*4,bitsPerPixel:32)!
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current=NSGraphicsContext(bitmapImageRep:rep)!
+        let context=NSGraphicsContext.current!.cgContext
+        context.clear(CGRect(x:0,y:0,width:width,height:height)); context.scaleBy(x:scale,y:scale); context.translateBy(x:-origin.x,y:-origin.y)
+        CueEffectRenderer(style:style,recipe:CueEffectCatalog.preset(id:style.effectID).recipe,time:time,reduceMotion:false,duration:nil,capture:true).draw(in:NSRect(origin:.zero,size:canvasSize))
+        NSGraphicsContext.restoreGraphicsState(); return rep
     }
     static func bitmap(style: CueVisualStyle, size: NSSize, time: TimeInterval, background: Bool) -> NSBitmapImageRep {
         let width = max(16, Int(size.width)), height = max(16, Int(size.height))

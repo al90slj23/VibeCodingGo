@@ -83,3 +83,14 @@ An accepted Globalping measurement ID is retained independently of polling succe
 Report preparation runs on a utility queue and caps the entire Unicode document at 96 KiB. At most six reports are held in memory. Hidden, minimized and occluded completions update cache without applying TextKit. Two window event observers restore the current cache; no new polling timer is registered. Document/layout identities prevent unchanged geometry and idle text layout. The performance snapshot exposes counts and state, not targets or addresses.
 
 The build gate now includes 25 network native fixture invariants and a finite diagnostic termination invariant. Installed --network-self-test includes 47 checks. The 0.32.0 regression run passed 118 focused network tests, 1,022 full Python tests and 134 native/performance checks. Live source/proxy observations and the distinction between offline rendering, installed backend tests and interactive UI acceptance are recorded in [network delivery evidence](network-solid-2026-10-30.md).
+
+
+## Alert rendering and audio preparation (0.33.0)
+
+Visible alert animation uses one shared lazy Metal pipeline, compiled on a utility queue. Each screen owns non-overlapping cropped edge windows and each surface admits at most one frame; a busy surface drops the stale request instead of queueing frames. Drawable acquisition, encoding and submission stay off main. Main-thread parameter delivery is bounded. Retiring a view cancels its gate before closing windows. Reduce Motion is static; Metal unavailability produces one background static fallback, never continuous CPU shading.
+
+The original CPU renderer remains for bounded offline reference thumbnails. Production frame timing now explicitly distinguishes GPU execution from main-thread submission; it must not be compared directly with historical CPU draw timing. Offline GPU self-tests and PNG exports are explicit finite operations, not production readbacks or startup jobs.
+
+CueSoundPreparation owns one utility queue and a latest-only revision. File lookup, bounded decoding/synthesis and prepareToPlay finish before main-thread delivery. Both queued work and main delivery recheck revision; the controller additionally checks event identity, token and enabled/pause/mute/shutdown state. Builtin sounds play cached memory data without recurring WAV writes. Close/replacement invalidates preparation, so an obsolete sound cannot start later.
+
+The build uses project-local external compiler temporary and module-cache paths. PCM caches bind absolute paths: a migrated cache is preserved for compatibility but a new path gets a fresh cache. Do not claim a build-only relocation solves whole-system disk/swap pressure. The finite sampler records CPU deltas and typed renderer counters, excluding message text and network credentials. Current scoped results and system limits are documented in [alert performance evidence](alert-performance-2026-10-30.md).

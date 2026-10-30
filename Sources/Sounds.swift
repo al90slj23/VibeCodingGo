@@ -352,7 +352,7 @@ enum CueSoundCatalog {
             guard let url = preset.systemURL else { return false }
             return url.path.hasPrefix("/System/Library/Sounds/") && FileManager.default.isReadableFile(atPath: url.path)
         }
-        return ["exactly_50_synthesized_presets": synthesizedPresets.count == 50,
+        var checks = ["exactly_50_synthesized_presets": synthesizedPresets.count == 50,
                 "unique_sound_ids": Set(presets.map(\.id)).count == presets.count,
                 "fifty_distinct_audio_signals": hashes.count == 50,
                 "all_non_silent": nonSilent, "no_pcm_clipping": notClipped,
@@ -366,6 +366,147 @@ enum CueSoundCatalog {
                 "source_tags_are_explicit": presets.allSatisfy { !$0.tags.isEmpty && $0.tags.allSatisfy { tag(id: $0) != nil } && !$0.sourceDescription.isEmpty },
                 "system_files_read_from_os_only": systemReadable,
                 "silent_is_separate": !contains(id: "silent")]
+        checks.merge(CueSoundPreparation.validationReport()) { _, new in new }
+        return checks
+    }
+}
+
+/// One finite, latest-only audio preparation owner. Playback and its UI state
+/// remain with the caller; file reads, synthesis, decoding and device preparation
+/// never run on the UI thread. A cancelled/older request cannot start a sound.
+struct CuePreparedSound {
+    let player: AVAudioPlayer
+    let sourcePath: String
+    let preparationMilliseconds: Double
+    let wasPreparedOnMainThread: Bool
+}
+
+final class CueSoundPreparation {
+    private let queue = DispatchQueue(label: "local.vibecue.sound-preparation", qos: .utility)
+    private let lock = NSLock()
+    private var revision: UInt64 = 0
+
+    private func nextRevision() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        revision &+= 1
+        return revision
+    }
+    private func isCurrent(_ expected: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return revision == expected
+    }
+    func cancel() { _ = nextRevision() }
+
+    func prepare(kind: String, customDirectory: URL, volume: Float,
+                 completion: @escaping (Result<CuePreparedSound, Error>) -> Void) {
+        let expected = nextRevision()
+        queue.async { [weak self] in
+            guard let self, self.isCurrent(expected) else { return }
+            let result = Result { try Self.prepareNow(kind: kind, customDirectory: customDirectory, volume: volume) }
+            guard self.isCurrent(expected) else {
+                if case .success(let prepared) = result { prepared.player.stop() }
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCurrent(expected) else {
+                    if case .success(let prepared) = result { prepared.player.stop() }
+                    return
+                }
+                completion(result)
+            }
+        }
+    }
+
+    private static func customSource(kind: String, directory: URL) throws -> URL {
+        let name = String(kind.dropFirst(7))
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\\"),
+              !name.contains("\0"), name == URL(fileURLWithPath: name).lastPathComponent else {
+            throw NSError(domain: "VibeCueAudio", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid custom sound selection"])
+        }
+        let path = directory.appendingPathComponent(name)
+        let properties = try path.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard properties.isRegularFile == true, properties.isSymbolicLink != true,
+              let bytes = properties.fileSize, bytes > 0, bytes <= 20 * 1024 * 1024 else {
+            throw NSError(domain: "VibeCueAudio", code: 4, userInfo: [NSLocalizedDescriptionKey: "Custom sound is unavailable"])
+        }
+        return path
+    }
+
+    private static func prepareNow(kind: String, customDirectory: URL, volume: Float) throws -> CuePreparedSound {
+        let started = ProcessInfo.processInfo.systemUptime
+        let player: AVAudioPlayer
+        let source: String
+        if kind.hasPrefix("custom:") {
+            let path = try customSource(kind: kind, directory: customDirectory)
+            player = try AVAudioPlayer(contentsOf: path); source = path.path
+        } else {
+            guard let preset = CueSoundCatalog.preset(id: kind) else { throw CocoaError(.fileReadNoSuchFile) }
+            if let url = preset.systemURL {
+                player = try AVAudioPlayer(contentsOf: url); source = url.path
+            } else {
+                player = try AVAudioPlayer(data: CueChime.resolvedWaveData(for: preset))
+                source = "memory:" + preset.id
+            }
+        }
+        guard player.duration.isFinite, player.duration > 0, player.duration <= 30 else {
+            throw NSError(domain: "VibeCueAudio", code: 4, userInfo: [NSLocalizedDescriptionKey: "Sound duration is invalid"])
+        }
+        player.volume = volume.isFinite ? max(0, min(1, volume)) : 0
+        player.isMeteringEnabled = true
+        guard player.prepareToPlay() else {
+            throw NSError(domain: "VibeCueAudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "Audio output preparation failed"])
+        }
+        return CuePreparedSound(player: player, sourcePath: source,
+                                preparationMilliseconds: max(0, ProcessInfo.processInfo.systemUptime - started) * 1000,
+                                wasPreparedOnMainThread: Thread.isMainThread)
+    }
+
+    /// Silent isolation checks. No sound is played and no user files are read.
+    static func validationReport() -> [String: Bool] {
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("vcgo-audio-preparation-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var checks: [String: Bool] = [:]
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let preparation = CueSoundPreparation()
+            var received: Result<CuePreparedSound, Error>?, callbackOnMain = false, oldDelivered = false
+            preparation.prepare(kind: "complete", customDirectory: directory, volume: 0) { value in
+                callbackOnMain = Thread.isMainThread; received = value
+            }
+            let deadline = Date().addingTimeInterval(10)
+            while received == nil, deadline.timeIntervalSinceNow > 0 { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+            checks["audio_preparation_main_callback_is_bounded"] = received != nil && callbackOnMain
+            if case .success(let prepared) = received {
+                checks["audio_preparation_work_runs_off_main_thread"] = !prepared.wasPreparedOnMainThread
+                checks["audio_preparation_is_silent_and_uses_memory_without_files"] = !prepared.player.isPlaying && prepared.player.volume == 0 && prepared.sourcePath == "memory:complete" && ((try? FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty) == true)
+            } else { checks["audio_preparation_is_silent_and_uses_memory_without_files"] = false }
+            var newestDelivered = false
+            preparation.prepare(kind: "input", customDirectory: directory, volume: 0) { _ in oldDelivered = true }
+            preparation.prepare(kind: "complete", customDirectory: directory, volume: 0) { value in
+                if case .success(let prepared) = value { prepared.player.stop(); newestDelivered = true }
+            }
+            let latestDeadline = Date().addingTimeInterval(5)
+            while !newestDelivered, latestDeadline.timeIntervalSinceNow > 0 { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+            checks["audio_preparation_latest_only_replaces_pending_delivery"] = newestDelivered && !oldDelivered
+            var cancelledDelivered = false
+            preparation.prepare(kind: "input", customDirectory: directory, volume: 0) { _ in cancelledDelivered = true }
+            preparation.cancel()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+            checks["audio_preparation_cancel_invalidates_queued_and_main_delivery"] = !cancelledDelivered
+            do { _ = try customSource(kind: "custom:../escape.wav", directory: directory); checks["audio_preparation_rejects_custom_traversal"] = false }
+            catch { checks["audio_preparation_rejects_custom_traversal"] = true }
+            let custom = directory.appendingPathComponent("fixture.wav")
+            try CueChime.waveData(kind: "complete").write(to: custom)
+            let regular = try customSource(kind: "custom:fixture.wav", directory: directory)
+            checks["audio_preparation_accepts_valid_custom_path"] = regular == custom
+            let linked = directory.appendingPathComponent("linked.wav")
+            try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: custom)
+            do { _ = try customSource(kind: "custom:linked.wav", directory: directory); checks["audio_preparation_rejects_custom_symlinks"] = false }
+            catch { checks["audio_preparation_rejects_custom_symlinks"] = true }
+            if case .success(let prepared) = received { prepared.player.stop() }
+        } catch { checks["audio_preparation_fixture_completed"] = false }
+        return checks
     }
 }
 

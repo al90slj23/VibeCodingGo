@@ -192,7 +192,7 @@ def install(start=True, with_hooks=True, user_home=None):
             previous.get('legacy_app_pending') == str(legacy_app)):
         legacy_manifest = dict(previous, app=str(legacy_app))
     legacy_owned = owned_bundle(legacy_app, legacy_manifest, LEGACY_EXECUTABLE)
-    record = {'version': '0.32.0', 'product_name': 'VibeCoding Go', 'short_name': 'VCGo',
+    record = {'version': '0.33.0', 'product_name': 'VibeCoding Go', 'short_name': 'VCGo',
               'app': str(app), 'home': str(home), 'hooks': previous.get('hooks'),
               'source_dir': str(PROJECT), 'labels': list(LABELS),
               'installed_at': datetime.now(timezone.utc).isoformat()}

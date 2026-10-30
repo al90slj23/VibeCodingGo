@@ -270,7 +270,10 @@ final class CueNetworkTestsController: NSWindowController, NSWindowDelegate, NST
         stoppedReceipt = canReceive ? StoppedReceipt(callbackGeneration:previousGeneration,stoppedGeneration:generation,kind:selected,target:target.stringValue.trimmingCharacters(in:.whitespacesAndNewlines),probeLimit:requestProbeLimit,previousMeasurement:measurement) : nil
         client?.stop(); client = nil; setBusy(false)
         if wasBusy {
-            reports[selected] = Self.prepare(["status":"cancelled","title":selected.title,"summary":"本次检测尚未完成。已停止本机等待；已提交的公共测量可能继续，这里不会自动重新发送。","rows":[]])
+            let summary = selected == .globalPing || selected == .globalHTTP
+                ? "本次检测尚未完成。已停止本机等待；已提交的公共测量可能继续，这里不会自动重新发送。"
+                : "本次检测尚未完成。已停止本次请求，不会自动重试或沿用上次结果。"
+            reports[selected] = Self.prepare(["status":"cancelled","title":selected.title,"summary":summary,"rows":[]])
             presentCachedReport()
         }
     }

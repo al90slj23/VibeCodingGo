@@ -6,7 +6,7 @@
 
 ## 板块与设置层级
 
-0.32.0 使用一个可调整大小的主面板，通过两级标签切换功能。四个一级板块统一为四字名称：
+0.33.0 使用一个可调整大小的主面板，通过两级标签切换功能。四个一级板块统一为四字名称：
 
 - **任务提醒**：提醒概览、按类型的规则与样式、全局泛光和音量。提醒开关仅控制提醒表现。
 - **编程助手**：当前支持 Codex 的任务、对话与连接设置；用量统计、模型价格、汇率和账号额度也属于此板块。历史用量仍支持 Codex、Claude Code 与 OpenCode。
@@ -39,7 +39,7 @@
 
 0.29.1 将日志翻页改为精确版本校验后的局部响应，概览失效时自动完整重查；复用 watcher 明细的精确编码，并消除任务列表的重复刷新。[本轮性能报告](docs/performance-paging-2026-10-30.md)记录测量与边界；[Web Coding 新板块调研](docs/web-coding-modules-2026-10-30.md)整理环境、接口、日志、质量与交付工具的开源参考，候选功能尚未实现。
 
-## 项目名称与兼容升级
+0.33.0 将提醒改为四块屏幕边缘的 Metal 光场，颜色、样式与运动方向继续可自定义；主线程不再逐帧生成全屏渐变。声音在后台准备，内置音效不重复写临时 WAV。没有 Metal 的设备使用一次后台静态光效。详见[性能与现场验证](docs/alert-performance-2026-10-30.md)，六项网络检测的[实际界面验收](docs/network-ui-2026-10-30.md)单独记录。\n\n## 项目名称与兼容升级
 
 0.26.0 起，项目由 VibeCue 更名为 **VibeCoding Go**，简称 **VCGo**；源码与仓库名称为 `VibeCodingGo`。应用为 `/Applications/VibeCoding Go.app`，可执行程序为 `VCGo`，常用命令入口为 `./scripts/vcgo`。
 
@@ -226,6 +226,7 @@
 "build/VibeCoding Go.app/Contents/MacOS/VCGo" --usage-money-self-test
 "build/VibeCoding Go.app/Contents/MacOS/VCGo" --usage-schedule-self-test
 "build/VibeCoding Go.app/Contents/MacOS/VCGo" --window-preview-self-test  # 短暂显示无声测试窗口
+"build/VibeCoding Go.app/Contents/MacOS/VCGo" --effects-gpu-self-test     # 显式离屏 GPU 验证
 /usr/bin/python3 scripts/check-lighting.py --output /private/tmp/vibecue-lighting-review
 "build/VibeCoding Go.app/Contents/MacOS/VCGo" --resolution-self-test
 "build/VibeCoding Go.app/Contents/MacOS/VCGo" --event-validation-self-test
