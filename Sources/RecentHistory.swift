@@ -1091,7 +1091,7 @@ final class CueStatusPopoverController: NSViewController, NSPopoverDelegate, NSM
         }
         label(embedded ? "任务对话" : "Coding · 对话", NSRect(x: 22, y: embedded ? 13 : 163, width: 130, height: 23), size: 13, weight: .semibold)
         label(batchMode ? "已选 \(selectedThreads.count) 个对话 · 已去重" : "\(history.unopenedCount) 未读 · \(snapshot.activeCount) 运行 · \(snapshot.recoveryByThread.count) 中断 · \(snapshot.deferredCount) 待续 · 历史 \(history.ordinaryCount)/50", NSRect(x: 155, y: embedded ? 15 : 165, width: max(1, panelWidth - 290), height: 20), size: 11, color: history.unopenedCount > 0 || batchMode ? .systemBlue : .secondaryLabelColor).identifier = NSUserInterfaceItemIdentifier("task-counts")
-        button(batchMode ? "退出批量" : "批量模式", NSRect(x: panelWidth - 122, y: embedded ? 7 : 157, width: 98, height: 29), #selector(toggleBatchMode))
+        button(batchMode ? "取消选择" : "模型设置", NSRect(x: panelWidth - 122, y: embedded ? 7 : 157, width: 98, height: 29), #selector(toggleBatchMode))
         if batchMode {
             let pinnedIDs = Set(frozenPinnedTargets.map(\.threadID))
             let activeIDs = Set(frozenRunningTargets.map(\.threadID))
@@ -1104,7 +1104,7 @@ final class CueStatusPopoverController: NSViewController, NSPopoverDelegate, NSM
             }
             button("全选", NSRect(x: 213, y: batchY - 2, width: 66, height: 28), #selector(selectAllBatchThreads))
             button("清空", NSRect(x: 283, y: batchY - 2, width: 66, height: 28), #selector(clearBatchSelection))
-            let apply = NSButton(title: "批量操作 (\(selectedThreads.count))", target: self, action: #selector(configureSelected))
+            let apply = NSButton(title: "设置模型 (\(selectedThreads.count))", target: self, action: #selector(configureSelected))
             apply.frame = NSRect(x: panelWidth - 211, y: batchY - 2 + batchExtra, width: 187, height: 28); apply.isEnabled = !selectedThreads.isEmpty
             apply.identifier = NSUserInterfaceItemIdentifier("batch-apply")
             view.addSubview(apply)
@@ -1253,7 +1253,7 @@ final class CueStatusPopoverController: NSViewController, NSPopoverDelegate, NSM
                 case "setting-sound": button.state = soundEnabled ? .on : .off
                 case "pause-button": button.title = paused ? "恢复提醒" : "暂停 30 分钟"
                 case "connect-codex": button.isHidden = !showsConnectionAction; button.title = connectionSummary == nil ? "接通 Codex…" : "连接诊断…"
-                case "batch-apply": button.title = "批量操作 (\(selectedThreads.count))"; button.isEnabled = !selectedThreads.isEmpty
+                case "batch-apply": button.title = "设置模型 (\(selectedThreads.count))"; button.isEnabled = !selectedThreads.isEmpty
                 case "batch-scope-pinned", "batch-scope-running":
                     let targets = button.identifier?.rawValue == "batch-scope-pinned" ? frozenPinnedTargets : frozenRunningTargets
                     let ids = Set(targets.map(\.threadID))
@@ -1890,7 +1890,7 @@ final class CueStatusPopoverController: NSViewController, NSPopoverDelegate, NSM
         check.frame = NSRect(x: 7, y: y + 17, width: 24, height: 25)
         check.identifier = NSUserInterfaceItemIdentifier(target.threadID)
         check.state = selectedThreads.contains(target.threadID) ? .on : .off
-        check.setAccessibilityLabel("批量选择：" + target.title); document.addSubview(check)
+        check.setAccessibilityLabel("选择要设置模型的对话：" + target.title); document.addSubview(check)
     }
     private func toggleBatchThread(_ id: String) {
         guard let target = availableBatchTargets().first(where: { $0.threadID == id }) ?? batchTargets[id] else { return }

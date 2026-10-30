@@ -7,6 +7,7 @@ conversation text is never exposed or persisted by this module.
 """
 from collections import OrderedDict
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -23,6 +24,18 @@ SCHEMA_VERSION = 1
 MAX_THREADS = 200
 MAX_MESSAGE = 2 * 1024 * 1024
 THREAD_ID = re.compile(r'^[A-Za-z0-9_-]{1,160}$')
+
+
+def progress_event(callback, identifiers, results, phase, identifier=None):
+    if callback is None:
+        return
+    event = {'event': 'progress', 'phase': phase, 'total': len(identifiers),
+             'completed': len(results), 'thread_id': identifier,
+             'summary': {key: sum(row.get('status') == key for row in results)
+                         for key in ('verified', 'unverified', 'failed', 'queued')}}
+    if phase == 'completed' and results:
+        event['result'] = results[-1]
+    callback(event)
 
 
 class ControlError(Exception):
@@ -174,7 +187,7 @@ class Controller:
                 results.append({'thread_id': identifier, 'status': 'failed', 'message': clean(error, 300)})
         return {'schema_version': SCHEMA_VERSION, 'connected': True, 'results': results}
 
-    def apply(self, params):
+    def apply(self, params, progress=None):
         if self.deadline is None:
             self.deadline = time.monotonic() + 85
         identifiers = unique_threads(params.get('thread_ids'))
@@ -193,6 +206,7 @@ class Controller:
         loaded = self.loaded_ids()
         results = []
         for identifier in identifiers:
+            progress_event(progress, identifiers, results, 'reading', identifier)
             try:
                 if identifier not in loaded:
                     raise ControlError('此对话尚未载入当前 Codex；请先打开对话，再重新应用。')
@@ -214,20 +228,25 @@ class Controller:
                         raise ControlError('此模型未提供快速档位，未修改此对话')
                     patch['serviceTier'] = model['fast_tier']
                 _, revision = self.channel.settings(identifier)
+                progress_event(progress, identifiers, results, 'writing', identifier)
                 try:
                     self.rpc('thread/settings/update', {'threadId': identifier, **patch})
                 except UnconfirmedUpdate as error:
                     results.append({'thread_id': identifier, 'status': 'unverified', 'verified': False,
                                     'settings': settings_subset(patch), 'message': clean(error, 300)})
+                    progress_event(progress, identifiers, results, 'completed', identifier)
                     continue
+                progress_event(progress, identifiers, results, 'verifying', identifier)
                 left = max(0, self.deadline - time.monotonic())
                 confirmed = self.channel.wait_settings(identifier, revision, patch, timeout=min(2, left))
-                results.append({'thread_id': identifier, 'status': 'verified' if confirmed else 'unverified',
-                                'verified': bool(confirmed), 'settings': confirmed or settings_subset(patch),
+                verified = confirmed is not None and fields_match(confirmed, patch)
+                results.append({'thread_id': identifier, 'status': 'verified' if verified else 'unverified',
+                                'verified': verified, 'settings': confirmed or settings_subset(patch),
                                 'message': '已由 Codex 通知确认，下轮生效。' if confirmed else 'Codex 已接收，但未收到设置回读；请在 Codex 中核对。'})
             except ControlError as error:
                 results.append({'thread_id': identifier, 'status': 'failed', 'verified': False,
                                 'message': clean(error, 300)})
+            progress_event(progress, identifiers, results, 'completed', identifier)
         return {'schema_version': SCHEMA_VERSION, 'connected': True, 'results': results,
                 'summary': {'selected': len(identifiers), **{key: sum(row['status'] == key for row in results)
                                                         for key in ('verified', 'unverified', 'failed')}}}
@@ -305,9 +324,14 @@ def socket_call(connection, operation, params, timeout=90):
         raise ControlError('本机 Codex 控制连接已中断，请重新连接后重试') from error
 
 
-def run(operation, params=None, home=None, codex_home=None):
+def run(operation, params=None, home=None, codex_home=None, progress=None):
     params = params or {}
-    deadline = time.monotonic()+90
+    identifiers = [] if operation == 'catalog' else unique_threads(params.get('thread_ids'))
+    # One finite, user-triggered process; large selections no longer lose their
+    # tail to a fixed 85-second batch budget. Every desktop item also has its own
+    # absolute deadline. Non-streaming callers retain their original budget.
+    deadline = time.monotonic() + (max(90, len(identifiers) * 20 + 15) if progress else 90)
+    progress_event(progress, identifiers, [], 'starting')
     live = connections(home)
     if operation == 'catalog':
         for connection in live:
@@ -323,26 +347,31 @@ def run(operation, params=None, home=None, codex_home=None):
     if operation not in ('apply', 'inspect'):
         raise ControlError('不支持的批量操作')
     identifiers = unique_threads(params.get('thread_ids'))
+    # The owner drives the native composer, whereas an old stdio relay can
+    # confirm only backend notifications. Prefer the native path whenever it
+    # exists, and never fall back after it attempted a mutation.
+    desktop = desktop_run(operation, params, home, codex_home, deadline, progress=progress)
+    if desktop is not None:
+        return desktop
     if not live:
-        desktop = desktop_run(operation, params, home, codex_home, deadline)
-        if desktop is not None:
-            return desktop
         return {'schema_version': SCHEMA_VERSION, 'connected': False,
                 'results': [{'thread_id': identifier, 'status': 'failed', 'verified': False,
                              'message': '尚未连接 Codex 控制通道，没有修改此对话。'} for identifier in identifiers],
                 'summary': {'selected': len(identifiers), 'verified': 0, 'unverified': 0, 'failed': len(identifiers)}}
-    if len(live) == 1:
+    if len(live) == 1 and progress is None:
         return socket_call(live[0], operation, {**params, 'thread_ids': identifiers}, timeout=90)
     # A desktop normally owns one local backend. Multiple live owners are not
     # guessed: inspect safely, then send the patch only to a reader that reports
     # the thread as loaded. This never resumes a thread to claim ownership.
     results = []
     for identifier in identifiers:
+        progress_event(progress, identifiers, results, 'reading', identifier)
         routed = False
         last = None
         for connection in live:
             try:
-                answer = socket_call(connection, operation, {**params, 'thread_ids': [identifier]}, timeout=deadline-time.monotonic())
+                relay_params = {key: value for key, value in params.items() if key != 'defer_unloaded'}
+                answer = socket_call(connection, operation, {**relay_params, 'thread_ids': [identifier]}, timeout=deadline-time.monotonic())
                 row = next((item for item in answer.get('results', []) if item.get('thread_id') == identifier), None)
                 if row is not None and row.get('status') != 'failed':
                     results.append(row); routed = True; break
@@ -353,20 +382,22 @@ def run(operation, params=None, home=None, codex_home=None):
         if not routed:
             results.append(last if last is not None else
                            {'thread_id': identifier, 'status': 'failed', 'verified': False, 'message': '此对话没有可用的 Codex 控制连接。'})
+        progress_event(progress, identifiers, results, 'completed', identifier)
     return {'schema_version': SCHEMA_VERSION, 'connected': True, 'results': results,
             'summary': {'selected': len(identifiers), **{key: sum(row.get('status') == key for row in results)
                                                     for key in ('verified', 'unverified', 'failed')}}}
 
 
-def desktop_run(operation, params, home=None, codex_home=None, deadline=None):
+def desktop_run(operation, params, home=None, codex_home=None, deadline=None, progress=None):
     # Lazy import preserves the low-level error types shared by both transports.
     from .desktop_control import run as desktop_operation
-    return desktop_operation(operation, params, home=home, codex_home=codex_home, deadline=deadline)
+    return desktop_operation(operation, params, home=home, codex_home=codex_home, deadline=deadline, progress=progress)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='VibeCoding Go Codex 批量设置')
-    parser.add_argument('operation', choices=('catalog', 'inspect', 'apply'))
+    parser.add_argument('operation', choices=('catalog', 'inspect', 'apply', 'queue-drain', 'queue-cancel'))
+    parser.add_argument('--stream', action='store_true', help='按项目输出进度和最终结果（JSON Lines）')
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -376,12 +407,54 @@ def main(argv=None):
         params = {} if args.operation == 'catalog' else json.loads(raw)
         if not isinstance(params, dict):
             raise ControlError('批量操作需要 JSON 对象')
-        print(json.dumps(run(args.operation, params), ensure_ascii=False))
+        if args.operation in ('queue-drain', 'queue-cancel'):
+            if set(params) != ({'thread_ids'} if args.operation == 'queue-drain' else {'items'}):
+                raise ControlError('后台模型设置操作参数无效')
+            from .model_queue import drain, cancel
+            answer = drain(params.get('thread_ids')) if args.operation == 'queue-drain' else cancel(params.get('items'))
+            print(json.dumps(answer, ensure_ascii=False), flush=True)
+            return 0
+        # A single app-wide lock prevents two replaced/hidden batch windows
+        # from concurrently overwriting the same native selections. The receipt
+        # contains IDs/settings only, is never replayed and survives window loss.
+        if args.stream and args.operation == 'apply':
+            folder = vibecue_directory()
+            folder.mkdir(parents=True, exist_ok=True)
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+            with os.fdopen(os.open(folder / 'codex-batch.lock', flags, 0o600), 'r+') as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise ControlError('已有一批 Codex 设置正在处理，请等待该批次结束') from None
+                rows = {}
+                requested = {key: params[key] for key in ('model', 'effort', 'speed') if key in params}
+                def emit(event):
+                    if isinstance(event.get('result'), dict):
+                        rows[event['result']['thread_id']] = event['result']
+                    for row in event.get('results', []):
+                        rows[row['thread_id']] = row
+                    receipt = {'schema_version': SCHEMA_VERSION, 'updated_at': time.time(),
+                               'requested': requested, 'thread_ids': params.get('thread_ids'),
+                               'results': list(rows.values()), 'progress': event}
+                    from .cli import atomic_json
+                    atomic_json(folder / 'codex-batch-result.json', receipt)
+                    print(json.dumps(event, ensure_ascii=False), flush=True)
+                answer = run(args.operation, params, progress=emit)
+                emit({'event': 'finished', **answer})
+        else:
+            def stream_progress(event):
+                print(json.dumps(event, ensure_ascii=False), flush=True)
+            answer = run(args.operation, params, progress=stream_progress if args.stream else None)
+        print(json.dumps({'event': 'result', 'result': answer} if args.stream else answer, ensure_ascii=False), flush=True)
     except (ControlError, OSError, ValueError, TypeError) as error:
-        print(json.dumps({'schema_version': SCHEMA_VERSION, 'connected': False, 'error': clean(error, 300)}, ensure_ascii=False))
+        answer = {'schema_version': SCHEMA_VERSION, 'connected': False, 'error': clean(error, 300)}
+        print(json.dumps({'event': 'result', 'result': answer} if args.stream else answer, ensure_ascii=False), flush=True)
         return 1
     return 0
 
 
 if __name__ == '__main__':
+    # Sibling transports import these exact error types. Running with -m must
+    # not create a second module/class identity and lose structured CLI errors.
+    sys.modules.setdefault('vibecue.codex_control', sys.modules[__name__])
     raise SystemExit(main())

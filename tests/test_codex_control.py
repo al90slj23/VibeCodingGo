@@ -2,15 +2,19 @@ import json
 import io
 import fcntl
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from vibecue.codex_control import (Controller, ControlError, UnconfirmedUpdate,
                                   cached_catalog, connections, normalize_model, run, unique_threads, socket_call)
+from vibecue.codex_control import main, progress_event
 from vibecue.codex_control_relay import ControlHub, atomic_pipe_write
 
 
@@ -136,6 +140,66 @@ class ControlPolicyTests(unittest.TestCase):
         for values in ([], ['../private'], [True], ['x']*1601):
             with self.assertRaises(ControlError): unique_threads(values)
         with self.assertRaises(ControlError): Controller(FakeChannel()).apply({'thread_ids':['one']})
+
+    def test_stream_cli_emits_progress_before_final_and_keeps_private_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            params = {'thread_ids': ['one', 'two'], 'model': 'model-one', 'effort': 'max', 'speed': 'standard'}
+            output = io.StringIO()
+            def operation(op, request, **kwargs):
+                self.assertEqual(op, 'apply'); self.assertEqual(request, params)
+                callback = kwargs['progress']
+                progress_event(callback, ['one', 'two'], [], 'writing', 'one')
+                self.assertIn('writing', output.getvalue())
+                rows = [{'thread_id': 'one', 'status': 'verified', 'verified': True},
+                        {'thread_id': 'two', 'status': 'failed', 'verified': False}]
+                progress_event(callback, ['one', 'two'], rows[:1], 'completed', 'one')
+                progress_event(callback, ['one', 'two'], rows, 'completed', 'two')
+                return {'results': rows, 'summary': {'selected': 2, 'verified': 1, 'failed': 1, 'unverified': 0}}
+            stdin = io.TextIOWrapper(io.BytesIO(json.dumps(params).encode()))
+            with patch.dict(os.environ, {'VIBECUE_HOME': directory}), patch('sys.stdin', stdin), \
+                    patch('vibecue.codex_control.run', side_effect=operation), redirect_stdout(output):
+                self.assertEqual(main(['apply', '--stream']), 0)
+            lines = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual([e['event'] for e in lines], ['progress', 'progress', 'progress', 'finished', 'result'])
+            self.assertEqual(lines[-1]['result']['summary']['verified'], 1)
+            receipt = Path(directory) / 'codex-batch-result.json'
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            stored = json.loads(receipt.read_text())
+            self.assertEqual(stored['requested'], {k: params[k] for k in ['model', 'effort', 'speed']})
+            self.assertEqual([row['thread_id'] for row in stored['results']], ['one', 'two'])
+
+    def test_stream_cli_refuses_overlapping_batches_before_any_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (Path(directory) / 'codex-batch.lock').open('w') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                output = io.StringIO()
+                stdin = io.TextIOWrapper(io.BytesIO(b'{"thread_ids":["one"],"effort":"max"}'))
+                with patch.dict(os.environ, {'VIBECUE_HOME': directory}), patch('sys.stdin', stdin), \
+                        patch('vibecue.codex_control.run') as operation, redirect_stdout(output):
+                    self.assertEqual(main(['apply', '--stream']), 1)
+                operation.assert_not_called()
+                self.assertIn('已有一批', json.loads(output.getvalue())['result']['error'])
+
+    def test_module_cli_keeps_sibling_transport_errors_structured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / 'ipc').mkdir(); (root / 'ipc/ipc.sock').touch()
+            environment = dict(os.environ, CODEX_HOME=directory, VIBECUE_HOME=str(root / 'state'), PYTHONDONTWRITEBYTECODE='1')
+            process = subprocess.run([sys.executable, '-m', 'vibecue.codex_control', 'apply', '--stream'],
+                cwd=Path(__file__).resolve().parents[1], env=environment, capture_output=True,
+                input=json.dumps({'thread_ids': ['one'], 'effort': 'max', 'approvalPolicy': 'never'}).encode(), timeout=5)
+            self.assertEqual(process.returncode, 1)
+            frames = [json.loads(line) for line in process.stdout.splitlines()]
+            self.assertEqual(frames[-1]['event'], 'result')
+            self.assertIn('只允许', frames[-1]['result']['error'])
+            self.assertEqual(process.stderr, b'')
+
+    def test_native_control_is_preferred_and_never_rerouted_after_unconfirmed_submission(self):
+        expected = {'results': [{'thread_id': 'one', 'status': 'unverified'}]}
+        with patch('vibecue.codex_control.connections', return_value=[{'socket_path': '/legacy'}]), \
+                patch('vibecue.codex_control.desktop_run', return_value=expected), \
+                patch('vibecue.codex_control.socket_call') as legacy:
+            self.assertIs(run('apply', {'thread_ids': ['one'], 'effort': 'max'}), expected)
+        legacy.assert_not_called()
 
     def test_deadline_preserves_confirmed_results_and_never_sends_remaining_updates(self):
         channel=FakeChannel(); original=channel.request; current=[0]

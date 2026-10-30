@@ -123,6 +123,18 @@ class DesktopIPCTests(unittest.TestCase):
         with channel:
             self.assertEqual(channel.runtime_snapshot()['resume_state'], 'resumed')
 
+    def test_composer_metadata_is_independent_of_saved_settings_and_never_exposes_instructions(self):
+        fake = FakeSocket()
+        fake.state['latestThreadSettings'] = {'model': 'saved', 'effort': 'max'}
+        fake.state['latestCollaborationMode'] = {'mode': 'default', 'settings': {
+            'model': 'native', 'reasoning_effort': 'ultra', 'developer_instructions': 'PRIVATE INSTRUCTIONS'}}
+        _, channel = self.connect(fake)
+        with channel:
+            result = channel.runtime_snapshot()
+        self.assertEqual(result['composer_settings'], {'model': 'native', 'effort': 'ultra'})
+        self.assertEqual(result['thread_settings']['effort'], 'max')
+        self.assertNotIn('PRIVATE', json.dumps(result))
+
     def test_snapshot_settle_uses_low_full_baseline_and_contiguous_live_delta(self):
         def handler(sock, value):
             if value['type'] == 'broadcast' and value['params']['following']:

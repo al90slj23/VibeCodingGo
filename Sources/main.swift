@@ -290,6 +290,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var sideChats: [String: [CueSideChat]] = [:]
     private var modelSettingsTargets = Data()
     var batchController: CueCodexBatchController?
+    private lazy var modelSettingsQueue = CueCodexModelQueue(home: home)
     private var runningTaskSnapshot = Data()
     lazy var recentHistory = CueRecentHistory(home: home)
     var shortcutMenu: NSMenu?
@@ -1021,6 +1022,14 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         // refreshMenu already updates both task surfaces. Health labels must
         // not run the same list projection again for this watcher snapshot.
         settingsPanel?.updateHealth(updateTasks: !refreshTaskLists || statusItem == nil)
+        if ownsLock {
+            let ready = Set(taskDetails.filter { $0.value.hasReadableCurrentSettings(at: commitTime) }.map { $0.key })
+            modelSettingsQueue.update(readyIDs: ready) { [weak self] rows in
+                guard let self, !self.shuttingDown else { return }
+                self.batchController?.adoptQueuedResults(rows)
+                self.writeModelSettingsTargets()
+            }
+        }
     }
 
     func startWatcher() {
@@ -1161,7 +1170,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     @objc func connectLegacyManualApproval() {
         guard approvalLauncher?.isRunning != true else { return }
         let alert = NSAlert()
-        alert.messageText = "接通 Codex 提醒、对话与批量设置"
+        alert.messageText = "接通 Codex 提醒、对话与模型设置"
         alert.informativeText = "首次连接或升级对话输入通道，需要你主动退出并重新打开 Codex。请先完成或保存当前工作；VibeCoding Go 会等你退出后重新打开。对话输入只在你点击“载入对话”或“发送”时执行，模型设置只在点击“应用”后修改。"
         alert.addButton(withTitle: "准备连接，等待我退出")
         alert.addButton(withTitle: "稍后")
@@ -1371,10 +1380,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         // IDs only. This tells the existing read-only subscription which
         // retained list entries need current settings, including older chats.
         let conversations = recentHistory.displayRecords
-        let ids = CueModelTargetSelection.select([runningTasks.map(\.threadID),
+        let ids = CueModelTargetSelection.select([runningTasks.map(\.threadID), modelSettingsQueue.pendingIDs,
             conversations.filter(\.isPinned).map { $0.event.threadID }, recentHistory.followups.records.map(\.threadID),
             interruptedTasks.map(\.threadID), conversations.map { $0.event.threadID }])
-        guard let data = try? JSONSerialization.data(withJSONObject: ["thread_ids": ids], options: [.sortedKeys]), data != modelSettingsTargets else { return }
+        guard let data = try? JSONSerialization.data(withJSONObject: ["thread_ids": ids, "priority_thread_ids": Array(modelSettingsQueue.pendingIDs.prefix(48))], options: [.sortedKeys]), data != modelSettingsTargets else { return }
         let file = home.appendingPathComponent("model-settings-targets.json")
         do {
             try data.write(to: file, options: .atomic)
@@ -1447,7 +1456,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             batchConfigure: { [weak self] targets in
                 guard let self else { return }
                 self.statusPopover?.performClose(nil)
-                self.batchController = CueCodexBatchController(home: self.home, targets: targets, connect: { [weak self] in self?.connectManualApproval() }, completion: { [weak self] in self?.updateWatcherHealth() })
+                if self.batchController?.isApplying != true {
+                    self.batchController = CueCodexBatchController(home: self.home, targets: targets, connect: { [weak self] in self?.connectManualApproval() }, completion: { [weak self] in self?.updateWatcherHealth() })
+                    self.batchController?.adoptQueuedResults(self.modelSettingsQueue.latestResults)
+                }
                 self.openWorkspacePage(.codingTasks)
                 if let parent = self.settingsPanel?.window { self.batchController?.presentSheet(on: parent) }
                 NSApp.activate(ignoringOtherApps: true)
@@ -2642,6 +2654,14 @@ if CommandLine.arguments.contains("--task-preview-self-test") {
     exit(results.values.allSatisfy { $0 } ? 0 : 1)
 }
 
+if CommandLine.arguments.contains("--codex-batch-self-test") {
+    _ = NSApplication.shared
+    var results = CueCodexBatchController.validationReport()
+    results.merge(CueCodexModelQueue.validationReport()) { _, new in new }
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+
 if CommandLine.arguments.contains("--recent-self-test") {
     _ = NSApplication.shared
     let home = FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-recent-integration-" + UUID().uuidString)
@@ -2661,6 +2681,7 @@ if CommandLine.arguments.contains("--recent-self-test") {
     results.merge(CueNetworkTestsController.validationReport()) { _, new in new }
     results.merge(CueStatusPopoverController.validationReport()) { _, new in new }
     results.merge(CueCodexBatchController.validationReport()) { _, new in new }
+    results.merge(CueCodexModelQueue.validationReport()) { _, new in new }
     results.merge(CueTaskHoverController.validationReport()) { _, new in new }
     results.merge(CueTaskRecoverySnapshot.validationReport()) { _, new in new }
     results.merge(CueConversationController.validationReport()) { _, new in new }

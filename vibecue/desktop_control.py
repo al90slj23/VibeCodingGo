@@ -6,11 +6,13 @@ origin is shown explicitly. A settings mutation is only verified after a matchin
 read from the same owner. A submitted update is never retried on another channel.
 """
 import time
+from contextlib import closing
 
 from .codex_control import (ControlError, UnconfirmedUpdate, SCHEMA_VERSION,
                             cached_catalog, clean, fields_match, settings_subset,
-                            unique_threads)
-from .codex_desktop_ipc import DesktopChannel, DesktopOwnerUnavailable, VERSIONS
+                            unique_threads, progress_event)
+from .codex_desktop_ipc import (DesktopChannel, DesktopOwnerUnavailable,
+                                 DesktopConnectionInterrupted, VERSIONS)
 from .events import codex_directory
 
 
@@ -42,8 +44,10 @@ class DesktopControlChannel(DesktopChannel):
 
 
 def _validate_apply(params):
-    if set(params) - {'thread_ids', 'model', 'effort', 'speed'}:
+    if set(params) - {'thread_ids', 'model', 'effort', 'speed', 'defer_unloaded'}:
         raise ControlError('批量操作只允许修改模型、强度和快速档位')
+    if 'defer_unloaded' in params and type(params['defer_unloaded']) is not bool:
+        raise ControlError('后台排队选项无效')
     speed = params.get('speed', 'keep')
     if speed not in ('keep', 'standard', 'fast'):
         raise ControlError('快速档位无效')
@@ -57,7 +61,7 @@ def _validate_apply(params):
 def _read(channel):
     raw = channel.read_settings()
     if raw.get('resumeState') != 'resumed':
-        raise ControlError('此对话尚未在 Codex 就绪，请先在 Codex 打开；不会自动载入')
+        raise DesktopOwnerUnavailable('此对话尚未在 Codex 就绪，请先在 Codex 打开')
     result = settings_subset(raw)
     return result
 
@@ -67,10 +71,33 @@ def _summary(identifiers, results, connected):
             'transport': 'desktop_ipc', 'results': results,
             'summary': {'selected': len(identifiers),
                         **{key: sum(row.get('status') == key for row in results)
-                           for key in ('verified', 'unverified', 'failed')}}}
+                           for key in ('verified', 'unverified', 'failed', 'queued')
+                           if key != 'queued' or any(row.get('status') == 'queued' for row in results)}}}
 
 
-def run(operation, params=None, home=None, codex_home=None, deadline=None):
+def readback(channel, identifier):
+    observed = _read(channel)
+    snapshot = channel.runtime_snapshot()
+    if snapshot.get('thread_id') != identifier or snapshot.get('resume_state') != 'resumed':
+        raise ControlError('回读的对话或就绪状态不匹配，无法确认设置')
+    saved = settings_subset(snapshot.get('thread_settings', {}))
+    composer = snapshot.get('composer_settings', {})
+    if not isinstance(composer, dict):
+        composer = {}
+    if 'service_tier' in saved:
+        observed['service_tier'] = saved['service_tier']
+    return observed, saved, composer
+
+
+def readback_matches(observed, saved, composer, patch):
+    native_patch = {key: value for key, value in patch.items() if key != 'serviceTier'}
+    # Do not merge saved settings over native readback: that used to erase a
+    # mismatch and could mark the batch successful while the composer differed.
+    return (fields_match(observed, patch) and fields_match(saved, patch)
+            and fields_match(composer, native_patch))
+
+
+def run(operation, params=None, home=None, codex_home=None, deadline=None, progress=None, queued_execution=False):
     """Return None when no desktop socket exists, preserving legacy fallback.
 
     Opening this connection only initializes the current desktop IPC. It never
@@ -103,16 +130,27 @@ def run(operation, params=None, home=None, codex_home=None, deadline=None):
     for identifier in identifiers:
         submitted = False
         patch = {}
+        progress_event(progress, identifiers, results, 'reading', identifier)
         try:
+            if operation == 'apply' and 'model' in params and params['model'] not in by_model:
+                raise ControlError('本机模型缓存没有目标模型，请先在 Codex 刷新模型目录')
+            if operation == 'apply' and not queued_execution:
+                from .model_queue import supersede
+                supersede(identifier, home)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ControlError('本轮批量操作已到时，此项未提交；请核对已完成项目')
-            with DesktopControlChannel(identifier, codex_home=codex_home, timeout=min(8, remaining)) as channel:
+            item_deadline = min(deadline, time.monotonic() + 20)
+            with DesktopControlChannel(identifier, codex_home=codex_home,
+                                       timeout=min(4, remaining), deadline=item_deadline) as channel:
                 connected = True
                 current = _read(channel)
                 if operation == 'inspect':
+                    current, saved, composer = readback(channel, identifier)
                     results.append({'thread_id': identifier, 'settings': current,
+                                    'saved_settings': saved, 'composer_settings': composer,
                                     'loaded': True, 'status': 'read'})
+                    progress_event(progress, identifiers, results, 'completed', identifier)
                     continue
                 selected = params.get('model') or current.get('model')
                 model = by_model.get(selected)
@@ -131,9 +169,9 @@ def run(operation, params=None, home=None, codex_home=None, deadline=None):
                 if time.monotonic() >= deadline:
                     raise ControlError('本轮批量操作已到时，此项未提交')
                 channel.require_method('thread-follower-update-thread-settings', 2)
-                if 'serviceTier' in patch:
-                    channel.require_method('thread-stream-state-changed', 11)
-                    channel.require_method('thread-stream-following-changed', 1)
+                channel.require_method('thread-stream-state-changed', 11)
+                channel.require_method('thread-stream-following-changed', 1)
+                progress_event(progress, identifiers, results, 'writing', identifier)
                 submitted = True
                 applied = channel.update_settings(patch)
                 if not applied:
@@ -142,22 +180,32 @@ def run(operation, params=None, home=None, codex_home=None, deadline=None):
                 # Waits for the owner's own pending setting update, then reads
                 # model/effort. The snapshot carries serviceTier, which is not
                 # present in the dedicated model-settings response.
-                observed = _read(channel)
-                if 'serviceTier' in patch:
-                    snapshot = channel.runtime_snapshot()
-                    if snapshot.get('thread_id') != identifier:
-                        raise UnconfirmedUpdate('设置已提交，但回读的对话不匹配，请在 Codex 核对')
-                    observed.update(settings_subset(snapshot.get('thread_settings', {})))
-                verified = fields_match(observed, patch)
+                progress_event(progress, identifiers, results, 'verifying', identifier)
+                observed, saved, composer = readback(channel, identifier)
+                verified = readback_matches(observed, saved, composer, patch)
                 results.append({'thread_id': identifier,
                                 'status': 'verified' if verified else 'unverified',
-                                'verified': verified, 'settings': observed,
+                                'verified': verified, 'settings': observed, 'saved_settings': saved,
+                                'composer_settings': composer, 'expected_settings': settings_subset(patch),
                                 'message': 'Codex 已应用并回读确认，下轮生效。' if verified else
                                            'Codex 已接收，回读未完整匹配；请核对，不会自动重试。'})
         except (ControlError, OSError, ValueError, TypeError) as error:
             uncertain = submitted or isinstance(error, UnconfirmedUpdate)
+            unavailable = not submitted and (isinstance(error, (DesktopOwnerUnavailable, DesktopConnectionInterrupted))
+                                             or '先在 Codex 打开' in str(error))
+            if unavailable and operation == 'apply' and params.get('defer_unloaded') is True:
+                from .model_queue import enqueue
+                try:
+                    results.append(enqueue(identifier, params, home))
+                    progress_event(progress, identifiers, results, 'completed', identifier)
+                    continue
+                except (ControlError, OSError, ValueError, TypeError) as queue_error:
+                    error = queue_error; unavailable = False
             results.append({'thread_id': identifier,
                             'status': 'unverified' if uncertain else 'failed',
                             'verified': False, 'settings': settings_subset(patch),
-                            'message': ('设置可能已提交，请在 Codex 核对；不会自动重试。' if uncertain else clean(error, 300))})
+                            'error_kind': 'not_loaded' if unavailable else 'unconfirmed' if uncertain else 'rejected',
+                            'message': ('设置可能已提交，请在 Codex 核对；不会自动重试。' if uncertain else
+                                        '此对话尚未在 Codex 就绪，未修改。打开此对话后可仅重试未生效项。' if unavailable else clean(error, 300))})
+        progress_event(progress, identifiers, results, 'completed', identifier)
     return _summary(identifiers, results, connected)

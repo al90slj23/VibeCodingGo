@@ -183,7 +183,7 @@ class ContractHealthTests(unittest.TestCase):
         self.assertTrue(health['connected'])
         self.assertEqual(health['subscribed_threads'], 0)
 
-    def test_unknown_stream_never_claims_attention_and_keeps_compatible_control(self):
+    def test_unknown_stream_disables_attention_and_settings_that_cannot_be_verified(self):
         service = DesktopAttentionService('/fixture')
         channel = VerifiedContractFixture()
         channel.protocol_contract = dict(KNOWN_PROTOCOL)
@@ -192,7 +192,7 @@ class ContractHealthTests(unittest.TestCase):
         health = service.snapshot()
         self.assertFalse(health['capabilities']['reply'])
         self.assertFalse(health['capabilities']['attention'])
-        self.assertTrue(health['capabilities']['control'])
+        self.assertFalse(health['capabilities']['control'])
         self.assertEqual(health['reason_code'], 'protocol_unsupported')
         self.assertEqual(health['pending_count'], 0)
 

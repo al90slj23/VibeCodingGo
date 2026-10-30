@@ -29,7 +29,7 @@ struct CueCodexConnection {
             var available: [String] = []
             if reply { available.append("回复") }
             if attentionConnected { available.append("批准提醒") }
-            if control { available.append("批量设置") }
+            if control { available.append("模型设置") }
             summary = "Codex 已自动连接 · " + available.joined(separator: "、") + (!attentionConnected ? " · 批准监听恢复中" : "")
         } else if attentionConnected {
             state = "connected"
@@ -57,7 +57,7 @@ struct CueCodexConnection {
         let partialState = Self(watcher: partial, now: now)
         let incompatibleState = Self(watcher: incompatibility, now: now)
         let incompatiblePartialState = Self(watcher: partialIncompatibility, now: now)
-        return ["desktop_connection_health_enables_only_confirmed_live_capabilities": connected.state == "connected" && connected.attentionConnected && connected.summary.contains("回复、批准提醒、批量设置"),
+        return ["desktop_connection_health_enables_only_confirmed_live_capabilities": connected.state == "connected" && connected.attentionConnected && connected.summary.contains("回复、批准提醒、模型设置"),
                 "stale_watcher_cannot_claim_connected": Self(watcher: stale, now: now).state == "reconnecting",
                 "stale_desktop_cannot_claim_connected": Self(watcher: staleDesktop, now: now).state == "reconnecting",
                 "socket_without_capabilities_cannot_claim_connected": Self(watcher: missing, now: now).state == "reconnecting",

@@ -45,4 +45,12 @@ with tempfile.TemporaryDirectory(prefix='vcgo-ui-contract-') as home:
     preview_failed = [key for key, value in preview_checks.items() if value is not True]
     print(json.dumps({'task_preview_checks': len(preview_checks), 'failed': preview_failed,
                       'report': str(preview_output)}, ensure_ascii=False))
-    raise SystemExit(run.returncode or pages.returncode or preview.returncode or bool(failed) or bool(page_failed) or bool(preview_failed))
+    batch = subprocess.run([str(app / 'Contents/MacOS/VCGo'), '--codex-batch-self-test'],
+                           env=env, capture_output=True, text=True, timeout=30)
+    batch_checks = json.loads(batch.stdout)
+    batch_output = root / 'build/vcgo-codex-batch-validation.json'
+    batch_output.write_text(json.dumps(batch_checks, ensure_ascii=False, indent=2) + '\n')
+    batch_failed = [key for key, value in batch_checks.items() if value is not True]
+    print(json.dumps({'codex_batch_checks': len(batch_checks), 'failed': batch_failed,
+                      'report': str(batch_output)}, ensure_ascii=False))
+    raise SystemExit(run.returncode or pages.returncode or preview.returncode or batch.returncode or bool(failed) or bool(page_failed) or bool(preview_failed) or bool(batch_failed))

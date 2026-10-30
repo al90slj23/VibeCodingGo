@@ -44,7 +44,8 @@ CAPABILITY_METHODS = {
               'thread-follower-read-model-settings', 'thread-stream-state-changed',
               'thread-stream-following-changed'),
     'control': ('thread-owner-discovery', 'thread-follower-read-model-settings',
-                'thread-follower-update-thread-settings'),
+                'thread-follower-update-thread-settings', 'thread-stream-state-changed',
+                'thread-stream-following-changed'),
     'attention': ('thread-owner-discovery', 'thread-stream-state-changed',
                   'thread-stream-following-changed'),
 }
@@ -405,7 +406,18 @@ class DesktopChannel:
                                      latestThreadSettings=projection.settings.settings)
                         state.update({key: value for key, value in projection.settings.values.items()
                                       if key in ('latestModel', 'latestReasoningEffort')})
-                        return _snapshot_metadata(state, self.thread_id, self.owner, projection.revision)
+                        metadata = _snapshot_metadata(state, self.thread_id, self.owner, projection.revision)
+                        # The native composer reads latestCollaborationMode,
+                        # independently of the saved next-turn settings. Keep
+                        # only its two scalar selections so a settings write
+                        # cannot be "verified" against its own saved echo while
+                        # the native composer is still using another selection.
+                        metadata['composer_settings'] = {
+                            target: value for key, target in
+                            (('collaboration_model', 'model'), ('collaboration_effort', 'effort'))
+                            if isinstance((value := projection.settings.values.get(key)), str)
+                        }
+                        return metadata
                     if left <= 0:
                         raise DesktopConnectionInterrupted('Codex 对话状态仍在同步，正在重新读取')
                 if received >= SNAPSHOT_SETTLE_FRAMES:

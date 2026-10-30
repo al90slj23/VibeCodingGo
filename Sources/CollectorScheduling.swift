@@ -42,7 +42,7 @@ final class CueCollectorScheduler {
             return command == "configure" ? .interactive : .read
         }
         if module == "vibecue.codex_chat" { return command == "status" ? .status : .interactive }
-        if module == "vibecue.codex_control" { return command == "apply" ? .control : .status }
+        if module == "vibecue.codex_control" { return ["apply", "queue-drain"].contains(command) ? .control : .status }
         if module == "vibecue.usage", command == "sync" { return .maintenance }
         if module == "vibecue.usage", command == "sync-status" { return .status }
         if module == "vibecue.network_tests" ||

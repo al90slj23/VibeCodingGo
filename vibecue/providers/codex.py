@@ -633,11 +633,13 @@ class Watcher:
         prioritized = sorted(recent, key=lambda pair: (pair[1].activity_state == 'running', pair[1].last_activity, pair[1].metadata.updated_at), reverse=True)
         active = [pair[1].metadata.thread_id for pair in prioritized if pair[1].activity_state == 'running']
         requested = self._model_settings_targets()
-        self.desktop.set_threads(active + [pair[1].metadata.thread_id for pair in prioritized] + requested)
+        self.desktop.set_threads(active + getattr(self, '_model_settings_priority', []) +
+                                 [pair[1].metadata.thread_id for pair in prioritized] + requested)
 
     def _model_settings_targets(self):
         # The app requests only navigation metadata for its retained list.
         # Old recovery records alone never force large desktop snapshots.
+        self._model_settings_priority = []
         try:
             path = self.vibecue_home / 'model-settings-targets.json'
             with path.open('rb') as stream:
@@ -648,6 +650,10 @@ class Watcher:
             rows = value.get('thread_ids') if isinstance(value, dict) else None
             if not isinstance(rows, list) or len(rows) > 256:
                 return []
+            priority = value.get('priority_thread_ids', [])
+            if isinstance(priority, list) and len(priority) <= 48:
+                self._model_settings_priority = list(dict.fromkeys(row for row in priority if isinstance(row, str) and
+                                                                    re.fullmatch(r'[A-Za-z0-9_-]{1,160}', row)))
             return list(dict.fromkeys(row for row in rows if isinstance(row, str) and
                                       re.fullmatch(r'[A-Za-z0-9_-]{1,160}', row)))
         except (OSError, ValueError, TypeError):

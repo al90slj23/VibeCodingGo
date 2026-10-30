@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -25,6 +26,8 @@ class FakeChannel(VerifiedContractFixture):
     fail = None
     applied = True
     verify = True
+    saved_override = None
+    composer_override = None
     entered = []
 
     def __init__(self, thread_id, **kwargs):
@@ -35,6 +38,9 @@ class FakeChannel(VerifiedContractFixture):
         return self
 
     def __exit__(self, *args):
+        pass
+
+    def close(self):
         pass
 
     def read_settings(self):
@@ -51,13 +57,19 @@ class FakeChannel(VerifiedContractFixture):
         return self.applied
 
     def runtime_snapshot(self):
-        return {'thread_id': self.thread_id, 'thread_settings': self.rows.get(self.thread_id, {}).copy()}
+        row = self.rows.get(self.thread_id, {})
+        return {'thread_id': self.thread_id, 'resume_state': row.get('resumeState'),
+                'thread_settings': self.saved_override if self.saved_override is not None else row.copy(),
+                'composer_settings': self.composer_override if self.composer_override is not None else
+                    {'model': row.get('model'), 'effort': row.get('reasoningEffort')}}
 
 
 class DesktopControlTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
+        environment = patch.dict(os.environ, {'VIBECUE_HOME': str(self.home)})
+        environment.start(); self.addCleanup(environment.stop)
         (self.home / 'ipc').mkdir(); (self.home / 'ipc/ipc.sock').touch()
         (self.home / 'models_cache.json').write_text(json.dumps({'models': [
             {'slug': 'model-one', 'display_name': 'One', 'supported_reasoning_levels': [{'effort': 'high'}, {'effort': 'max'}],
@@ -68,6 +80,7 @@ class DesktopControlTests(unittest.TestCase):
         FakeChannel.updates = []; FakeChannel.reads = []; FakeChannel.entered = []
         FakeChannel.protocol_contract = dict(KNOWN_PROTOCOL)
         FakeChannel.fail = None; FakeChannel.applied = True; FakeChannel.verify = True
+        FakeChannel.saved_override = None; FakeChannel.composer_override = None
         helper = patch('vibecue.desktop_control.DesktopControlChannel', FakeChannel)
         helper.start(); self.addCleanup(helper.stop)
 
@@ -94,7 +107,8 @@ class DesktopControlTests(unittest.TestCase):
         self.assertEqual(result['results'][0]['status'], 'failed')
         self.assertEqual(FakeChannel.updates, [])
         plain = self.call('apply', {'thread_ids':['one'], 'effort':'max'})
-        self.assertEqual(plain['results'][0]['status'], 'verified')
+        self.assertEqual(plain['results'][0]['status'], 'failed')
+        self.assertEqual(FakeChannel.updates, [])
 
     def test_catalog_auto_connects_without_loading_or_discovering_a_chat(self):
         result = self.call('catalog')
@@ -152,6 +166,72 @@ class DesktopControlTests(unittest.TestCase):
         self.assertEqual(result['summary']['unverified'], 1)
         self.assertFalse(result['results'][0]['verified'])
         self.assertEqual(len(FakeChannel.updates), 1)
+
+    def test_saved_echo_cannot_hide_native_readback_mismatch(self):
+        FakeChannel.verify = False
+        FakeChannel.saved_override = {'model': 'model-one', 'effort': 'max', 'serviceTier': 'default'}
+        result = self.call('apply', {'thread_ids': ['one'], 'effort': 'max', 'speed': 'standard'})
+        row = result['results'][0]
+        self.assertEqual(row['status'], 'unverified')
+        self.assertEqual(row['settings']['effort'], 'high')
+        self.assertEqual(row['saved_settings']['effort'], 'max')
+
+    def test_composer_must_match_even_when_saved_and_dedicated_settings_match(self):
+        FakeChannel.composer_override = {'model': 'model-one', 'effort': 'high'}
+        result = self.call('apply', {'thread_ids': ['one'], 'effort': 'max'})
+        self.assertEqual(result['results'][0]['status'], 'unverified')
+        self.assertEqual(result['results'][0]['composer_settings']['effort'], 'high')
+
+    def test_progress_precedes_writes_and_emits_each_result_before_next_item(self):
+        events = []
+        def progress(event):
+            events.append((event.copy(), len(FakeChannel.updates)))
+        answer = desktop_control.run('apply', {'thread_ids': ['one', 'one', 'two'], 'effort': 'max'},
+                                     codex_home=self.home, progress=progress)
+        self.assertEqual(answer['summary']['verified'], 2)
+        writes = [(event, count) for event, count in events if event['phase'] == 'writing']
+        self.assertEqual([count for _, count in writes], [0, 1])
+        completed = [event for event, _ in events if event['phase'] == 'completed']
+        self.assertEqual([event['completed'] for event in completed], [1, 2])
+        self.assertEqual([event['result']['thread_id'] for event in completed], ['one', 'two'])
+        self.assertTrue(all(event['total'] == 2 for event, _ in events))
+
+    def test_inspect_has_native_composer_and_tier_without_any_mutation(self):
+        FakeChannel.rows['one']['serviceTier'] = 'priority'
+        result = self.call('inspect', {'thread_ids': ['one']})['results'][0]
+        self.assertEqual(result['composer_settings'], {'model': 'model-one', 'effort': 'high'})
+        self.assertEqual(result['settings']['service_tier'], 'priority')
+        self.assertEqual(FakeChannel.updates, [])
+
+    def test_unready_items_have_actionable_failure_and_progress_is_not_lost(self):
+        FakeChannel.rows['one']['resumeState'] = 'needs-resume'
+        events = []
+        result = desktop_control.run('apply', {'thread_ids': ['one', 'two'], 'effort': 'max'},
+                                     codex_home=self.home, progress=events.append)
+        self.assertEqual(result['results'][0]['error_kind'], 'not_loaded')
+        self.assertEqual(result['summary'], {'selected': 2, 'verified': 1, 'failed': 1, 'unverified': 0})
+        self.assertEqual([e['completed'] for e in events if e['phase'] == 'completed'], [1, 2])
+        self.assertEqual([id for id, _ in FakeChannel.updates], ['two'])
+
+    def test_unloaded_items_can_be_queued_without_navigation_or_updates(self):
+        FakeChannel.rows['one']['resumeState'] = 'needs-resume'
+        events = []
+        result = desktop_control.run('apply', {'thread_ids': ['one'], 'effort': 'max', 'defer_unloaded': True},
+                                     home=self.home, codex_home=self.home, progress=events.append)
+        self.assertEqual(result['summary']['queued'], 1)
+        self.assertEqual(result['summary']['verified'], 0)
+        self.assertEqual(FakeChannel.updates, [])
+        self.assertFalse(any(event['phase'] == 'opening' for event in events))
+        stored = json.loads((self.home / 'codex-model-queue.json').read_text())
+        self.assertEqual(stored['records'][0]['params'], {'effort': 'max'})
+
+    def test_auto_open_flags_are_rejected_before_connecting(self):
+        with self.assertRaises(ControlError):
+            self.call('apply', {'thread_ids': ['one'], 'effort': 'max', 'open_unloaded': True})
+        for invalid in ['yes', 1, None]:
+            with self.assertRaises(ControlError):
+                self.call('apply', {'thread_ids': ['one'], 'effort': 'max', 'defer_unloaded': invalid})
+        self.assertEqual(FakeChannel.entered, [])
 
     def test_declined_update_is_failed_and_never_retried(self):
         FakeChannel.applied = False
