@@ -200,6 +200,9 @@ final class CueWatcherProjectionReader {
     private static func featureData(_ snapshot: CueWatcherPreparedSnapshot, now: Date) -> Data {
         func date(_ value: Date?) -> String { value.map { String($0.timeIntervalSince1970) } ?? "nil" }
         func integer(_ value: Int64?) -> String { value.map { String($0) } ?? "nil" }
+        // Both projections must observe the same clock, including derived
+        // model/speed text. Wall-clock getters could cross a real expiry while
+        // these two differential snapshots are compared sequentially.
         func task(_ value: CueRunningTask) -> [String] {
             [value.threadID, value.title, value.provider, date(value.startDate), date(value.updatedDate),
              value.turnID, value.recoveryStatus, date(value.interruptedAt), value.recoveryReason]
@@ -209,12 +212,12 @@ final class CueWatcherProjectionReader {
             guard let value = snapshot.details[id] else { continue }
             let scalar: [String] = [value.status, value.turnID, date(value.startedAt), date(value.finishedAt),
                 date(value.lastActivity), value.elapsedSeconds.map { String($0) } ?? "nil", value.elapsedStatus,
-                value.model, value.reasoningEffort, value.serviceTier, value.currentSettingsStatus,
+                value.model(at: now), value.reasoningEffort(at: now), value.serviceTier(at: now), value.currentSettingsStatus,
                 value.currentSettingsSource, date(value.currentSettingsObservedAt), integer(value.totalTokens),
                 integer(value.inputTokens), integer(value.outputTokens), integer(value.cacheReadTokens),
                 integer(value.cacheCreationTokens), value.tokensStatus, value.lastMessage,
                 date(value.lastMessageAt), value.lastRole, String(value.contentTruncated),
-                value.modelSelectionLine, value.speedSelectionLine, value.settingsTooltip,
+                value.modelSelectionLine(at: now), value.speedSelectionLine(at: now), value.settingsTooltip(at: now),
                 String(value.hasReadableCurrentSettings(at: now))]
             let usage: [String] = [value.turnUsage.tokenLine, value.turnUsage.costLine, value.turnUsage.tooltip,
                 value.historyUsage.tokenLine, value.historyUsage.costLine, value.historyUsage.tooltip]
@@ -305,7 +308,17 @@ final class CueWatcherProjectionReader {
         CueWatcherProjectionBuilder.appendFrame("json", Data("c".utf8), to: &second)
         CueWatcherProjectionBuilder.appendFrame("i", Data("da".utf8), to: &third)
         CueWatcherProjectionBuilder.appendFrame("json", Data("bc".utf8), to: &third)
-        return ["watcher_composed_signature_matches_reference_change_decisions": sameChangeDecisions,
+        let expiring = CueTaskDetail(raw: ["current_settings": expiringSettings["fixture-0"]!])
+        let derivedExpiry = expiring.model(at: now) == "fixture-model"
+            && expiring.reasoningEffort(at: now) == "high"
+            && expiring.modelSelectionLine(at: now).contains("fixture-model")
+            && expiring.settingsTooltip(at: now).contains("只读获取")
+            && expiring.model(at: now.addingTimeInterval(2)).isEmpty
+            && expiring.reasoningEffort(at: now.addingTimeInterval(2)).isEmpty
+            && expiring.modelSelectionLine(at: now.addingTimeInterval(2)) == "当前设置不可读"
+            && expiring.settingsTooltip(at: now.addingTimeInterval(2)).contains("当前选择暂不可核实")
+        return ["watcher_derived_model_display_observes_explicit_expiry_clock": derivedExpiry,
+            "watcher_composed_signature_matches_reference_change_decisions": sameChangeDecisions,
             "watcher_composed_signature_preserves_all_observed_features": featuresEqual,
             "watcher_signature_ignores_dictionary_insertion_order": newSignatures[0] == newSignatures[1],
             "watcher_signature_detects_model_only_change": newSignatures[0] != newSignatures[2],

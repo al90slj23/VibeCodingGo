@@ -681,9 +681,9 @@ private struct CueEffectRenderer {
 }
 
 final class CueEdgeEffectView: NSView {
-    var style: CueVisualStyle { didSet { fallbackKey=nil; requestFrame() } }
+    var style: CueVisualStyle { didSet { fallbackKey=nil;uniformTemplate=nil;lastSubmittedUniforms=nil;requestFrame() } }
     var elapsed: TimeInterval = 0
-    var displayDuration: TimeInterval?
+    var displayDuration: TimeInterval? { didSet { requestFrame() } }
     let canvasSize: NSSize
     let viewportOrigin: NSPoint
     private(set) var lastRenderDuration: TimeInterval = 0
@@ -692,6 +692,15 @@ final class CueEdgeEffectView: NSView {
     private(set) var lastSubmissionDuration: TimeInterval = 0
     private(set) var submittedFrameCount = 0
     private(set) var skippedFrameCount = 0
+    private(set) var duplicateFrameCount = 0
+    private(set) var uniformTemplateBuildCount = 0
+    private var uniformTemplate:CueEffectGPU.UniformTemplate?
+    private var lastSubmittedUniforms:[Float]?
+    private var lastSubmittedSize:CGSize?
+    private var needsLatestFrame=false
+    private var submissionGeneration:UInt64=0
+    private var visibilityObserver:NSObjectProtocol?
+    private var preparedFallback:(key:String,image:CGImage?,duration:TimeInterval)?
     private var frameDriver: CueEffectGPUFrameDriver?
     private var fallbackKey: String?
     private var fallbackPreparing = false
@@ -722,9 +731,28 @@ final class CueEdgeEffectView: NSView {
         }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    deinit { frameDriver?.cancel() }
-    func finish() { retired=true; frameDriver?.cancel(); frameDriver=nil }
-    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); requestFrame() }
+    deinit {
+        frameDriver?.cancel()
+        if let visibilityObserver { NotificationCenter.default.removeObserver(visibilityObserver) }
+    }
+    func finish() {
+        retired=true;frameDriver?.cancel();frameDriver=nil;preparedFallback=nil
+        if let visibilityObserver { NotificationCenter.default.removeObserver(visibilityObserver);self.visibilityObserver=nil }
+    }
+    private var presentationVisible:Bool {
+        guard let window else { return false }
+        return window.isVisible && !window.isMiniaturized && window.occlusionState.contains(.visible)
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let visibilityObserver { NotificationCenter.default.removeObserver(visibilityObserver);self.visibilityObserver=nil }
+        if let window, !retired {
+            visibilityObserver=NotificationCenter.default.addObserver(forName:NSWindow.didChangeOcclusionStateNotification,object:window,queue:.main) { [weak self] _ in
+                self?.requestFrame()
+            }
+        }
+        requestFrame()
+    }
     override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); requestFrame() }
     override func layout() { super.layout(); requestFrame() }
     func advance(to time: TimeInterval) {
@@ -734,24 +762,48 @@ final class CueEdgeEffectView: NSView {
     }
     private func requestFrame() {
         guard !retired, pipelineReady, bounds.width>0, bounds.height>0 else { return }
+        guard presentationVisible else {
+            frameDriver?.suspend(true);lastSubmittedUniforms=nil;lastSubmittedSize=nil;needsLatestFrame=false
+            return
+        }
         let reduced=NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         if let frameDriver, let metal=metalSurface {
+            frameDriver.suspend(false)
             // Backing size changes are main-thread metadata work only. Drawable
             // acquisition and all encoding stay on the driver's utility queue.
             let scale=window?.backingScaleFactor ?? 2
             let pixels=CGSize(width:max(1,ceil(bounds.width*scale)),height:max(1,ceil(bounds.height*scale)))
             if metal.drawableSize != pixels { metal.drawableSize=pixels; metal.contentsScale=scale }
             let submittedAt=ProcessInfo.processInfo.systemUptime
-            let values=CueEffectGPU.uniforms(style:style,canvas:canvasSize,origin:viewportOrigin,viewport:bounds.size,time:elapsed,duration:displayDuration,reduceMotion:reduced)
+            if uniformTemplate == nil {
+                uniformTemplate=CueEffectGPU.uniformTemplate(style:style,canvas:canvasSize);uniformTemplateBuildCount += 1
+            }
+            guard let uniformTemplate else { return }
+            let values=uniformTemplate.frame(origin:viewportOrigin,viewport:bounds.size,time:elapsed,duration:displayDuration,reduceMotion:reduced)
+            guard lastSubmittedUniforms != values || lastSubmittedSize != pixels else {
+                duplicateFrameCount += 1;lastSubmissionDuration=ProcessInfo.processInfo.systemUptime-submittedAt;return
+            }
+            let expectedSubmission=submissionGeneration &+ 1
             let accepted=frameDriver.submit(values) { [weak self] duration in
-                guard let self, !self.retired else { return }
-                self.lastRenderDuration=duration; self.renderedFrameCount += 1
+                guard let self, !self.retired,self.submissionGeneration == expectedSubmission else { return }
+                guard self.presentationVisible else { self.lastSubmittedUniforms=nil;self.lastSubmittedSize=nil;return }
+                if let duration { self.lastRenderDuration=duration;self.renderedFrameCount += 1 }
+                else { self.lastSubmittedUniforms=nil;self.lastSubmittedSize=nil }
+                if self.needsLatestFrame { self.needsLatestFrame=false;self.requestFrame() }
             }
             lastSubmissionDuration=ProcessInfo.processInfo.systemUptime-submittedAt
-            if accepted { submittedFrameCount += 1 } else { skippedFrameCount += 1 }
-        } else { prepareStaticFallback() }
+            if accepted {
+                submissionGeneration=expectedSubmission;lastSubmittedUniforms=values;lastSubmittedSize=pixels;submittedFrameCount += 1;needsLatestFrame=false
+            } else { skippedFrameCount += 1;needsLatestFrame=true }
+        } else { applyPreparedFallback();prepareStaticFallback() }
+    }
+    private func applyPreparedFallback() {
+        guard presentationVisible, let preparedFallback,preparedFallback.key == fallbackKey else { return }
+        self.preparedFallback=nil;layer?.contents=preparedFallback.image
+        lastRenderDuration=preparedFallback.duration;renderedFrameCount += 1
     }
     private func prepareStaticFallback() {
+        guard presentationVisible else { return }
         // A machine without Metal gets one finite static frame for this style,
         // never recurring software shading that can stall other applications.
         let key=style.effectID+style.paletteHex.joined()+String(describing:bounds.size)+String(describing:style.width)
@@ -766,7 +818,7 @@ final class CueEdgeEffectView: NSView {
                 guard let self, !self.retired else { return }
                 self.fallbackPreparing=false
                 guard self.fallbackKey == key else { self.prepareStaticFallback(); return }
-                self.layer?.contents=image; self.lastRenderDuration=duration; self.renderedFrameCount += 1
+                self.preparedFallback=(key,image,duration);self.applyPreparedFallback()
             }
         }
     }

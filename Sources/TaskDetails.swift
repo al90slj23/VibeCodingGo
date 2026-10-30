@@ -213,9 +213,12 @@ struct CueTaskDetail {
     private let currentSettingsVerifiedAt: Date?
     private let currentSettingsExpiresAt: Date?
     private let currentSettingsMessage: String
-    var model: String { currentSettingsReadable ? (["default", "unknown"].contains(selectedModelStatus) ? "" : selectedModel) : recordedModel }
-    var reasoningEffort: String { currentSettingsReadable ? selectedReasoningEffort : recordedReasoningEffort }
-    var serviceTier: String { currentSettingsReadable ? selectedServiceTier : recordedServiceTier }
+    var model: String { model(at: Date()) }
+    var reasoningEffort: String { reasoningEffort(at: Date()) }
+    var serviceTier: String { serviceTier(at: Date()) }
+    func model(at now: Date) -> String { hasReadableCurrentSettings(at: now) ? (["default", "unknown"].contains(selectedModelStatus) ? "" : selectedModel) : recordedModel }
+    func reasoningEffort(at now: Date) -> String { hasReadableCurrentSettings(at: now) ? selectedReasoningEffort : recordedReasoningEffort }
+    func serviceTier(at now: Date) -> String { hasReadableCurrentSettings(at: now) ? selectedServiceTier : recordedServiceTier }
     let totalTokens: Int64?
     let inputTokens: Int64?
     let outputTokens: Int64?
@@ -311,7 +314,6 @@ struct CueTaskDetail {
         return "\(scope(eventDate: eventDate)) · \(duration) · \(tokenText)"
     }
 
-    private var currentSettingsReadable: Bool { hasReadableCurrentSettings(at: Date()) }
     /// The same predicate drives display and snapshot temporal invalidation.
     /// No formatted string or model value is cached past its usable lifetime.
     func hasReadableCurrentSettings(at now: Date) -> Bool {
@@ -331,16 +333,18 @@ struct CueTaskDetail {
     private static func effortLabel(_ effort: String) -> String {
         ["none":"None", "minimal":"Minimal", "low":"Low", "medium":"Medium", "high":"High", "xhigh":"Extra High", "max":"Max", "ultra":"Ultra", "default":"默认强度"][effort] ?? effort
     }
-    var modelSelectionLine: String {
-        if currentSettingsReadable {
+    var modelSelectionLine: String { modelSelectionLine(at: Date()) }
+    func modelSelectionLine(at now: Date) -> String {
+        if hasReadableCurrentSettings(at: now) {
             let name = selectedModelStatus == "default" ? "模型跟随默认" : selectedModel.isEmpty ? "模型未提供" : Self.friendlyModel(selectedModel, displayName: selectedModelDisplayName)
             return "当前 · " + name + " " + (selectedReasoningEffort.isEmpty ? "强度未提供" : Self.effortLabel(selectedReasoningEffort))
         }
         guard !recordedModel.isEmpty || !recordedReasoningEffort.isEmpty else { return "当前设置不可读" }
         return (currentSettingsStatus.isEmpty ? "" : "当前不可读 · ") + (isActive ? "本轮记录 · " : "上次记录 · ") + Self.friendlyModel(recordedModel) + (recordedReasoningEffort.isEmpty ? "" : " " + Self.effortLabel(recordedReasoningEffort))
     }
-    var speedSelectionLine: String {
-        if currentSettingsReadable {
+    var speedSelectionLine: String { speedSelectionLine(at: Date()) }
+    func speedSelectionLine(at now: Date) -> String {
+        if hasReadableCurrentSettings(at: now) {
             switch selectedSpeedKind {
             case "fast": return "Fast · 已保存"
             case "ultrafast": return "Ultra Fast · 已保存"
@@ -357,14 +361,18 @@ struct CueTaskDetail {
         if recordedServiceTier == "default" { return "速度跟随默认（记录）" }
         return "仅有历史档位"
     }
-    var speedSelectionIsFast: Bool { currentSettingsReadable && ["fast", "ultrafast"].contains(selectedSpeedKind) }
-    var secondaryLine: String {
-        let modelLine = modelSelectionLine
-        return modelLine == "当前设置不可读" ? modelLine : modelLine + " · " + speedSelectionLine
+    var speedSelectionIsFast: Bool { speedSelectionIsFast(at: Date()) }
+    func speedSelectionIsFast(at now: Date) -> Bool { hasReadableCurrentSettings(at: now) && ["fast", "ultrafast"].contains(selectedSpeedKind) }
+    var secondaryLine: String { secondaryLine(at: Date()) }
+    func secondaryLine(at now: Date) -> String {
+        let modelLine = modelSelectionLine(at: now)
+        return modelLine == "当前设置不可读" ? modelLine : modelLine + " · " + speedSelectionLine(at: now)
     }
-    var settingsTooltip: String {
-        var lines = [secondaryLine]
-        if currentSettingsReadable {
+    var settingsTooltip: String { settingsTooltip(at: Date()) }
+    func settingsTooltip(at now: Date) -> String {
+        let readable = hasReadableCurrentSettings(at: now)
+        var lines = [secondaryLine(at: now)]
+        if readable {
             lines.append("来源：Codex 已保存的对话设置，只读获取。输入框内尚未提交的临时选择不在共享接口内。")
             if let observed = currentSettingsObservedAt {
                 lines.append("读取时间：" + CueTaskTimeLabels.string(observed, format: "HH:mm:ss"))
@@ -379,7 +387,7 @@ struct CueTaskDetail {
             lines.append("当前选择暂不可核实；记录值仅表示已读到的本轮或上次执行设置。")
             if !currentSettingsMessage.isEmpty { lines.append(currentSettingsMessage) }
         }
-        if currentSettingsReadable {
+        if readable {
             if !selectedServiceTier.isEmpty { lines.append("已保存请求档位：" + selectedServiceTier) }
             if !selectedSpeedMessage.isEmpty { lines.append(selectedSpeedMessage) }
             lines.append("Ultra 表示推理强度；Fast 是独立速度档位。")

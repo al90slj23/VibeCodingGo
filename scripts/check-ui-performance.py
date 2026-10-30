@@ -11,8 +11,8 @@ root = Path(__file__).resolve().parents[1]
 app = root / 'build/VibeCoding Go.app'
 info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 version = tuple(int(value) for value in info['CFBundleShortVersionString'].split('.'))
-if info.get('CFBundleIdentifier') != 'local.vibecue' or version < (0, 33, 0):
-    raise SystemExit('Build VibeCoding Go 0.33.0 or newer before running this check.')
+if info.get('CFBundleIdentifier') != 'local.vibecue' or version < (0, 34, 0):
+    raise SystemExit('Build VibeCoding Go 0.34.0 or newer before running this check.')
 with tempfile.TemporaryDirectory(prefix='vcgo-ui-contract-') as home:
     env = os.environ.copy()
     env['VIBECUE_HOME'] = home
@@ -29,4 +29,12 @@ with tempfile.TemporaryDirectory(prefix='vcgo-ui-contract-') as home:
         if watcher.get(key) is not True:
             failed.append('watcher_measurement_' + key)
     print(json.dumps({'failed': failed, 'measurement': result['measurement'], 'watcher_measurement': watcher, 'report': str(output)}, ensure_ascii=False))
-    raise SystemExit(run.returncode or bool(failed))
+    pages = subprocess.run([str(app / 'Contents/MacOS/VCGo'), '--resident-pages-self-test'],
+                           env=env, capture_output=True, text=True, timeout=30)
+    page_checks = json.loads(pages.stdout)
+    page_output = root / 'build/vcgo-resident-pages-performance.json'
+    page_output.write_text(json.dumps(page_checks, ensure_ascii=False, indent=2) + '\n')
+    page_failed = [key for key, value in page_checks.items() if value is not True]
+    print(json.dumps({'resident_page_checks': len(page_checks), 'failed': page_failed,
+                      'report': str(page_output)}, ensure_ascii=False))
+    raise SystemExit(run.returncode or pages.returncode or bool(failed) or bool(page_failed))

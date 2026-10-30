@@ -263,37 +263,71 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var isEmbedded = false
     private var embeddedVisible = false
     private var hostObservers: [NSObjectProtocol] = []
-    private var presentationWindow: NSWindow? { surface.window ?? (isEmbedded ? nil : window) }
+    // Background synchronization owns numeric state without constructing an
+    // NSWindow, table, heatmap or its controls.
+    private var presentationPrepared = false
+    private var nativePresentationWindow: NSWindow?
+    private var presentationBuilds = 0, presentationComponents = 0
+    private func makePresentationComponent<T>(_ build: () -> T) -> T {
+        presentationComponents += 1
+        return build()
+    }
+    private var queryRequests = 0, statusRequests = 0
+    private var fixtureOcclusion: Bool?
+    private var fixtureRun: (([String], String, @escaping (Result<[String: Any], Error>) -> Void) -> Void)?
+    private var presentationWindow: NSWindow? {
+        guard presentationPrepared else { return nil }
+        return surface.window ?? (isEmbedded ? nil : nativePresentationWindow)
+    }
+    var performanceSnapshot: [String: Any] {
+        ["created": true, "presentation_created": presentationPrepared, "presentation_builds": presentationBuilds,
+         "presentation_components": presentationComponents,
+         "visible": dashboardVisible, "display_requests": queryRequests, "status_requests": statusRequests,
+         "query_in_flight": queryInFlight, "status_in_flight": statusInFlight,
+         "background_started": backgroundStarted, "history_syncing": syncing || backendRunning,
+         "snapshot_applications": snapshotApplyCount, "accounts": accountController?.performanceSnapshot ?? ["created": false]]
+    }
     private let client: CueUsageClient
     private let statusClient: CueUsageClient
-    private let surface = CueUsageSurface()
-    private let titleLabel = NSTextField(labelWithString: "用量统计")
-    private let subtitle = NSTextField(labelWithString: "本机历史与 CC Switch 数值记录")
-    private let range = NSPopUpButton(), app = NSPopUpButton(), model = NSPopUpButton(), source = NSPopUpButton(), provider = NSPopUpButton()
-    private let statusFilter = NSPopUpButton(), heatmapMetric = NSPopUpButton()
-    private let chartStyle = NSPopUpButton()
-    private let columnsButton = NSButton(title: "显示列…", target: nil, action: nil), detailsButton = NSButton(title: "查看详情…", target: nil, action: nil)
-    private let moreHistory = NSButton(title: "显示更多 ▾", target: nil, action: nil), lessHistory = NSButton(title: "收起", target: nil, action: nil)
-    private let clearDateButton = NSButton(title: "清除日期", target: nil, action: nil)
-    private let summaryButton = NSButton(title: "摘要明细…", target: nil, action: nil)
-    private let syncButton = NSButton(title: "立即同步", target: nil, action: nil)
-    private let infoButton = NSButton(title: "数据说明", target: nil, action: nil)
-    private let moneyButton = NSButton(title: "统计设置…", target: nil, action: nil)
-    private let accountsButton = NSButton(title: "Codex 账号额度…", target: nil, action: nil)
-    private let syncLabel = NSTextField(labelWithString: "尚未同步")
-    private let status = NSTextField(wrappingLabelWithString: "")
-    private let metrics = [CueUsageMetric(title: "Tokens 总量"), CueUsageMetric(title: "新增输入"), CueUsageMetric(title: "输出"), CueUsageMetric(title: "缓存命中率"), CueUsageMetric(title: "用量记录"), CueUsageMetric(title: "API 参考费用")]
-    private let heatmapTitle = NSTextField(labelWithString: "最近 53 周")
-    private let heatmapRange = NSTextField(labelWithString: "")
-    private let heatmapSummary = NSTextField(labelWithString: "")
-    private let heatmap = CueUsageHeatmap()
-    private let heatmapScroll = NSScrollView()
-    private let tabs = NSSegmentedControl(labels: ["请求日志", "供应商", "模型", "来源"], trackingMode: .selectOne, target: nil, action: nil)
-    private let table = NSTableView(), scroll = CueUsageScrollView()
-    private let listSection = CueUsageListSection(), paginationBar = CueUsagePaginationBar()
-    private let pageLabel = NSTextField(labelWithString: ""), detail = NSTextField(labelWithString: "")
-    private let pageSizePopup = NSPopUpButton()
-    private let previous = NSButton(title: "上一页", target: nil, action: nil), next = NSButton(title: "下一页", target: nil, action: nil)
+    private lazy var surface = makePresentationComponent { CueUsageSurface() }
+    private lazy var titleLabel = makePresentationComponent { NSTextField(labelWithString: "用量统计") }
+    private lazy var subtitle = makePresentationComponent { NSTextField(labelWithString: "本机历史与 CC Switch 数值记录") }
+    private lazy var range = makePresentationComponent { NSPopUpButton() }
+    private lazy var app = makePresentationComponent { NSPopUpButton() }
+    private lazy var model = makePresentationComponent { NSPopUpButton() }
+    private lazy var source = makePresentationComponent { NSPopUpButton() }
+    private lazy var provider = makePresentationComponent { NSPopUpButton() }
+    private lazy var statusFilter = makePresentationComponent { NSPopUpButton() }
+    private lazy var heatmapMetric = makePresentationComponent { NSPopUpButton() }
+    private lazy var chartStyle = makePresentationComponent { NSPopUpButton() }
+    private lazy var columnsButton = makePresentationComponent { NSButton(title: "显示列…", target: nil, action: nil) }
+    private lazy var detailsButton = makePresentationComponent { NSButton(title: "查看详情…", target: nil, action: nil) }
+    private lazy var moreHistory = makePresentationComponent { NSButton(title: "显示更多 ▾", target: nil, action: nil) }
+    private lazy var lessHistory = makePresentationComponent { NSButton(title: "收起", target: nil, action: nil) }
+    private lazy var clearDateButton = makePresentationComponent { NSButton(title: "清除日期", target: nil, action: nil) }
+    private lazy var summaryButton = makePresentationComponent { NSButton(title: "摘要明细…", target: nil, action: nil) }
+    private lazy var syncButton = makePresentationComponent { NSButton(title: "立即同步", target: nil, action: nil) }
+    private lazy var infoButton = makePresentationComponent { NSButton(title: "数据说明", target: nil, action: nil) }
+    private lazy var moneyButton = makePresentationComponent { NSButton(title: "统计设置…", target: nil, action: nil) }
+    private lazy var accountsButton = makePresentationComponent { NSButton(title: "Codex 账号额度…", target: nil, action: nil) }
+    private lazy var syncLabel = makePresentationComponent { NSTextField(labelWithString: "尚未同步") }
+    private lazy var status = makePresentationComponent { NSTextField(wrappingLabelWithString: "") }
+    private lazy var metrics = makePresentationComponent { [CueUsageMetric(title: "Tokens 总量"), CueUsageMetric(title: "新增输入"), CueUsageMetric(title: "输出"), CueUsageMetric(title: "缓存命中率"), CueUsageMetric(title: "用量记录"), CueUsageMetric(title: "API 参考费用")] }
+    private lazy var heatmapTitle = makePresentationComponent { NSTextField(labelWithString: "最近 53 周") }
+    private lazy var heatmapRange = makePresentationComponent { NSTextField(labelWithString: "") }
+    private lazy var heatmapSummary = makePresentationComponent { NSTextField(labelWithString: "") }
+    private lazy var heatmap = makePresentationComponent { CueUsageHeatmap() }
+    private lazy var heatmapScroll = makePresentationComponent { NSScrollView() }
+    private lazy var tabs = makePresentationComponent { NSSegmentedControl(labels: ["请求日志", "供应商", "模型", "来源"], trackingMode: .selectOne, target: nil, action: nil) }
+    private lazy var table = makePresentationComponent { NSTableView() }
+    private lazy var scroll = makePresentationComponent { CueUsageScrollView() }
+    private lazy var listSection = makePresentationComponent { CueUsageListSection() }
+    private lazy var paginationBar = makePresentationComponent { CueUsagePaginationBar() }
+    private lazy var pageLabel = makePresentationComponent { NSTextField(labelWithString: "") }
+    private lazy var detail = makePresentationComponent { NSTextField(labelWithString: "") }
+    private lazy var pageSizePopup = makePresentationComponent { NSPopUpButton() }
+    private lazy var previous = makePresentationComponent { NSButton(title: "上一页", target: nil, action: nil) }
+    private lazy var next = makePresentationComponent { NSButton(title: "下一页", target: nil, action: nil) }
     private var rows: [[String: Any]] = []
     private var snapshot: [String: Any] = [:]
     var currentKnownModels: [String] {
@@ -349,10 +383,24 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         self.useSavedColumns = useSavedColumns
         self.home = home; client = CueUsageClient(home: home); statusClient = CueUsageClient(home: home); schedule = CueUsageSchedulePreferences(home: home)
         if useSavedColumns { columnOverrides = UserDefaults.standard.dictionary(forKey: "VibeCueUsageLogColumns") as? [String: Bool] ?? [:] }
+        super.init(window: nil)
+        scheduleObserver = NotificationCenter.default.addObserver(forName: .cueUsageScheduleDidChange, object: nil, queue: .main) { [weak self] note in
+            guard let self, note.userInfo?["home"] as? String == self.home.path else { return }
+            self.schedule = CueUsageSchedulePreferences(home: self.home)
+            self.configureBackgroundTimer(); self.configureVisibleTimer(); self.query(); self.usageDidChange?()
+        }
+    }
+
+    override func loadWindow() { ensurePresentation() }
+
+    private func ensurePresentation() {
+        guard !presentationPrepared else { return }
+        presentationPrepared = true; presentationBuilds += 1
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 850), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "VibeCoding Go · 用量统计"; window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 1000, height: 760); window.center()
-        super.init(window: window); window.delegate = self; window.contentView = surface
+        nativePresentationWindow = window
+        self.window = window; window.delegate = self; window.contentView = surface
         titleLabel.font = .systemFont(ofSize: 23, weight: .semibold)
         subtitle.font = .systemFont(ofSize: 12); subtitle.textColor = .secondaryLabelColor
         syncLabel.font = .systemFont(ofSize: 11); syncLabel.textColor = .secondaryLabelColor; syncLabel.alignment = .right
@@ -427,11 +475,6 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         surface.onLayout = { [weak self] in self?.layout() }
         surface.onAppearance = { [weak self] in self?.metrics.forEach { $0.needsDisplay = true }; self?.heatmap.needsDisplay = true }
         configureColumns(); layout(); updateStatus()
-        scheduleObserver = NotificationCenter.default.addObserver(forName: .cueUsageScheduleDidChange, object: nil, queue: .main) { [weak self] note in
-            guard let self, note.userInfo?["home"] as? String == self.home.path else { return }
-            self.schedule = CueUsageSchedulePreferences(home: self.home)
-            self.configureBackgroundTimer(); self.configureVisibleTimer(); self.query(); self.usageDidChange?()
-        }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit {
@@ -442,25 +485,29 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
 
     /// Reparent the existing collector's page rather than creating another collector.
     func embeddedContentView() -> NSView {
+        ensurePresentation()
         if !isEmbedded {
             isEmbedded = true; window?.orderOut(nil); window?.contentView = nil
-            for name in [NSWindow.didResignKeyNotification, NSWindow.willMiniaturizeNotification, NSWindow.willCloseNotification] {
+            for name in [NSWindow.didResignKeyNotification, NSWindow.willMiniaturizeNotification, NSWindow.willCloseNotification, NSWindow.didChangeOcclusionStateNotification, NSWindow.didDeminiaturizeNotification] {
                 hostObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
                     guard let self, let host = note.object as? NSWindow, host === self.presentationWindow else { return }
                     self.heatmap.hidePreview()
                     if name == NSWindow.willCloseNotification { self.deactivateEmbedded() }
+                    else if name == NSWindow.didChangeOcclusionStateNotification || name == NSWindow.didDeminiaturizeNotification { self.resumeVisibleDisplay() }
                 })
             }
         }
         return surface
     }
     func activateEmbedded() {
+        ensurePresentation()
         embeddedVisible = true
         guard !stopped else { return }
         query(); refreshExchange(); configureVisibleTimer()
     }
     func deactivateEmbedded() {
-        embeddedVisible = false; heatmap.hidePreview()
+        embeddedVisible = false
+        if presentationPrepared { heatmap.hidePreview() }
         visibleLease?.cancel(); visibleLease = nil
     }
     /// Saved settings refresh the existing page without changing the selected tag.
@@ -470,6 +517,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         configureBackgroundTimer(); configureVisibleTimer(); query(invalidate: true); usageDidChange?()
     }
     override func showWindow(_ sender: Any?) {
+        ensurePresentation()
         if isEmbedded { activateEmbedded(); presentationWindow?.makeKeyAndOrderFront(nil); return }
         super.showWindow(sender); window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         query(); refreshExchange(); configureVisibleTimer()
@@ -508,7 +556,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     }
     func stopBackgroundSync() {
         stopped = true; backgroundStarted = false
-        heatmap.hidePreview()
+        if presentationPrepared { heatmap.hidePreview() }
         backgroundTimer?.invalidate(); backgroundTimer = nil; visibleLease?.cancel(); visibleLease = nil
         pricingTimer?.invalidate(); pricingTimer = nil; client.stop(); statusClient.stop()
     }
@@ -520,12 +568,19 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         guard let host = notification.object as? NSWindow, host === presentationWindow else { return }
         visibleLease?.cancel(); visibleLease = nil; heatmap.hidePreview()
     }
+    func windowDidDeminiaturize(_ notification: Notification) { resumeVisibleDisplay() }
+    func windowDidChangeOcclusionState(_ notification: Notification) { resumeVisibleDisplay() }
+    private func resumeVisibleDisplay() {
+        guard !stopped, dashboardVisible else { return }
+        query(); refreshExchange(); configureVisibleTimer()
+    }
     func windowWillMiniaturize(_ notification: Notification) { heatmap.hidePreview() }
     func windowDidResignKey(_ notification: Notification) { heatmap.hidePreview() }
 
     /// Explicit offline visual QA: renders a supplied numeric snapshot without
     /// launching the collector or touching the user's statistics database.
     func capture(snapshot: [String: Any], to url: URL, dark: Bool) throws {
+        ensurePresentation()
         window?.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         apply(snapshot); updateStatus(); surface.layoutSubtreeIfNeeded()
         guard let bitmap = surface.bitmapImageRepForCachingDisplay(in: surface.bounds) else { throw CocoaError(.fileWriteUnknown) }
@@ -565,6 +620,40 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
 
     static func validationReport() -> [String: Bool] {
         var report = CueUsageScheduleController.validationReport()
+        let backgroundOnly = CueUsageDashboardController(home: FileManager.default.temporaryDirectory.appendingPathComponent("vcgo-background-only-" + UUID().uuidString), useSavedColumns: false)
+        var backgroundCommands: [String] = []
+        backgroundOnly.fixtureRun = { arguments, module, completion in
+            backgroundCommands.append(module + ":" + (arguments.first ?? ""))
+            if arguments.first == "sync-status" {
+                completion(.success(["available": true, "sync": ["running": false, "last_synced_at": Date().timeIntervalSince1970]]))
+            } else if arguments.first == "refresh-pricing" {
+                completion(.success(["pricing_next_refresh_at": NSNull(), "pricing_refresh_due": false, "pricing": []]))
+            }
+        }
+        // init(window: nil) can count as loaded to NSWindowController; inspect
+        // actual owned window and lazy component allocations, never its getter.
+        let unprepared = !backgroundOnly.presentationPrepared && backgroundOnly.nativePresentationWindow == nil && backgroundOnly.presentationComponents == 0
+        backgroundOnly.startBackgroundSync()
+        report["usage_background_sync_and_pricing_do_not_construct_native_ui"] = unprepared && backgroundOnly.backgroundStarted && !backgroundOnly.presentationPrepared && backgroundOnly.nativePresentationWindow == nil && backgroundOnly.presentationComponents == 0 && backgroundOnly.presentationBuilds == 0 && backgroundCommands == ["vibecue.usage:sync-status", "vibecue.usage_money:refresh-pricing"]
+        backgroundOnly.refreshAfterPreferences()
+        report["usage_background_preferences_keep_display_dirty_without_creating_ui"] = !backgroundOnly.presentationPrepared && backgroundOnly.nativePresentationWindow == nil && backgroundOnly.presentationComponents == 0 && backgroundOnly.snapshotNeedsRefresh && backgroundOnly.queryRequests == 0
+        backgroundOnly.stopBackgroundSync()
+        report["usage_background_shutdown_does_not_initialize_lazy_views"] = !backgroundOnly.presentationPrepared && backgroundOnly.nativePresentationWindow == nil && backgroundOnly.presentationComponents == 0
+        let obscured = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
+        let obscuredWindow = obscured.window
+        obscuredWindow?.setFrameOrigin(NSPoint(x: -10000, y: -10000)); obscuredWindow?.orderFront(nil)
+        obscured.fixtureOcclusion = false
+        var obscuredCommands = 0
+        obscured.fixtureRun = { _, _, _ in obscuredCommands += 1 }
+        obscured.query(); obscured.refreshExchange()
+        report["usage_occluded_dashboard_skips_query_and_exchange_workers"] = !obscured.dashboardVisible && obscured.queryRequests == 0 && obscuredCommands == 0 && !obscured.exchangeRefreshing && obscured.snapshotNeedsRefresh
+        let beforeOccludedApply = obscured.snapshotApplyCount
+        obscured.acceptHiddenQuerySnapshot(obscured.snapshot)
+        report["usage_occluded_numeric_result_is_retained_without_native_rebuild"] = obscured.snapshotApplyCount == beforeOccludedApply && obscured.snapshotNeedsRefresh && obscured.queryRequiresApply
+        obscuredWindow?.orderOut(nil)
+        let lazyCanvas = backgroundOnly.embeddedContentView()
+        _ = backgroundOnly.embeddedContentView()
+        report["usage_explicit_presentation_constructs_once_and_reuses_canvas"] = backgroundOnly.presentationBuilds == 1 && backgroundOnly.presentationPrepared && backgroundOnly.nativePresentationWindow != nil && backgroundOnly.presentationComponents > 0 && lazyCanvas === backgroundOnly.surface
         report.merge(CueUsageLogDetailsController.validationReport()) { _, new in new }
         report.merge(CueUsageHeatmap.validationReport()) { _, new in new }
         let scheduled = fixtureController(size: NSSize(width: 1120, height: 850), currency: "CNY", dark: true)
@@ -659,6 +748,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         let overview = paging.metrics.map { $0.value.stringValue }, calendarDays = paging.heatmap.days.count, message = paging.status.stringValue
         paging.window?.setFrameOrigin(NSPoint(x: -10000, y: -10000)); paging.window?.orderFront(nil)
         defer { paging.window?.orderOut(nil) }
+        paging.fixtureOcclusion = true
         paging.queryInFlight = true // Exercise invalidation without starting a worker.
         paging.nextPage()
         report["usage_pagination_changes_only_list_loading"] = paging.page == 2 && paging.rows.isEmpty && paging.pageLabel.stringValue.contains("第 2 页") && paging.metrics.map { $0.value.stringValue } == overview && paging.heatmap.days.count == calendarDays && paging.status.stringValue == message
@@ -725,6 +815,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
 
     private static func fixtureController(size: NSSize, currency: String, dark: Bool) -> CueUsageDashboardController {
         let controller = CueUsageDashboardController(home: FileManager.default.temporaryDirectory.appendingPathComponent("vibecue-usage-fixture-\(UUID().uuidString)", isDirectory: true), useSavedColumns: false)
+        controller.ensurePresentation()
         controller.window?.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         controller.window?.setContentSize(size)
         controller.surface.frame = NSRect(origin: .zero, size: size)
@@ -829,11 +920,17 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         updateChartHeader()
     }
 
+    private func runCollector(_ arguments: [String], module: String = "vibecue.usage", statusOnly: Bool = false,
+                              completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        if let fixtureRun { fixtureRun(arguments, module, completion); return }
+        (statusOnly ? statusClient : client).run(arguments, module: module, completion: completion)
+    }
+
     @objc private func syncNow() { synchronize() }
     private func synchronize() {
         guard !stopped, !syncing, !backendRunning else { return }
         syncing = true; lastSyncAttempt = Date(); syncError = ""; configureBackgroundTimer(); updateStatus()
-        client.run(["sync"]) { [weak self] result in
+        runCollector(["sync"]) { [weak self] result in
             guard let self else { return }; self.syncing = false
             switch result {
             case .success(let data):
@@ -846,11 +943,13 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private var dashboardVisible: Bool {
         guard let host = presentationWindow else { return false }
         return host.isVisible && !host.isMiniaturized && (!isEmbedded || embeddedVisible)
+            && (fixtureOcclusion ?? host.occlusionState.contains(.visible))
     }
     private func pollSyncStatus() {
         guard !stopped, !statusInFlight else { return }
         statusInFlight = true
-        statusClient.run(["sync-status"]) { [weak self] result in
+        statusRequests += 1
+        runCollector(["sync-status"], statusOnly: true) { [weak self] result in
             guard let self else { return }; self.statusInFlight = false
             guard !self.stopped else { return }
             switch result {
@@ -902,7 +1001,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
             if snapshotNeedsRefresh { queryPending = true }
             return
         }
-        queryInFlight = true; snapshotNeedsRefresh = false
+        queryInFlight = true; snapshotNeedsRefresh = false; queryRequests += 1
         let identifier = queryID, forceApply = queryRequiresApply
         queryRequiresApply = false
         var arguments = ["query", "--overview-protocol", "--range", selected(range), "--app", selected(app), "--provider", selected(provider), "--model", selected(model), "--source", selected(source), "--status", selected(statusFilter), "--heatmap-weeks", String(heatmapWeeks), "--page", String(page), "--page-size", String(pageSize), "--view", currentView]
@@ -910,7 +1009,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         // A filter change cleared overview labels; a hidden full response has
         // not been painted yet. Both require a full apply before page reuse.
         if currentView == "logs", (!forceApply || tableOnly), snapshot["overview_protocol"] as? Int == 1, let revision = snapshot["overview_revision"] as? String { arguments += ["--overview-revision", revision] }
-        client.run(arguments) { [weak self] result in
+        runCollector(arguments) { [weak self] result in
             guard let self else { return }
             self.queryInFlight = false
             if self.queryID == identifier {
@@ -1086,6 +1185,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         if tableChanged { table.reloadData() }
     }
     private func updateStatus() {
+        guard presentationPrepared else { return }
         let busy = syncing || backendRunning
         let rebuilding = syncMetadata["rebuild"] as? Bool == true
         syncButton.isEnabled = !busy; syncButton.title = busy ? (rebuilding ? "正在重建…" : "正在同步…") : "立即同步"
@@ -1193,7 +1293,7 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
     private func refreshPricing() {
         guard !stopped, !pricingRefreshing else { return }
         pricingTimer?.invalidate(); pricingTimer = nil; pricingRefreshing = true
-        client.run(["refresh-pricing"], module: "vibecue.usage_money") { [weak self] result in
+        runCollector(["refresh-pricing"], module: "vibecue.usage_money") { [weak self] result in
             guard let self, !self.stopped else { return }; self.pricingRefreshing = false
             switch result {
             case .success(let data): self.pricingRetryAfter = nil; self.pricingNextRefreshAt = nil; self.readPricingSchedule(data)
@@ -1210,9 +1310,9 @@ final class CueUsageDashboardController: NSWindowController, NSWindowDelegate, N
         }
     }
     private func refreshExchange() {
-        guard !stopped, !exchangeRefreshing, Date().timeIntervalSince(lastExchangeRefresh) > 900 else { return }
+        guard !stopped, dashboardVisible, !exchangeRefreshing, Date().timeIntervalSince(lastExchangeRefresh) > 900 else { return }
         exchangeRefreshing = true; lastExchangeRefresh = Date()
-        client.run(["refresh"], module: "vibecue.usage_money") { [weak self] result in
+        runCollector(["refresh"], module: "vibecue.usage_money") { [weak self] result in
             guard let self, !self.stopped else { return }; self.exchangeRefreshing = false
             if case .success(let data) = result,
                !Self.moneyDisplaySnapshot(self.snapshot["money"] as? [String: Any] ?? [:]).isEqual(Self.moneyDisplaySnapshot(data)) {

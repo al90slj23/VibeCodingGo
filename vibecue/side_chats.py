@@ -513,6 +513,30 @@ class SideChatService:
                 pass  # Keep a verified relation unavailable; never infer archive/completion.
             return
 
+    def _poll_timeout(self):
+        """Bound idle wakeups while keeping socket delivery and due work live."""
+        now, delay = self.clock(), 1.0
+        with self.lock:
+            delay = min(delay, max(.01, self.next_scan - now))
+            if self.cache_dirty:
+                delay = min(delay, max(.01, self.next_cache_write - now))
+            awaiting = False
+            for thread, projection in self.projections.items():
+                if projection.revision is None:
+                    awaiting = True
+                    delay = min(delay, max(.01, self.subscribed_at.get(thread, now) + 5 - now))
+            if not awaiting:
+                for thread, projection in self.projections.items():
+                    if projection.relation is not None:
+                        due = max(self.next_probe, self.next_owner_check.get(thread, 0))
+                        delay = min(delay, max(.1, due - now))
+                if sum(p.relation is not None for p in self.projections.values()) < MAX_SIDE_CHATS:
+                    for thread in set(self.known) | set(self.candidates):
+                        if thread not in self.projections:
+                            due = max(self.next_probe, self.next_attempt.get(thread, 0))
+                            delay = min(delay, max(.1, due - now))
+        return max(.01, min(1.0, delay))
+
     def _run(self):
         delay = 1
         while not self.stop_event.is_set():
@@ -526,7 +550,7 @@ class SideChatService:
                         self.message = '已连接 Codex 侧边聊天'
                     while not self.stop_event.is_set():
                         self._discover()
-                        readable, _, _ = select.select([channel.socket], [], [], .1)
+                        readable, _, _ = select.select([channel.socket], [], [], self._poll_timeout())
                         drained = 0
                         while readable and drained < 32 and not self.stop_event.is_set():
                             channel._receive(time.monotonic() + 2)

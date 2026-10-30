@@ -555,6 +555,33 @@ class DesktopAttentionService:
             if attempted >= 1:
                 break
 
+    def _poll_timeout(self):
+        """Socket events wake immediately; only real deadlines need a timer.
+
+        Approval settlement keeps its exact deadline and initial subscription
+        discovery keeps the prior short cadence. A healthy unchanged stream
+        needs one liveness pass per second, not ten empty select wakeups.
+        """
+        delay = 1.0
+        now = time.monotonic()
+        with self._lock:
+            if self.monitor.emit_enabled:
+                settle_now = self.monitor.clock()
+                for pending in self.monitor.pending.values():
+                    if not pending.emitted:
+                        delay = min(delay, max(0.0, pending.observed + SETTLE_SECONDS - settle_now))
+            awaiting = False
+            for thread, projection in self.projections.items():
+                if projection.revision is None:
+                    awaiting = True
+                    delay = min(delay, max(.01, self.subscribed_at.get(thread, now) + 5 - now))
+            if not awaiting:
+                for thread in self._threads:
+                    if thread not in self.projections:
+                        due = max(self.next_discovery.get(thread, 0), self.quarantine_until.get(thread, 0))
+                        delay = min(delay, max(.1, due - now))
+        return max(0.0, min(1.0, delay))
+
     def _contract_health(self, channel):
         capabilities = channel.capabilities
         available = capabilities['reply'] or capabilities['control'] or capabilities['attention']
@@ -595,7 +622,7 @@ class DesktopAttentionService:
                             desired, stdio = list(self._threads), self._stdio
                             self.monitor.emit_enabled = not stdio
                         self._discover(desired)
-                        readable, _, _ = select.select([channel.socket], [], [], .1)
+                        readable, _, _ = select.select([channel.socket], [], [], self._poll_timeout())
                         drained = 0
                         while readable and drained < 64 and not self._stop.is_set():
                             channel._receive(time.monotonic() + 2)

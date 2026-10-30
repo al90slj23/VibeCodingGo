@@ -150,8 +150,9 @@ struct CueInboxBatch {
 final class CueEventInboxReader {
     private let queue = DispatchQueue(label: "local.vibecue.event-inbox", qos: .utility)
     private var busy = false
+    private var pendingRead: (() -> Void)?
     func read(home: URL, events: URL, inflight: URL, synchronous: Bool = false, completion: @escaping (CueInboxBatch) -> Void) {
-        guard !busy else { return }; busy = true
+        guard !busy else { pendingRead = { [weak self] in self?.read(home: home, events: events, inflight: inflight, synchronous: synchronous, completion: completion) }; return }; busy = true
         let work = {
             let request = home.appendingPathComponent("settings.request")
             let requested = FileManager.default.fileExists(atPath: request.path)
@@ -170,8 +171,12 @@ final class CueEventInboxReader {
             }
             return CueInboxBatch(rows: rows, settingsRequested: requested)
         }
-        if synchronous { let batch = work(); busy = false; completion(batch) }
-        else { queue.async { let batch = work(); DispatchQueue.main.async { self.busy = false; completion(batch) } } }
+        let deliver: (CueInboxBatch) -> Void = { batch in
+            self.busy = false; completion(batch)
+            let next = self.pendingRead; self.pendingRead = nil; next?()
+        }
+        if synchronous { deliver(work()) }
+        else { queue.async { let batch = work(); DispatchQueue.main.async { deliver(batch) } } }
     }
     func acknowledge(_ batch: CueInboxBatch, home: URL, synchronous: Bool = false) {
         let work = {
@@ -199,6 +204,20 @@ enum CueWorkPipelineChecks {
             inbox.acknowledge(batch, home: root, synchronous: true)
             result["work_inbox_acknowledges_only_after_delivery"] = !FileManager.default.fileExists(atPath: batch.rows[0].0.path) && !FileManager.default.fileExists(atPath: root.appendingPathComponent("settings.request").path) && FileManager.default.fileExists(atPath: external.path)
         }
+        try! Data("{\"id\":\"first\"}".utf8).write(to: events.appendingPathComponent("first.json"))
+        var firstDelivered = false, secondDelivered = false
+        inbox.read(home: root, events: events, inflight: inflight) { batch in
+            inbox.acknowledge(batch, home: root)
+            try! Data("{\"id\":\"second\"}".utf8).write(to: events.appendingPathComponent("second.json"))
+            firstDelivered = true
+        }
+        inbox.read(home: root, events: events, inflight: inflight) { batch in
+            secondDelivered = batch.rows.contains { String(data: $0.1, encoding: .utf8)?.contains("second") == true }
+            inbox.acknowledge(batch, home: root)
+        }
+        let inboxDeadline = Date().addingTimeInterval(1.5)
+        while !secondDelivered && Date() < inboxDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.005)) }
+        result["work_inbox_retains_latest_signal_while_previous_batch_is_in_flight"] = firstDelivered && secondDelivered
         let file = root.appendingPathComponent("state.json"), reader = CueJSONSnapshotReader()
         try! Data("{\"value\":1}".utf8).write(to: file, options: .atomic)
         func fetch(_ limit: Int = 1024) -> [String: Any]? {

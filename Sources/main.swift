@@ -323,6 +323,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
     var approvalLauncher: Process?
     var approvalLaunchLog: FileHandle?
     var readTimer: CueActivityLease?
+    private var inboxSignals: CueInboxDirectorySignals?
     private var diagnosticsLease: CueActivityLease?
     var pulseTimer: Timer?
     var effectFrameRate = 0.0
@@ -431,7 +432,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         updateWatcherHealth()
         refreshMenu()
         recoverInflight()
-        readTimer = CueActivityScheduler.shared.observe(key: "application.event-inbox", interval: 0.5, isActive: { [weak self] in self?.shuttingDown == false }) { [weak self] in self?.scanEvents() }
+        let signals = CueInboxDirectorySignals(home: home, events: eventsDirectory) { [weak self] in self?.scanEvents() }
+        inboxSignals = signals; signals.start()
+        readTimer = CueActivityScheduler.shared.observe(key: "application.event-inbox", interval: 2, isActive: { [weak self] in self?.shuttingDown == false }) { [weak self] in self?.inboxSignals?.reconcile(); self?.scanEvents() }
         diagnosticsLease = CueActivityScheduler.shared.observe(key: "application.diagnostics", interval: 5, isActive: { [weak self] in self?.shuttingDown == false }) { [weak self] in self?.writeStatus() }
         monitorObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, let current = self.current else { return }
@@ -520,7 +523,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         seen.append(event.id)
         if seen.count > 512 { seen.removeFirst(seen.count - 512) }
         recent = recentHistory.events
-        refreshMenu()
+        refreshMenu(); writeStatus()
         guard pausedUntil == nil, settings.allows(event) else { return }
         // A real event immediately replaces a preview, including completion events.
         if current?.isPreview == true {
@@ -571,7 +574,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         previewComponent = component
         if component == "sound" {
             playChime(kind: kind, name: settings.soundName(for: kind))
-            return finish(muted || settings.soundToken(for: kind) == "silent" ? "已保存音效。当前处于静音状态。" : "正在试听：\(lastSound)")
+            return finish(muted || settings.soundToken(for: kind) == "silent" ? "已保存音效。当前处于静音状态。" : settings.soundVolume <= 0 ? "已保存音效。当前音量为零，未播放。" : "正在试听：\(lastSound)")
         }
         let event = CueEvent(kind: kind, title: "VibeCoding Go · 样式预览", message: "这是样式预览。正式提醒会显示具体对话名称。")
         previewComponent = component; current = event; shownAt = Date()
@@ -588,8 +591,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func showNext() {
         guard current == nil, pausedUntil == nil else { return }
+        let before = pending.count
         pending.removeAll { abs($0.date.timeIntervalSinceNow) > 120 || !settings.allows($0) }
-        guard !pending.isEmpty else { writeStatus(); return }
+        guard !pending.isEmpty else { if before > 0 { writeStatus() }; return }
         let event = pending.removeFirst()
         current = event; shownAt = Date()
         lastShownTitle = event.title
@@ -607,8 +611,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         banner?.close(); banner = nil
         let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
         let screens = settings.allDisplays ? NSScreen.screens : targetScreen.map { [$0] } ?? []
-        let showEdges = settings.glowEnabled && (!event.isPreview || previewComponent != "card")
         let visual = resolvedVisualStyle(for: event)
+        let showEdges = settings.glowEnabled && settings.glowIntensity > 0 && visual.opacity > 0 && (!event.isPreview || previewComponent != "card")
         for screen in showEdges ? screens : [] {
             // Small, non-overlapping edge surfaces avoid a full-screen
             // transparent drawable/compositing pass over video and other apps.
@@ -869,10 +873,10 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         lastSoundPath = ""; lastSoundPeakDBFS = -160; lastSoundPlaybackTime = 0
         lastSoundPreparationMs = 0; lastSoundPreparedOnMainThread = false
         lastSoundFinished = false; lastSoundFinishSucceeded = false; lastSoundError = ""
-        guard settings.enabled, pausedUntil == nil, !muted, token != "silent", !shuttingDown else { writeStatus(); return }
+        guard settings.enabled, pausedUntil == nil, !muted, settings.soundVolume > 0, token != "silent", !shuttingDown else { writeStatus(); return }
         soundPreparation.prepare(kind: token, customDirectory: home.appendingPathComponent("sounds/custom", isDirectory: true),
                                  volume: Float(settings.soundVolume)) { [weak self] result in
-            guard let self, !self.shuttingDown, self.settings.enabled, self.pausedUntil == nil, !self.muted,
+            guard let self, !self.shuttingDown, self.settings.enabled, self.pausedUntil == nil, !self.muted, self.settings.soundVolume > 0,
                   self.current?.id == eventID, self.lastPlayedSoundToken == token else { return }
             switch result {
             case .success(let prepared):
@@ -908,6 +912,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard audioPlayer === player else { return }
         lastSoundFinished = true; lastSoundFinishSucceeded = flag
         lastSoundPlaybackTime = player.duration
+        player.delegate = nil; player.stop(); audioPlayer = nil
         if current == nil, previewComponent == "sound" {
             previewFeedback = flag ? "试听已结束。点击音效可再次试听。" : "试听未完成，请查看音频状态。"
             settingsPanel?.updatePreviewFeedback(previewFeedback)
@@ -919,6 +924,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         guard audioPlayer === player else { return }
         lastSoundError = error?.localizedDescription ?? "Audio decode failed"
         lastSoundFinished = true; lastSoundFinishSucceeded = false
+        player.delegate = nil; player.stop(); audioPlayer = nil
         writeStatus()
     }
 
@@ -1221,7 +1227,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
 
     func applySettings(updateCurrent: Bool = true) {
         saveSettings()
-        if muted || !settings.enabled || pausedUntil != nil { stopAudio() }
+        if muted || settings.soundVolume <= 0 || !settings.enabled || pausedUntil != nil { stopAudio() }
         audioPlayer?.volume = Float(settings.soundVolume)
         pending.removeAll { !settings.allows($0) }
         if let current, updateCurrent || current.isPreview {
@@ -1365,11 +1371,9 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         // IDs only. This tells the existing read-only subscription which
         // retained list entries need current settings, including older chats.
         let conversations = recentHistory.displayRecords
-        let requested = runningTasks.map(\.threadID) + conversations.filter(\.isPinned).map { $0.event.threadID }
-            + recentHistory.followups.records.map(\.threadID) + interruptedTasks.map(\.threadID)
-            + conversations.map { $0.event.threadID }
-        var seen = Set<String>()
-        let ids = Array(requested.filter { seen.insert($0).inserted && CueIdentifier.isValid($0) }.prefix(256))
+        let ids = CueModelTargetSelection.select([runningTasks.map(\.threadID),
+            conversations.filter(\.isPinned).map { $0.event.threadID }, recentHistory.followups.records.map(\.threadID),
+            interruptedTasks.map(\.threadID), conversations.map { $0.event.threadID }])
         guard let data = try? JSONSerialization.data(withJSONObject: ["thread_ids": ids], options: [.sortedKeys]), data != modelSettingsTargets else { return }
         let file = home.appendingPathComponent("model-settings-targets.json")
         do {
@@ -1528,6 +1532,8 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "effect_submission_ms": edgeViews.map { $0.lastSubmissionDuration * 1000 },
             "effect_submitted_frames": edgeViews.map(\.submittedFrameCount),
             "effect_coalesced_frames": edgeViews.map(\.skippedFrameCount),
+            "effect_unchanged_frames": edgeViews.map(\.duplicateFrameCount),
+            "effect_uniform_templates": edgeViews.map(\.uniformTemplateBuildCount),
             "effect_rendered_frames": edgeViews.map(\.renderedFrameCount),
             "preview_duration": Self.previewDuration,
             "edge_windows": edges.map { ["visible": $0.isVisible, "level": $0.level.rawValue, "alpha": $0.alphaValue, "frame": NSStringFromRect($0.frame)] as [String: Any] },
@@ -1558,7 +1564,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
             "codex_permission_wait_supported": true, "manual_approval_connected": manualApprovalConnected,
             "manual_approval_status": manualApprovalStatus, "raw_permission_requests_suppressed": true,
             "codex_connection_state": codexConnectionState, "codex_connection_summary": codexConnectionSummary,
-            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "engineering": settingsPanel?.engineeringController?.performanceSnapshot ?? ["created": false], "engineering_updates": engineeringMaintenance?.performanceSnapshot ?? ["created": false], "engineering_settings": settingsPanel?.engineeringSettingsController?.performanceSnapshot ?? ["created": false], "network": networkTests?.performanceSnapshot ?? ["created": false], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
+            "performance": ["scheduler": CueActivityScheduler.shared.metrics, "inbox_signals": inboxSignals?.metrics ?? [:], "usage": usageDashboard?.performanceSnapshot ?? ["presentation_created": false], "collectors": CueCollectorScheduler.shared.metrics, "watcher_projection": watcherProjection.metrics, "shortcut_menu_rebuilds": menuRebuilds, "task_list": statusPopoverController?.performanceSnapshot ?? [:], "engineering": settingsPanel?.engineeringController?.performanceSnapshot ?? ["created": false], "engineering_updates": engineeringMaintenance?.performanceSnapshot ?? ["created": false], "engineering_settings": settingsPanel?.engineeringSettingsController?.performanceSnapshot ?? ["created": false], "network": networkTests?.performanceSnapshot ?? ["created": false], "conversations": conversationWindows.values.map { $0.performanceSnapshot }, "title_cache": CueRunningTask.titleKeyCacheMetrics],
             "queued": pending.count, "updated_at": Date().timeIntervalSince1970]
         let destination = home.appendingPathComponent("app-status.json")
         let write = {
@@ -1598,6 +1604,7 @@ final class CueController: NSObject, NSApplicationDelegate, AVAudioPlayerDelegat
         watcherRestartTimer?.invalidate()
         if let process = watcherProcess, process.isRunning { process.terminate() }
         if historyScopeActive { historyURL?.stopAccessingSecurityScopedResource() }
+        inboxSignals?.stop(); inboxSignals = nil
         readTimer?.cancel(); diagnosticsLease?.cancel(); diagnosticWrite?.cancel(); diagnosticWrite = nil; diagnosticQueue.sync {}; hideWindows()
         if let monitorObserver { NotificationCenter.default.removeObserver(monitorObserver) }
         try? FileManager.default.removeItem(at: home.appendingPathComponent("app-status.json"))
@@ -2555,6 +2562,15 @@ if let index = CommandLine.arguments.firstIndex(of: "--ccswitch-system-action"),
     exit(0)
 }
 
+if CommandLine.arguments.contains("--resident-self-test") {
+    _ = NSApplication.shared
+    var checks = CueInboxDirectorySignals.validationReport()
+    checks.merge(CueModelTargetSelection.validationReport()) { _, new in new }
+    checks.merge(CueWorkPipelineChecks.validationReport()) { _, new in new }
+    print(String(data: try! JSONSerialization.data(withJSONObject: checks, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(checks.values.allSatisfy { $0 } ? 0 : 1)
+}
+
 if CommandLine.arguments.contains("--effects-gpu-self-test") {
     _ = NSApplication.shared
     let report = CueEffectGPU.renderingValidationReport()
@@ -2569,6 +2585,8 @@ if CommandLine.arguments.contains("--ui-performance-measure") {
     checks.merge(CueCollectorScheduler.validationReport()) { _, new in new }
     checks.merge(CueWatcherProjectionReader.validationReport()) { _, new in new }
     checks.merge(CueWorkPipelineChecks.validationReport()) { _, new in new }
+    checks.merge(CueInboxDirectorySignals.validationReport()) { _, new in new }
+    checks.merge(CueModelTargetSelection.validationReport()) { _, new in new }
     checks.merge(CueEngineeringToolsController.validationReport()) { _, new in new }
     checks.merge(CueEngineeringSettingsController.validationReport()) { _, new in new }
     checks.merge(CueEngineeringMaintenanceMonitor.validationReport()) { _, new in new }
@@ -2946,6 +2964,13 @@ if CommandLine.arguments.contains("--menu-bar-self-test") {
 if CommandLine.arguments.contains("--usage-money-self-test") {
     _ = NSApplication.shared
     let results = CueUsagePreferencesController.validationReport()
+    print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(results.values.allSatisfy { $0 } ? 0 : 1)
+}
+if CommandLine.arguments.contains("--resident-pages-self-test") {
+    _ = NSApplication.shared
+    var results = CueUsageDashboardController.validationReport()
+    results.merge(CueCCAccountsController.validationReport()) { _, new in new }
     print(String(data: try! JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]), encoding: .utf8)!)
     exit(results.values.allSatisfy { $0 } ? 0 : 1)
 }

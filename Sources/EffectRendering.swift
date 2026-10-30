@@ -60,6 +60,28 @@ final class CueEffectGPU {
         }
         return values
     }
+    struct UniformTemplate {
+        let base:[Float]
+        let motion:CueEffectMotion
+        let envelope:CueEffectEnvelope
+        let speed:Double
+        let direction:String
+        func frame(origin:NSPoint,viewport:NSSize,time:TimeInterval,duration:TimeInterval?,reduceMotion:Bool) -> [Float] {
+            var values=base
+            values[2]=Float(origin.x);values[3]=Float(origin.y)
+            values[4]=Float(viewport.width);values[5]=Float(viewport.height)
+            let sample=motion.sample(at:time,speed:speed,direction:direction,reduceMotion:reduceMotion)
+            values[17]=Float(sample.phase)
+            values[18]=Float(sample.strength * envelope.opacity(at:time,duration:duration,reduceMotion:reduceMotion))
+            values[19]=Float(sample.sign)
+            return values
+        }
+    }
+    static func uniformTemplate(style:CueVisualStyle,canvas:NSSize) -> UniformTemplate {
+        let recipe=CueEffectCatalog.preset(id:style.effectID).recipe
+        let base=uniforms(style:style,canvas:canvas,origin:.zero,viewport:canvas,time:0,duration:nil,reduceMotion:true)
+        return UniformTemplate(base:base,motion:recipe.motion,envelope:recipe.envelope,speed:style.speed,direction:style.direction)
+    }
     static func encode(_ values: [Float], texture: MTLTexture, context: Context) -> MTLCommandBuffer? {
         guard let command = context.queue.makeCommandBuffer() else { return nil }
         let descriptor = MTLRenderPassDescriptor()
@@ -203,10 +225,12 @@ fragment float4 cue_fragment(Vertex in [[stage_in]],constant float *u [[buffer(0
 /// requests rather than accumulating animation work behind a slow GPU.
 final class CueEffectFrameGate {
     private let lock=NSLock()
-    private var busy=false, cancelled=false
-    func begin() -> Bool { lock.lock(); defer { lock.unlock() }; guard !busy && !cancelled else { return false }; busy=true; return true }
+    private var busy=false, cancelled=false, suspended=false
+    func begin() -> Bool { lock.lock(); defer { lock.unlock() }; guard !busy && !cancelled && !suspended else { return false }; busy=true; return true }
     func end() { lock.lock(); busy=false; lock.unlock() }
     func cancel() { lock.lock(); cancelled=true; lock.unlock() }
+    func suspend(_ value:Bool) { lock.lock();suspended=value;lock.unlock() }
+    var canPresent:Bool { lock.lock();defer { lock.unlock() };return !cancelled && !suspended }
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
 }
 
@@ -219,17 +243,18 @@ final class CueEffectGPUFrameDriver {
     private let context: CueEffectGPU.Context
     init(layer: CAMetalLayer, context: CueEffectGPU.Context) { metalLayer=layer; self.context=context }
     func cancel() { gate.cancel() }
-    @discardableResult func submit(_ values: [Float], completion: @escaping (TimeInterval) -> Void) -> Bool {
+    func suspend(_ value:Bool) { gate.suspend(value) }
+    @discardableResult func submit(_ values: [Float], completion: @escaping (TimeInterval?) -> Void) -> Bool {
         guard gate.begin() else { return false }
         queue.async { [weak self] in
             guard let self else { return }
-            guard !self.gate.isCancelled, let drawable=self.metalLayer.nextDrawable(), !self.gate.isCancelled, let command=CueEffectGPU.encode(values,texture:drawable.texture,context:self.context) else { self.finish(); return }
+            guard self.gate.canPresent, let drawable=self.metalLayer.nextDrawable(), self.gate.canPresent, let command=CueEffectGPU.encode(values,texture:drawable.texture,context:self.context) else {
+                self.finish();DispatchQueue.main.async { completion(nil) };return
+            }
             command.addCompletedHandler { [weak self] command in
-                guard let self else { return }; let stop=self.gate.isCancelled; self.gate.end()
-                if !stop && command.status == .completed {
-                    let duration=max(0,command.gpuEndTime-command.gpuStartTime)
-                    DispatchQueue.main.async { completion(duration) }
-                }
+                guard let self else { return };let visible=self.gate.canPresent;self.gate.end()
+                let duration=visible && command.status == .completed ? max(0,command.gpuEndTime-command.gpuStartTime) : nil
+                DispatchQueue.main.async { completion(duration) }
             }
             command.present(drawable); command.commit()
         }
@@ -254,6 +279,13 @@ extension CueEffectGPU {
         let gate=CueEffectFrameGate()
         let first=gate.begin(), drop = !gate.begin(); gate.end(); let resumed=gate.begin(); gate.cancel(); gate.end()
         let cancelled = !gate.begin()
+        let visibilityGate=CueEffectFrameGate();visibilityGate.suspend(true)
+        let hidden = !visibilityGate.begin() && !visibilityGate.canPresent
+        visibilityGate.suspend(false);let visible=visibilityGate.begin()
+        visibilityGate.suspend(true);let pausedInFlight = !visibilityGate.canPresent
+        visibilityGate.end();visibilityGate.suspend(false);let restored=visibilityGate.begin()
+        visibilityGate.cancel();visibilityGate.end();visibilityGate.suspend(false)
+        let cancelledAfterRestore = !visibilityGate.begin()
         let allStyles=CueEffectCatalog.presets.map { CueVisualStyle(fields:["effect":$0.id,"palette":"#123456,#ABCDEF,#FFAACC,#44FF88,#FF0000,#00FF00,#0000FF,#FFFFFF"],fallback:fallback) }
         let uniforms=allStyles.map { Self.uniforms(style:$0,canvas:canvas,origin:.zero,viewport:canvas,time:1.35,duration:8,reduceMotion:false) }
         return [
@@ -264,6 +296,21 @@ extension CueEffectGPU {
             "effect_all_presets_have_finite_bounded_shader_uniforms": uniforms.allSatisfy { $0.count == 144 && $0.allSatisfy(\.isFinite) && (1...4).contains(Int($0[21])) && Int($0[22]) == 8 },
             "effect_reduce_motion_removes_time_from_shader_parameters": allStyles.allSatisfy { Self.uniforms(style:$0,canvas:canvas,origin:.zero,viewport:canvas,time:0,duration:8,reduceMotion:true) == Self.uniforms(style:$0,canvas:canvas,origin:.zero,viewport:canvas,time:100,duration:8,reduceMotion:true) },
             "effect_frame_admission_has_no_backlog_and_stays_cancelled": first && drop && resumed && cancelled,
+            "effect_hidden_surfaces_suspend_and_restore_without_reopening_cancelled_work": hidden && visible && pausedInFlight && restored && cancelledAfterRestore,
+            "effect_prepared_uniforms_match_original_parameters_for_every_preset": allStyles.allSatisfy { style in
+                let template=Self.uniformTemplate(style:style,canvas:canvas)
+                return [0.0,0.2,1.35,7.8,8.0].allSatisfy { time in
+                    [false,true].allSatisfy { reduced in
+                        template.frame(origin:NSPoint(x:17,y:23),viewport:NSSize(width:212,height:97),time:time,duration:8,reduceMotion:reduced) == Self.uniforms(style:style,canvas:canvas,origin:NSPoint(x:17,y:23),viewport:NSSize(width:212,height:97),time:time,duration:8,reduceMotion:reduced)
+                    }
+                }
+            },
+            "effect_static_steady_frames_are_identical_while_lifetime_fades_remain_distinct": {
+                let style=CueVisualStyle(fields:["effect":"quiet-edge"],fallback:fallback)
+                let template=Self.uniformTemplate(style:style,canvas:canvas)
+                func frame(_ time:Double) -> [Float] { template.frame(origin:.zero,viewport:canvas,time:time,duration:8,reduceMotion:false) }
+                return frame(1) == frame(5) && frame(0.2) != frame(1) && frame(7.8) != frame(1)
+            }(),
             "effect_extreme_controls_keep_surface_coverage_bounded": CueEffectPresence.allCases.allSatisfy { presence in
                 let style=CueVisualStyle(fields:["effect":"pulse-fragments","presence":presence.rawValue,"width":"80","inset":"80"],fallback:fallback)
                 let frames=CueEdgeEffectView.edgeViewports(size:canvas,style:style)

@@ -782,8 +782,12 @@ class Watcher:
         }
         temporary = self.vibecue_home / '.watcher-state.tmp'
         try:
-            with temporary.open('w', encoding='utf-8') as stream:
-                json.dump(bound_status_previews(state), stream)
+            # Same JSON values with less encoding and disk traffic. Escaping
+            # lone surrogates keeps malformed source strings valid UTF-8 too.
+            content = json.dumps(bound_status_previews(state), ensure_ascii=False,
+                                 separators=(',', ':')).encode('utf-8', 'backslashreplace')
+            with temporary.open('wb') as stream:
+                stream.write(content)
             temporary.chmod(0o600)
             os.replace(temporary, self.vibecue_home / 'watcher-state.json')
         except OSError:
